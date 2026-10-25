@@ -1,0 +1,10 @@
+# Always LF in the repo, regardless of platform. CI is Linux, dev is Windows.
+* text=auto eol=lf
+
+# Binary fixtures must never be normalized.
+*.zst binary
+*.png binary
+*.gz binary
+
+# Generated / large fixtures
+big.json -diff
