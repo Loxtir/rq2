@@ -6,6 +6,7 @@ makes it safe to write.
 A query is a **view over a stored response**, not a destructive filter. The raw
 body is always kept; the query is re-run against it locally and for free.
 
+
 ```
 {
   id!
@@ -15,21 +16,21 @@ body is always kept; the query is re-run against it locally and for free.
 }
 ```
 
-| Syntax | Meaning |
-| --- | --- |
-| `id` | leaf, copied verbatim |
-| `profile { a b }` | projected object |
-| `orders { id }` | array, each element projected |
-| `orders[:10] { id }` | slice; negative indices count from the end |
-| `metadata` (no braces) | whole subtree, verbatim |
-| `metadata { * }` | one level of keys, values verbatim |
-| `owner: author { login }` | alias |
-| `id!` | fail loudly if the response omits it |
-| `items[id]` | one value per element, flattened into a list |
-| `items[0:5][id]` | slice first, then collect |
-| `children...{ id }` | walk a repeated key to any depth, keeping structure |
-| `children...[id]` | walk it, then flatten to bare values |
-| `# comment` | ignored |
+| Syntax                      | Meaning                                             |
+| --------------------------- | --------------------------------------------------- |
+| `id`                      | leaf, copied verbatim                               |
+| `profile { a b }`         | projected object                                    |
+| `orders { id }`           | array, each element projected                       |
+| `orders[:10] { id }`      | slice; negative indices count from the end          |
+| `metadata` (no braces)    | whole subtree, verbatim                             |
+| `metadata { * }`          | one level of keys, values verbatim                  |
+| `owner: author { login }` | alias                                               |
+| `id!`                     | fail loudly if the response omits it                |
+| `items[id]`               | one value per element, flattened into a list        |
+| `items[0:5][id]`          | slice first, then collect                           |
+| `children...{ id }`       | walk a repeated key to any depth, keeping structure |
+| `children...[id]`         | walk it, then flatten to bare values                |
+| `# comment`               | ignored                                             |
 
 Field names may contain `-`, `.`, `@`, `$` and unicode, so `content-type` and
 `x-amz-date` work without quoting.
@@ -183,11 +184,11 @@ stored under `.secrets/`, never in committed YAML.
 The schema is an **internal abstraction** with providers, which is what makes
 spec-less APIs first-class:
 
-| Provider | Source | Works for |
-| --- | --- | --- |
-| OpenAPI | `--spec` | documented operations |
+| Provider | Source             | Works for                       |
+| -------- | ------------------ | ------------------------------- |
+| OpenAPI  | `--spec`         | documented operations           |
 | Inferred | captured responses | everything else, after one call |
-| `Any` | neither | accepts anything |
+| `Any`  | neither            | accepts anything                |
 
 ## The window
 
@@ -443,4 +444,3 @@ and why it lives next to the target instead of in a global preference.
   they need
 - pre-request scripts (the sandbox), declarative captures
 - creating, deleting, and drag-reordering requests and folders in the tree
-
