@@ -1,7 +1,8 @@
 # rq — response queries
 
-A projection language for JSON API responses, plus the schema plumbing that
-makes it safe to write.
+A desktop API client and CLI built around a projection language for JSON
+responses, with git-friendly collections, scoped variables, and desktop
+pre-request and post-response scripts.
 
 A query is a **view over a stored response**, not a destructive filter. The raw
 body is always kept; the query is re-run against it locally and for free.
@@ -74,7 +75,7 @@ crates/collection/       the on-disk workspace, importers, and sending
   src/store.rs           per-request files, secret splitting, leak guard
   src/send.rs            variable substitution and the HTTP call
 crates/desktop/          the window (Tauri + plain HTML/CSS/JS, no bundler)
-  src/main.rs            commands; response bodies never leave this process
+  src/main.rs            commands, JavaScript scripts, response storage and history
   ui/                    the front end
 crates/rq-cli/           thin driver binary
 queries/                 saved queries, committed
@@ -195,6 +196,9 @@ spec-less APIs first-class:
 `cargo run -p rq-desktop -- examples/jsonplaceholder` opens a workspace from disk;
 the last one is remembered. Three panes: the tree, the request, the command.
 
+- Search the collection tree by request name or URL. Open requests, folders,
+  collections, and historical responses in tabs; request tabs keep their own
+  draft, response, and query. The side panes resize and collapse.
 - **Params** has two sections: path variables derived from the `:name` segments
   in the URL (the name is read-only, the value is not), and query parameters with
   an enable box each. Unchecking a parameter keeps the row and its value but
@@ -221,8 +225,57 @@ the last one is remembered. Three panes: the tree, the request, the command.
   cURL, with secrets masked to `***` and a warning when a `:path` value is
   missing.
 - Collection, folder, and request scripts can run before a request or after its
-  response. See the [scripts and response queries tutorial](docs/scripts-and-queries.md)
-  for `pm.sendRequest`, variable scopes, and query examples.
+  response from their **Scripts** editors; see [Scripts](#scripts) below.
+- **Send** uses the current request draft; it becomes **Cancel** while a request
+  is pending. The response shows status, timing, size, unresolved variables, TLS
+  warnings, and post-response script errors.
+- The response viewer pretty-prints JSON with syntax highlighting, collapsible
+  objects and arrays, breadcrumb navigation, and key/value search. Large JSON
+  views use virtualized rows. The **Query** bar re-projects locally as you type;
+  **Suggest** infers a starter query from the response without an OpenAPI spec.
+  Leave the query empty to inspect the full JSON response. Non-JSON text views
+  are capped at 512 KiB; the original bytes remain in Rust.
+- **History** records successful and failed sends, with a per-request history
+  view and read-only tabs for stored responses. Response bodies persist in the
+  app's local data directory, with a configurable storage limit (250 MiB by
+  default); older bodies are pruned while request metadata remains. Set the
+  limit to zero to retain no response bodies, or use **Clear history** to remove
+  the history. Stored URLs and response bodies may contain sensitive data.
+
+### Scripts
+
+The desktop app runs JavaScript at collection, folder, and request level. Both
+**Pre-request** and **Post-response** run in this order: collection, enclosing
+folders from outermost to innermost, then request. Scripts are saved in YAML as
+`scripts.pre_request` and `scripts.post_response`.
+
+- Pre-request scripts run before variable substitution and can change
+  `pm.request.method`, `pm.request.url`, headers via `add` / `upsert`, and
+  `pm.request.body.raw`. A pre-request error stops the main send.
+- Post-response scripts can read `pm.response.code`, `responseTime`,
+  `responseSize`, `text()`, and `json()`, for example to capture a response value
+  into a variable for the next request. Errors are shown without discarding the
+  response; post-response scripts do not run after a transport failure.
+- `pm.variables`, `pm.globals`, `pm.environment`, and `pm.collectionVariables`
+  provide `get` / `set`. Getters read the effective merged variables.
+  `pm.variables.set` defaults to the current script's scope; its optional third
+  argument selects `global`, `environment`, `collection`, `folder`, or `request`.
+- Variable writes persist automatically through the collection store. Existing
+  secret variables stay in `.secrets/`; newly created variables are **not secret**
+  by default, so create a secret variable in the editor before assigning tokens
+  from a script. Environment writes require a saved environment.
+- `pm.sendRequest` supports callbacks and `await`, with a URL string or a request
+  object containing a URL, method, header array, and raw body. These extra HTTP
+  calls use variable substitution and the environment's TLS setting, but do not
+  inherit the main request's authentication.
+
+This is a Postman-style subset, not a complete Postman sandbox or test runner:
+`pm.test` is a no-op and full assertion APIs are not implemented. Postman import
+does not import event scripts, and **CLI `rq send` does not execute scripts**.
+The cURL preview represents the request draft, not the result of running scripts.
+
+See the [scripts and response queries tutorial](docs/scripts-and-queries.md) for
+`pm.sendRequest`, variable scopes, and query examples.
 
 ## Commands
 
@@ -235,7 +288,7 @@ cargo run -p rq-cli -- project -q queries/orders/brief.query big.json --pretty
 
 # check a query, with schema validation if you have a spec
 cargo run -p rq-cli -- check -q queries/orders/brief.query
-cargo run -p rq-cli -- check -q queries/orders/brief.query --spec openapi/service.json --operation getOrders
+cargo run -p rq-cli -- check -q queries/orders/brief.query --spec openapi/fixture.json --operation listOrders
 
 # list operations, so you know what --operation accepts
 cargo run -p rq-cli -- ops --spec openapi/fixture.json
@@ -271,12 +324,15 @@ machines. Line counts are approximate; the exact number is printed to stderr.
 
 Working today: parser, projector (slices, collect, recursive walks), OpenAPI
 provider (JSON + YAML), inference, validation with suggestions, starter-query
-generation, Postman v2.1 import with secret splitting, sending a stored request,
-and the desktop window. 132 tests, `clippy -D warnings` clean.
+generation, Postman v2.1 import with secret splitting, and CLI request sending.
+The desktop app adds draft editing and saving, scoped variables and auth,
+pre-request and post-response scripts, tabbed requests, searchable/virtualized
+JSON viewing, local response queries, cancellation, and persistent history.
 
 The window is not a mockup: it reads the workspace from disk, sends through the
-same core the CLI uses, and re-projects on every keystroke against a body held in
-Rust — so reshaping a response costs nothing and touches the network once.
+same HTTP core the CLI uses, and re-projects on every keystroke against a body
+held in Rust — so reshaping a response makes no additional network calls.
+Scripts can make additional calls explicitly through `pm.sendRequest`.
 
 Measured on a generated 500,000-line / 10.8 MB response:
 
@@ -297,15 +353,15 @@ and `rc.exe` from the Windows SDK, which `tauri-build` uses to embed the icon an
 manifest:
 
 ```powershell
-$sdk = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Directory |
-        Sort-Object Name | Select-Object -Last 1).FullName
-$env:Path = "$sdk\x64;$env:Path"
+$sdk = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Directory |
+       Where-Object Name -like '10.*' | Sort-Object Name | Select-Object -Last 1
+$env:Path = "$($sdk.FullName)\x64;$env:Path"
 cargo run -p rq-desktop -- examples/jsonplaceholder
 ```
 
 ```powershell
 cargo check --workspace --all-targets   # types, no linking
-cargo test --workspace                  # 132 tests
+cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
@@ -365,10 +421,11 @@ cargo fmt --all
 - `rq import` refuses to write over an existing collection directory rather
   than merging into it, because stale request files from a previous import would
   load as extra requests.
-- The response body never crosses into the webview. `send` keeps the bytes in the
-  Rust process and returns metadata; the frontend asks for a projection and gets
-  the projected text back. Holding to that now costs nothing and is the same
-  boundary a 500k-line body needs later.
+- `send` keeps original response bytes in Rust and returns metadata. The frontend
+  requests display text separately: a query projection, the complete pretty-printed
+  JSON when the query is empty, or a capped non-JSON text view. The JSON viewer
+  parses that display text in the webview; virtualization limits rendered rows,
+  not the amount of JSON transferred or parsed.
 - The last opened workspace is stored in the per-user config directory
   (`app_config_dir()`, which is `%APPDATA%` on Windows, `Application Support` on
   macOS, `$XDG_CONFIG_HOME` on Linux) rather than in webview storage: clearing the
@@ -380,8 +437,8 @@ cargo fmt --all
 
 ## Secrets
 
-`rq import` already writes the layout, so the rule is enforced before there is
-an app to forget it:
+`rq import` and the desktop's workspace saves enforce the split between committed
+configuration and local secret values:
 
 ```
 collections/acme-orders/collection.yml   committed: name and `secret: true`, no value
@@ -406,13 +463,17 @@ ignore rule was checked by running `git init && git add -A` over an imported
 workspace and confirming `.secrets/` never appears:
 
 - `render` is the only function that serialises, and it blanks every secret value
-  before writing JSON. There is no second code path to audit.
+  before writing workspace YAML. There is no second workspace serializer to audit.
 - It then scans every committed file for every secret value and records a leak;
   `write` refuses to touch the disk if one is found. The scan is the safety net
   for a future importer, not a substitute for the first rule.
 
 Every export path (cURL, copy-as-code, share) must resolve through one place that
 renders `***`, because with a plain file that is the only guard.
+
+These guards protect workspace configuration, not captured response data. Desktop
+history stores response bodies and resolved URLs locally outside the workspace;
+use its storage limit and clear controls when working with sensitive APIs.
 
 ## Certificates
 
@@ -440,7 +501,8 @@ and why it lives next to the target instead of in a global preference.
 
 ## Not built yet
 
-- the response viewer (virtualized raw view) and click-to-pick; both have the RPC
-  they need
-- pre-request scripts (the sandbox), declarative captures
+- click-to-pick query construction from response fields (the viewer already
+  supports navigation and search)
+- declarative captures (scripts can already capture response values into variables)
+- full Postman sandbox/test compatibility, event-script import, and CLI script execution
 - creating, deleting, and drag-reordering requests and folders in the tree
