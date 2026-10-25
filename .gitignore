@@ -1,0 +1,16 @@
+/target
+**/target
+
+# Secrets are never committed. This is the only guard, so keep it.
+.secrets/
+*.secrets.env
+
+# Local scratch fixtures
+big.json
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
