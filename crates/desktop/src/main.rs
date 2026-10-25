@@ -35,7 +35,6 @@ struct AppState {
     workspace: Mutex<Option<PathBuf>>,
     responses: Mutex<Responses>,
     cancellations: Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
-    script_variables: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
 }
 
 fn scripts_for_path(
@@ -259,6 +258,117 @@ fn send_script_request(payload: &str) -> Result<serde_json::Value, String> {
         "body": String::from_utf8_lossy(&sent.body),
         "headers": {},
     }))
+}
+
+fn apply_variable_writes(variables: &mut Vec<Variable>, writes: BTreeMap<String, String>) {
+    for (name, value) in writes {
+        if let Some(variable) = variables.iter_mut().find(|variable| variable.name == name) {
+            variable.value = Some(value);
+        } else {
+            variables.push(Variable {
+                name,
+                value: Some(value),
+                secret: false,
+            });
+        }
+    }
+}
+
+fn variables_at_path(collection: &Collection, path: &[usize]) -> Option<Vec<Variable>> {
+    let (last, parents) = path.split_last()?;
+    let mut items = &collection.items;
+    for index in parents {
+        items = &items.get(*index)?.items;
+    }
+    Some(item_variables(items.get(*last)?).to_vec())
+}
+
+/// Persist script writes through the collection store so secrets remain split
+/// into `.secrets/` and every edit follows the renderer's leak checks.
+fn persist_script_writes(
+    root: &std::path::Path,
+    collection_slug: &str,
+    writes: BTreeMap<String, BTreeMap<String, String>>,
+) -> Result<(), String> {
+    if writes.is_empty() {
+        return Ok(());
+    }
+    let root_key = root.display().to_string();
+    let collection_key = format!("{root_key}::{collection_slug}");
+    let mut workspace = store::load(root)?;
+
+    for (scope, values) in writes {
+        if scope == format!("global::{root_key}") {
+            apply_variable_writes(&mut workspace.globals, values);
+            store::save_globals(root, workspace.globals.clone())?;
+            continue;
+        }
+
+        let environment_prefix = format!("environment::{root_key}::");
+        if let Some(slug) = scope.strip_prefix(&environment_prefix) {
+            let environment = workspace
+                .environments
+                .iter()
+                .find(|environment| store::slugify(&environment.name) == slug)
+                .ok_or_else(|| {
+                    "pm.environment.set requires a selected, saved environment".to_string()
+                })?;
+            let name = environment.name.clone();
+            let insecure = environment.insecure;
+            let mut variables = environment.variables.clone();
+            apply_variable_writes(&mut variables, values);
+            store::update_environment(root, slug, name, insecure, variables)?;
+            continue;
+        }
+
+        let collection_prefix = format!("collection::{collection_key}");
+        if scope == collection_prefix {
+            let collection = workspace
+                .collections
+                .iter()
+                .find(|collection| store::slugify(&collection.name) == collection_slug)
+                .ok_or_else(|| "script collection scope no longer exists".to_string())?;
+            let mut variables = collection.variables.clone();
+            apply_variable_writes(&mut variables, values);
+            let edit = Edit::Collection {
+                name: collection.name.clone(),
+                description: collection.description.clone(),
+                variables,
+                auth: collection.auth.clone(),
+                scripts: collection.scripts.clone(),
+            };
+            store::save(root, collection_slug, &edit)?;
+            continue;
+        }
+
+        let collection = workspace
+            .collections
+            .iter()
+            .find(|collection| store::slugify(&collection.name) == collection_slug)
+            .ok_or_else(|| "script collection scope no longer exists".to_string())?;
+        let mut matched_path = None;
+        for kind in ["folder", "request"] {
+            let prefix = format!("{kind}::{collection_key}::");
+            if let Some(path) = scope.strip_prefix(&prefix) {
+                let path = path
+                    .split('.')
+                    .map(|part| {
+                        part.parse::<usize>()
+                            .map_err(|_| "invalid script variable scope".to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                matched_path = Some(path);
+                break;
+            }
+        }
+        let path =
+            matched_path.ok_or_else(|| format!("unsupported script variable scope: {scope}"))?;
+        let mut variables = variables_at_path(collection, &path)
+            .ok_or_else(|| "script variable target no longer exists".to_string())?;
+        apply_variable_writes(&mut variables, values);
+        store::save(root, collection_slug, &Edit::Variables { path, variables })?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -848,6 +958,12 @@ fn open_workspace(
     Ok(dto)
 }
 
+#[tauri::command]
+fn refresh_workspace(state: tauri::State<'_, AppState>) -> Result<WorkspaceDto, String> {
+    let root = workspace_path(&state)?;
+    workspace_dto(&root)
+}
+
 fn tree(items: &[Item], path: &mut Vec<usize>, collection: &Collection) -> Vec<TreeNode> {
     let mut out = Vec::new();
 
@@ -973,11 +1089,7 @@ async fn send(
     state: tauri::State<'_, AppState>,
 ) -> Result<ResponseDto, String> {
     let root = workspace_path(&state)?;
-    let runtime_snapshot = state
-        .script_variables
-        .lock()
-        .map_err(|_| "state poisoned")?
-        .clone();
+    let response_root = root.clone();
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     state
         .cancellations
@@ -1032,11 +1144,6 @@ async fn send(
             ),
         ];
         scope_keys.extend(script_layers.iter().map(|(key, _)| key.clone()));
-        for key in &scope_keys {
-            if let Some(values) = runtime_snapshot.get(key) {
-                variable_map.extend(values.clone());
-            }
-        }
         let mut runtime_writes = BTreeMap::<String, BTreeMap<String, String>>::new();
         for (scope, scripts) in &script_layers {
             let writes = apply_script(
@@ -1052,6 +1159,18 @@ async fn send(
                 runtime_writes.entry(target).or_default().extend(values);
             }
         }
+        persist_script_writes(&root, &collection_slug, runtime_writes)?;
+        let updated = locate(&root, &collection_slug, environment.as_deref())?;
+        let effective = collection::send::variables(
+            &updated.collection,
+            updated.environment.as_ref(),
+            &updated.globals,
+            &request_path,
+        );
+        variable_map = effective
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         let vars = collection::send::Variables::from(variable_map.clone());
         Ok::<_, String>((
             name,
@@ -1064,7 +1183,6 @@ async fn send(
             script_layers,
             scope_keys,
             variable_map,
-            runtime_writes,
             collection::send::SendOptions {
                 insecure,
                 timeout: Duration::from_secs(60),
@@ -1086,18 +1204,8 @@ async fn send(
             script_layers,
             scope_keys,
             mut variable_map,
-            runtime_writes,
             options,
         ))) => {
-            {
-                let mut stored = state
-                    .script_variables
-                    .lock()
-                    .map_err(|_| "state poisoned")?;
-                for (scope, values) in runtime_writes {
-                    stored.entry(scope).or_default().extend(values);
-                }
-            }
             let requested_url = request.url.clone();
             let result = tokio::select! {
                 _ = cancel_rx => Err("Request cancelled".to_string()),
@@ -1105,6 +1213,8 @@ async fn send(
             };
             match result {
                 Ok(sent) => {
+                    let post_root = response_root.clone();
+                    let post_collection = collection_slug.clone();
                     let post = tauri::async_runtime::spawn_blocking(move || {
                         let mut writes_all = BTreeMap::<String, BTreeMap<String, String>>::new();
                         let mut script_errors = Vec::new();
@@ -1140,15 +1250,15 @@ async fn send(
                                 Err(error) => script_errors.push(format!("{scope}: {error}")),
                             }
                         }
-                        (sent, script_errors, writes_all)
+                        if let Err(error) =
+                            persist_script_writes(&post_root, &post_collection, writes_all)
+                        {
+                            script_errors.push(format!("script variable write failed: {error}"));
+                        }
+                        (sent, script_errors)
                     })
                     .await
                     .map_err(|error| format!("post-response script task failed: {error}"))?;
-                    if let Ok(mut stored) = state.script_variables.lock() {
-                        for (scope, values) in post.2 {
-                            stored.entry(scope).or_default().extend(values);
-                        }
-                    }
                     Ok((
                         name,
                         collection_slug,
@@ -1623,6 +1733,7 @@ fn main() {
             initial_workspace,
             pick_workspace,
             open_workspace,
+            refresh_workspace,
             send,
             list_history,
             set_history_limit,

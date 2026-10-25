@@ -2006,6 +2006,21 @@ async function send() {
       tab.error = null;
       tab.cancelled = false;
     }
+    try {
+      state.workspace = await invoke("refresh_workspace");
+      renderWorkspace();
+      if (state.selection?.kind === "request") {
+        const current = findNode(state.selection.slug, state.selection.path);
+        if (current) {
+          state.selection.node = current.node;
+          state.selection.collection = current.collection;
+        }
+      }
+      repaintVariables();
+      refreshPreview();
+    } catch {
+      // The request response remains usable if reloading the saved workspace fails.
+    }
     if (state.activeRequestTab === tabKey) {
       state.response = response;
       showResponseMetadata(response);

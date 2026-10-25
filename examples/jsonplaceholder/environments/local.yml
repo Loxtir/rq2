@@ -3,3 +3,5 @@ insecure: true
 variables:
 - name: apiOrigin
   value: http://127.0.0.1:8788
+- name: test
+  value: b

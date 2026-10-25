@@ -219,6 +219,9 @@ the last one is remembered. Three panes: the tree, the request, the command.
   write is never deleted. The command pane shows the same request as a runnable
   cURL, with secrets masked to `***` and a warning when a `:path` value is
   missing.
+- Collection, folder, and request scripts can run before a request or after its
+  response. See the [scripts and response queries tutorial](docs/scripts-and-queries.md)
+  for `pm.sendRequest`, variable scopes, and query examples.
 
 ## Commands
 
