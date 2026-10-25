@@ -1,0 +1,10 @@
+# Every category id in the tree, at any depth.
+#
+#   curl -s "$API/categories" | rq project -q queries/categories/ids.query -
+#
+# `children...` walks the same key transitively, depth-first, in document order.
+# `[id]` collects one bare value per node instead of one-key objects.
+
+{
+  ids: children...[id]
+}

@@ -1,0 +1,6 @@
+name: JSONPlaceholder
+description: The public fake API used as the sample workspace. No auth, real HTTP.
+auth: none
+variables:
+- name: baseUrl
+  value: '{{apiOrigin}}'

@@ -1,0 +1,14 @@
+# name: Order brief
+# description: what we actually look at during an incident
+{
+  data {
+    items[:5] {
+      id: orderId
+      status
+      total
+      customer { id name }
+    }
+    page
+    totalPages
+  }
+}

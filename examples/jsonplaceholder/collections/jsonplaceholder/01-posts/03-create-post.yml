@@ -1,0 +1,15 @@
+name: Create post
+method: POST
+url: '{{baseUrl}}/posts'
+headers:
+- name: Content-Type
+  value: application/json
+body:
+  mode: raw
+  language: json
+  text: |-
+    {
+      "title": "hello from rq",
+      "body": "testing",
+      "userId": 1
+    }

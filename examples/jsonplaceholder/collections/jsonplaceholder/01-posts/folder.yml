@@ -1,0 +1,4 @@
+name: Posts
+variables:
+- name: limit
+  value: '20'

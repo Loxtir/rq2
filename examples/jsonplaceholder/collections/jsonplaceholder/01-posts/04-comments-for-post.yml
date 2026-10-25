@@ -1,0 +1,5 @@
+name: Comments for post
+method: GET
+url: '{{baseUrl}}/posts/:postId/comments'
+path_params:
+  postId: '1'

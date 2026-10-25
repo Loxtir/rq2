@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>rq</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <aside id="left" class="sidebar">
+      <header class="pane-head brand">
+        <span class="logo">rq</span>
+        <span id="workspace-name" class="workspace-name">no workspace</span>
+        <button id="collapse-left" class="icon-btn" title="Collapse the tree (Ctrl+B)">&#171;</button>
+      </header>
+
+      <div class="sidebar-tools">
+        <select id="environment" class="select" title="Environment">
+          <option value="">no environment</option>
+        </select>
+        <button id="environment-add" class="btn btn-ghost" title="Add an environment">+</button>
+        <button id="environment-edit" class="btn btn-ghost" title="Edit selected environment">Edit</button>
+        <button id="globals-edit" class="btn btn-ghost" title="Edit workspace globals">Globals</button>
+        <button id="open-workspace" class="btn btn-ghost" title="Open a workspace folder">
+          Open
+        </button>
+      </div>
+
+      <details id="collections-section" class="sidebar-section" open>
+        <summary class="sidebar-section-title">Collections</summary>
+        <div class="sidebar-section-content">
+          <div class="tree-search">
+            <input id="tree-search" class="tree-search-input" type="search" placeholder="Search requests by name or URL" autocomplete="off" spellcheck="false" aria-label="Search requests by name or URL" />
+            <button id="tree-search-clear" class="icon-btn" type="button" title="Clear search" hidden>×</button>
+          </div>
+          <nav id="tree" class="tree">
+            <p class="hint">Open a workspace to begin.</p>
+          </nav>
+        </div>
+      </details>
+
+      <details id="history-section" class="sidebar-section">
+        <summary id="history-summary" class="sidebar-section-title">History <span id="history-count" class="section-count"></span></summary>
+        <div class="sidebar-section-content history-content">
+          <div class="history-controls">
+            <label for="history-limit">Response storage limit</label>
+            <div class="history-limit-row"><input id="history-limit" type="number" min="0" step="25" /><span>MB</span><button id="history-clear" class="btn btn-ghost" type="button" title="Clear request and response history">Clear history</button></div>
+          </div>
+          <nav id="history-list" class="tree history-list"></nav>
+        </div>
+      </details>
+
+      <footer class="sidebar-foot">
+        <span id="workspace-path" class="path"></span>
+      </footer>
+    </aside>
+
+    <div
+      id="split-left"
+      class="splitter"
+      role="separator"
+      aria-orientation="vertical"
+      title="Drag to resize · double-click to reset"
+    ></div>
+
+    <main class="main">
+      <div id="collapsed-bar" class="collapsed-bar" hidden>
+        <button id="reveal-left" class="icon-btn reveal-panel" title="Show collections" hidden>&#187;</button>
+        <button id="reveal-right" class="icon-btn reveal-panel" title="Show command panel" hidden>&#171;</button>
+      </div>
+
+      <div id="request-tabs" class="request-tabs" role="tablist" aria-label="Opened items" hidden></div>
+
+      <section id="empty-state" class="empty-state">
+        <div class="empty-inner">
+          <p class="empty-title">rq</p>
+          <p class="empty-body">
+            Pick a request on the left. Edit it, send it, then reshape the
+            response with the query bar &mdash; every projection after that runs
+            locally.
+          </p>
+        </div>
+      </section>
+
+      <section id="request-view" class="view" hidden>
+        <div class="url-bar">
+          <div class="method-picker">
+            <button id="method-trigger" class="method-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" title="Method">
+              <span id="method-label">GET</span><span class="method-chevron">▾</span>
+            </button>
+            <div id="method-menu" class="method-menu" role="listbox" aria-label="Request method" hidden></div>
+          </div>
+          <select id="method" hidden aria-hidden="true" tabindex="-1" title="Method">
+            <option>GET</option>
+            <option>POST</option>
+            <option>PUT</option>
+            <option>PATCH</option>
+            <option>DELETE</option>
+            <option>HEAD</option>
+            <option>OPTIONS</option>
+          </select>
+          <input
+            id="url"
+            class="url-input"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="{{baseUrl}}/path?query=1"
+          />
+          <button id="send" class="btn btn-primary" title="Send (Ctrl+Enter)">Send</button>
+        </div>
+
+        <div class="meta-bar">
+          <input
+            id="request-name"
+            class="name-input"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="request name"
+            title="The file is named after this"
+          />
+          <span id="auth" class="tag"></span>
+          <span id="dirty" class="dirty" hidden title="Unsaved changes">&#9679;</span>
+          <span id="save-note" class="muted"></span>
+          <button id="request-history" class="btn btn-ghost" type="button" hidden>History</button>
+          <span class="spacer"></span>
+          <span id="missing-vars" class="tag tag-warn" hidden></span>
+          <button id="save" class="btn" disabled title="Save to disk (Ctrl+S)">Save</button>
+        </div>
+
+        <div class="tabs" id="tabs">
+          <button class="tab" data-tab="params">
+            Params <span id="param-count" class="count"></span>
+          </button>
+          <button class="tab" data-tab="headers">
+            Headers <span id="header-count" class="count"></span>
+          </button>
+          <button class="tab" data-tab="body">Body</button>
+          <button class="tab" data-tab="auth">Auth</button>
+          <button class="tab" data-tab="scripts">Scripts</button>
+        </div>
+
+        <div class="tab-body">
+          <div id="tab-params" class="tab-panel">
+            <div class="subhead">
+              Path variables
+            </div>
+            <div id="path-params" class="rows"></div>
+
+            <div class="subhead">
+              Query parameters
+            </div>
+            <div id="params" class="rows"></div>
+            <button class="btn btn-ghost add-row" data-add="param">+ Add param</button>
+          </div>
+
+          <div id="tab-headers" class="tab-panel" hidden>
+            <div id="headers" class="rows"></div>
+            <button class="btn btn-ghost add-row" data-add="header">+ Add header</button>
+          </div>
+
+          <div id="tab-body" class="tab-panel" hidden>
+            <div class="body-tools">
+              <select id="body-language" class="select select-narrow" title="Body language">
+                <option value="json">json</option>
+                <option value="text">text</option>
+                <option value="xml">xml</option>
+              </select>
+              <span class="spacer"></span>
+              <button id="body-clear" class="btn btn-ghost">Clear</button>
+            </div>
+            <textarea
+              id="body-text"
+              class="body-text"
+              spellcheck="false"
+              placeholder="request body"
+            ></textarea>
+          </div>
+
+          <div id="tab-auth" class="tab-panel" hidden>
+            <div id="request-auth" class="auth-host"></div>
+          </div>
+          <div id="tab-scripts" class="tab-panel" hidden>
+            <label class="field"><span class="field-label">Pre-request</span><textarea id="request-pre-script" class="body-text script-editor" spellcheck="false"></textarea></label>
+            <label class="field"><span class="field-label">Post-response</span><textarea id="request-post-script" class="body-text script-editor" spellcheck="false"></textarea></label>
+          </div>
+        </div>
+
+        <div class="response">
+          <div class="response-bar">
+            <span class="response-title">Response</span>
+            <span id="status" class="status status-idle">no response</span>
+            <span id="timing" class="muted"></span>
+            <span id="script-errors" class="status status-error" hidden></span>
+            <span id="tls" class="tag tag-warn" hidden>TLS not verified</span>
+            <span class="spacer"></span>
+            <span id="resolved" class="resolved" hidden></span>
+            <span id="sizes" class="muted"></span>
+          </div>
+
+          <div class="query-bar">
+            <span class="prompt">query</span>
+            <input
+              id="query"
+              class="query"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="{ id title }"
+            />
+            <button id="apply-query" class="btn btn-ghost">Apply</button>
+            <button id="suggest" class="btn btn-ghost" title="Infer a query from this response">
+              Suggest
+            </button>
+          </div>
+
+          <div id="query-error" class="query-error" hidden></div>
+
+          <div id="response-body" class="code response-body">Send the request to see a response.</div>
+        </div>
+      </section>
+
+      <section id="node-view" class="view" hidden>
+        <div class="url-bar">
+          <span id="node-kind" class="tag">collection</span>
+          <input id="node-name" class="url-input" spellcheck="false" autocomplete="off" />
+          <button id="node-save" class="btn" disabled title="Save to disk (Ctrl+S)">Save</button>
+        </div>
+
+        <div class="meta-bar">
+          <span id="node-dirty" class="dirty" hidden title="Unsaved changes">&#9679;</span>
+          <span id="node-note" class="muted"></span>
+          <span class="spacer"></span>
+          <span id="node-count" class="muted"></span>
+        </div>
+
+        <div id="collection-fields">
+          <label class="field">
+            <span class="field-label">Description</span>
+            <textarea
+              id="node-description"
+              class="body-text body-text-short"
+              spellcheck="false"
+              placeholder="What this collection is for"
+            ></textarea>
+          </label>
+
+          <div class="section-title">
+            Variables
+            <span class="muted">resolve <code>{{name}}</code> in every request here</span>
+          </div>
+          <div id="variables" class="rows"></div>
+          <button class="btn btn-ghost add-row" data-add="variable">+ Add variable</button>
+        </div>
+
+        <div class="section-title">
+          Auth
+          <span class="muted">applies to every request that inherits it</span>
+        </div>
+        <div id="node-auth" class="auth-host"></div>
+        <div class="section-title">Scripts</div>
+        <label class="field"><span class="field-label">Pre-request</span><textarea id="node-pre-script" class="body-text script-editor" spellcheck="false"></textarea></label>
+        <label class="field"><span class="field-label">Post-response</span><textarea id="node-post-script" class="body-text script-editor" spellcheck="false"></textarea></label>
+      </section>
+    </main>
+
+    <div
+      id="split-right"
+      class="splitter"
+      role="separator"
+      aria-orientation="vertical"
+      title="Drag to resize · double-click to reset"
+    ></div>
+
+    <aside id="right" class="inspector">
+      <header class="pane-head">
+        <span class="pane-title">Command</span>
+        <span id="preview-masked" class="tag tag-warn" hidden>secrets masked</span>
+        <span class="spacer"></span>
+        <button id="collapse-right" class="icon-btn" title="Collapse this panel">&#187;</button>
+      </header>
+
+      <div class="inspector-body">
+        <div class="curl-actions">
+          <button id="copy-curl" class="btn" disabled>Copy as cURL</button>
+          <span id="copy-note" class="muted"></span>
+        </div>
+
+        <pre id="curl" class="code curl">Select a request.</pre>
+        <p id="preview-problem" class="curl-problem" hidden></p>
+
+        <p class="hint">
+          Runs in bash or zsh. PowerShell aliases <code>curl</code>, so use
+          <code>curl.exe</code> there.
+        </p>
+
+        <div class="section-title">Details</div>
+        <dl id="summary" class="summary"></dl>
+      </div>
+    </aside>
+
+    <div id="var-popover" class="var-popover" hidden>
+      <div class="var-popover-head">
+        <code id="var-name"></code>
+        <span id="var-scope" class="tag"></span>
+      </div>
+      <input
+        id="var-value"
+        class="cell var-popover-value"
+        spellcheck="false"
+        autocomplete="off"
+      />
+      <p id="var-note" class="hint"></p>
+      <label id="var-create-row" class="var-popover-create" hidden>
+        <span class="hint">Create in</span>
+        <select id="var-create">
+          <option value="collection">collection</option>
+          <option value="environment">environment</option>
+          <option value="globals">globals</option>
+        </select>
+      </label>
+      <div class="var-popover-actions">
+        <button id="var-save" class="btn btn-primary">Save value</button>
+        <button id="var-cancel" class="btn btn-ghost">Cancel</button>
+      </div>
+    </div>
+
+    <dialog id="environment-dialog" class="editor-dialog">
+      <form method="dialog" id="environment-form">
+        <div class="dialog-head">
+          <strong id="environment-dialog-title">Environment</strong>
+          <button type="button" id="environment-close" class="icon-btn" title="Close">×</button>
+        </div>
+        <label id="environment-name-field" class="field">
+          <span class="field-label">Name</span>
+          <input id="environment-name" class="cell" autocomplete="off" />
+        </label>
+        <label id="environment-insecure-field" class="check-line">
+          <input id="environment-insecure" type="checkbox" />
+          <span>Skip TLS certificate verification for this environment</span>
+        </label>
+        <div class="section-title">Variables</div>
+        <div id="environment-variables" class="rows"></div>
+        <button type="button" id="environment-add-variable" class="btn btn-ghost add-row">+ Add variable</button>
+        <div id="environment-dialog-note" class="muted dialog-note"></div>
+        <div class="dialog-actions">
+          <button type="button" id="environment-delete" class="btn btn-danger" hidden>Delete environment</button>
+          <span class="spacer"></span>
+          <button type="button" id="environment-cancel" class="btn btn-ghost">Cancel</button>
+          <button type="button" id="environment-save" class="btn btn-primary">Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="request-history-dialog" class="editor-dialog request-history-dialog">
+      <div class="dialog-head">
+        <strong id="request-history-title">Request history</strong>
+        <button type="button" id="request-history-close" class="icon-btn" title="Close">×</button>
+      </div>
+      <div id="request-history-list" class="request-history-list"></div>
+    </dialog>
+
+    <script src="app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,6 @@
+name: Todos for a user
+method: GET
+url: '{{baseUrl}}/todos'
+params:
+- name: userId
+  value: '1'

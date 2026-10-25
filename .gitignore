@@ -1,5 +1,6 @@
 /target
 **/target
+/target-ui-copy/
 
 # Secrets are never committed. This is the only guard, so keep it.
 .secrets/

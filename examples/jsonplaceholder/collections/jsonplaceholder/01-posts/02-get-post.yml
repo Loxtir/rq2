@@ -1,0 +1,8 @@
+name: Get post
+method: GET
+url: '{{baseUrl}}/posts/:postId'
+path_params:
+  postId: '{{postNumber}}'
+variables:
+- name: postNumber
+  value: '1'

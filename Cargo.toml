@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/response-query", "crates/collection", "crates/rq-cli", "crates/desktop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_norway = "0.9.42"
+base64 = "0.22"
+ureq = { version = "2", default-features = false, features = ["native-tls", "gzip"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "gzip"] }
+tokio = { version = "1", features = ["sync", "macros", "rt"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+response-query = { path = "crates/response-query" }
+collection = { path = "crates/collection" }

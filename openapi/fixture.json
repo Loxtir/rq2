@@ -1,0 +1,130 @@
+{
+  "openapi": "3.1.0",
+  "info": { "title": "rq fixture", "version": "1.0.0" },
+  "paths": {
+    "/orders": {
+      "get": {
+        "operationId": "listOrders",
+        "summary": "List orders",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ListOrdersResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/nodes/{id}": {
+      "get": {
+        "operationId": "getNode",
+        "summary": "Fetch a tree node",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Node" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ListOrdersResponse": {
+        "type": "object",
+        "properties": {
+          "data": { "$ref": "#/components/schemas/OrderPage" },
+          "meta": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "Page": {
+        "type": "object",
+        "required": ["page"],
+        "properties": {
+          "page": { "type": "integer" },
+          "totalPages": { "type": "integer" }
+        }
+      },
+      "OrderPage": {
+        "allOf": [
+          { "$ref": "#/components/schemas/Page" },
+          {
+            "type": "object",
+            "required": ["items"],
+            "properties": {
+              "items": {
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/Order" }
+              },
+              "metadata": {
+                "type": "object",
+                "additionalProperties": { "type": "string" }
+              }
+            }
+          }
+        ]
+      },
+      "Order": {
+        "type": "object",
+        "required": ["orderId", "status"],
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "description": "Stable order identifier"
+          },
+          "total": { "type": "number" },
+          "status": { "type": "string" },
+          "customer": { "$ref": "#/components/schemas/Customer" },
+          "payment": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/CardPayment" },
+              { "$ref": "#/components/schemas/InvoicePayment" }
+            ]
+          },
+          "cancelledAt": { "type": ["string", "null"], "format": "date-time" }
+        }
+      },
+      "Customer": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "name": { "type": "string" },
+          "email": { "type": ["string", "null"] }
+        }
+      },
+      "CardPayment": {
+        "type": "object",
+        "properties": {
+          "kind": { "type": "string" },
+          "last4": { "type": "string" },
+          "brand": { "type": "string" }
+        }
+      },
+      "InvoicePayment": {
+        "type": "object",
+        "properties": {
+          "kind": { "type": "string" },
+          "invoiceNumber": { "type": "string" },
+          "dueDate": { "type": "string" }
+        }
+      },
+      "Node": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "label": { "type": "string" },
+          "parent": { "$ref": "#/components/schemas/Node" },
+          "children": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Node" }
+          }
+        }
+      }
+    }
+  }
+}

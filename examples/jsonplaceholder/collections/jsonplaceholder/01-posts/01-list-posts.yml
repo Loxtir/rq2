@@ -1,0 +1,9 @@
+name: List posts
+method: GET
+url: '{{baseUrl}}/posts'
+params:
+- name: _limit
+  value: '{{limit}}'
+headers:
+- name: Accept
+  value: application/json

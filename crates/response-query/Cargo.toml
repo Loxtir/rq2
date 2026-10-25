@@ -1,0 +1,12 @@
+[package]
+name = "response-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Projection language for JSON API responses, with schema validation from OpenAPI or observed samples."
+
+[dependencies]
+prost-reflect = "0.16.5"
+protox = "0.10.0"
+serde_json.workspace = true
+serde_norway = "0.9.42"
