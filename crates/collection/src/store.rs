@@ -306,6 +306,91 @@ fn unique_stem(name: &str, used: &mut BTreeSet<String>) -> String {
     }
 }
 
+/// Imports one Postman export into an existing workspace without replacing data.
+/// Globals add new names; collections and environments must have unused paths.
+pub fn import_postman(
+    root: &Path,
+    kind: &str,
+    bytes: &[u8],
+    extra_secrets: &[String],
+) -> Result<Vec<String>, String> {
+    let workspace = load(root)?;
+    let before = if kind == "globals" {
+        globals_files(&workspace.globals).0
+    } else {
+        BTreeMap::new()
+    };
+    let (files, secrets, warnings) = match kind {
+        "collection" => {
+            let parsed = crate::postman::parse_collection(bytes, extra_secrets)?;
+            required_name(&parsed.collection.name)?;
+            let directory = format!(
+                "collections/{}",
+                slug_or(&parsed.collection.name, "collection")
+            );
+            if root.join(&directory).exists() {
+                return Err(format!("refusing to overwrite existing `{directory}`"));
+            }
+            let (files, secrets) = collection_files(&parsed.collection);
+            (files, secrets, parsed.warnings)
+        }
+        "environment" => {
+            let parsed = crate::postman::parse_environment(bytes, extra_secrets)?;
+            required_name(&parsed.environment.name)?;
+            let slug = slug_or(&parsed.environment.name, "environment");
+            if workspace
+                .environments
+                .iter()
+                .any(|env| slug_or(&env.name, "environment") == slug)
+            {
+                return Err(format!(
+                    "an environment called `{}` already exists",
+                    parsed.environment.name
+                ));
+            }
+            let (files, secrets) = environment_files(&parsed.environment);
+            (files, secrets, parsed.warnings)
+        }
+        "globals" => {
+            let parsed = crate::postman::parse_globals(bytes, extra_secrets)?;
+            let mut variables = workspace.globals;
+            for variable in parsed.variables {
+                if variables
+                    .iter()
+                    .any(|existing| existing.name == variable.name)
+                {
+                    return Err(format!(
+                        "global variable `{}` already exists; edit it in Globals instead",
+                        variable.name
+                    ));
+                }
+                variables.push(variable);
+            }
+            let (files, secrets) = globals_files(&variables);
+            (files, secrets, parsed.warnings)
+        }
+        _ => return Err("choose collection, environment, or globals".to_string()),
+    };
+
+    let leaks = find_leaks(&files, &secrets);
+    if !leaks.is_empty() {
+        return Err(format!(
+            "refusing to import: secret value found in a committed file ({})",
+            leaks.join("; ")
+        ));
+    }
+    for path in files.keys() {
+        // Globals were explicitly merged above, including their stored secrets.
+        if root.join(path).exists() && (kind != "globals" || !before.contains_key(path)) {
+            return Err(format!("refusing to overwrite existing `{path}`"));
+        }
+    }
+    ensure_gitignore(root).map_err(|error| error.to_string())?;
+    ensure_gitattributes(root).map_err(|error| error.to_string())?;
+    apply_delta(root, &before, &files)?;
+    Ok(warnings)
+}
+
 pub fn write(out: &Path, rendered: &Rendered) -> io::Result<()> {
     if !rendered.report.leaks.is_empty() {
         return Err(io::Error::new(

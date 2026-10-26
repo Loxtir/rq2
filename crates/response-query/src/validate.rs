@@ -17,7 +17,7 @@ fn walk(sel: &Selection, schema: &Schema, out: &mut Vec<Diag>) {
     };
 
     for field in &sel.fields {
-        if field.is_wildcard() {
+        if field.is_wildcard() || field.excluded {
             continue;
         }
 
@@ -39,14 +39,15 @@ fn walk(sel: &Selection, schema: &Schema, out: &mut Vec<Diag>) {
             Some(schema_field) => {
                 let target = unwrap_arrays(&schema_field.schema);
 
-                if field.recursive
+                if (field.recursive || field.tree_recursive)
                     && !matches!(target.kind, SchemaKind::Object(_) | SchemaKind::Any)
                 {
                     out.push(Diag::new(
                         format!(
-                            "`{}` is {}, so `...` cannot walk through it",
+                            "`{}` is {}, so `{}` cannot walk through it",
                             field.name,
-                            target.note_pointer()
+                            target.note_pointer(),
+                            if field.tree_recursive { "**" } else { "..." }
                         ),
                         field.span,
                     ));

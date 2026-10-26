@@ -1,7 +1,8 @@
 use collection::model::{AuthSetting, Collection, Item, KeyValue, RequestDef, Variable};
-use collection::postman::{parse_collection, parse_environment};
+use collection::postman::{parse_collection, parse_environment, parse_globals};
 use collection::store::{
-    ensure_gitattributes, ensure_gitignore, load, parse_env, quote_env, render, slugify, write,
+    ensure_gitattributes, ensure_gitignore, import_postman, load, parse_env, quote_env, render,
+    slugify, write,
 };
 use std::path::PathBuf;
 
@@ -673,6 +674,157 @@ fn names_become_file_safe_slugs() {
     assert_eq!(slugify("dev"), "dev");
     assert_eq!(slugify("Staging EU (west)"), "staging-eu-west");
     assert_eq!(slugify("///"), "");
+}
+
+#[test]
+fn postman_globals_parse_secrets_disabled_and_structured_values() {
+    let parsed = parse_globals(
+        br#"{"_postman_variable_scope":"globals","values":[
+          {"key":"origin","value":"https://api.test"},
+          {"key":"token","value":"global-secret-value","type":"secret"},
+          {"key":"password","value":"extra-secret-value"},
+          {"key":"off","value":"ignored","enabled":false},
+          {"key":"object","value":{"x":1}}
+        ]}"#,
+        &["password".to_string()],
+    )
+    .unwrap();
+    assert_eq!(parsed.variables.len(), 4);
+    assert!(parsed.variables[1].secret);
+    assert!(parsed.variables[2].secret);
+    assert_eq!(parsed.variables[3].value.as_deref(), Some(r#"{"x":1}"#));
+    assert_eq!(parsed.warnings.len(), 1);
+}
+
+#[test]
+fn variable_exports_reject_the_wrong_type_or_missing_values() {
+    assert!(parse_globals(ENVIRONMENT.as_bytes(), &[]).is_err());
+    assert!(parse_globals(br#"{"_postman_variable_scope":"globals"}"#, &[]).is_err());
+    assert!(parse_environment(br#"{"name":"not an environment"}"#, &[]).is_err());
+    assert!(parse_environment(
+        br#"{"name":"globals","values":[],"_postman_variable_scope":"globals"}"#,
+        &[]
+    )
+    .is_err());
+}
+
+#[test]
+fn desktop_import_creates_yaml_and_preserves_other_workspace_files() {
+    let dir = temp_dir("desktop-import");
+    std::fs::write(dir.join("notes.txt"), "user file").unwrap();
+    std::fs::write(dir.join("secrets.example.env"), "# existing examples\n").unwrap();
+    import_postman(&dir, "collection", POSTMAN.as_bytes(), &[]).unwrap();
+    import_postman(&dir, "environment", ENVIRONMENT.as_bytes(), &[]).unwrap();
+    import_postman(
+        &dir,
+        "globals",
+        br#"{"_postman_variable_scope":"globals","values":[
+        {"key":"origin","value":"https://api.test"},
+        {"key":"globalToken","value":"global-secret-value","type":"secret"}
+    ]}"#,
+        &[],
+    )
+    .unwrap();
+
+    let workspace = load(&dir).unwrap();
+    assert_eq!(workspace.collections[0], parsed());
+    assert_eq!(workspace.environments[0], parsed_environment());
+    assert_eq!(
+        workspace.globals[1].value.as_deref(),
+        Some("global-secret-value")
+    );
+    assert!(dir
+        .join("collections/acme-api/02-admin/01-create-order.yml")
+        .is_file());
+    assert!(dir.join("environments/dev.yml").is_file());
+    assert!(!std::fs::read_to_string(dir.join("globals.yml"))
+        .unwrap()
+        .contains("global-secret-value"));
+    assert!(std::fs::read_to_string(dir.join(".secrets/globals.env"))
+        .unwrap()
+        .contains("global-secret-value"));
+    assert!(std::fs::read_to_string(dir.join(".gitignore"))
+        .unwrap()
+        .contains("/.secrets/"));
+    assert!(dir.join(".gitattributes").is_file());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("notes.txt")).unwrap(),
+        "user file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("secrets.example.env")).unwrap(),
+        "# existing examples\n"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn desktop_import_refuses_existing_collections_and_environments() {
+    let dir = temp_dir("desktop-collisions");
+    import_postman(&dir, "collection", POSTMAN.as_bytes(), &[]).unwrap();
+    import_postman(&dir, "environment", ENVIRONMENT.as_bytes(), &[]).unwrap();
+    let before = load(&dir).unwrap();
+    assert!(import_postman(&dir, "collection", POSTMAN.as_bytes(), &[])
+        .unwrap_err()
+        .contains("overwrite"));
+    assert!(
+        import_postman(&dir, "environment", ENVIRONMENT.as_bytes(), &[])
+            .unwrap_err()
+            .contains("already exists")
+    );
+    let after = load(&dir).unwrap();
+    assert_eq!(before.collections, after.collections);
+    assert_eq!(before.environments, after.environments);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn desktop_globals_import_merges_new_names_and_rejects_duplicates_without_changes() {
+    let dir = temp_dir("desktop-globals");
+    let first = br#"{"_postman_variable_scope":"globals","values":[{"key":"token","value":"stored-global-secret","type":"secret"}]}"#;
+    import_postman(&dir, "globals", first, &[]).unwrap();
+    let secret_path = dir.join(".secrets/globals.env");
+    let modified = std::fs::metadata(&secret_path).unwrap().modified().unwrap();
+    import_postman(&dir, "globals", br#"{"_postman_variable_scope":"globals","values":[{"key":"origin","value":"https://api.test"}]}"#, &[]).unwrap();
+    assert_eq!(
+        std::fs::metadata(&secret_path).unwrap().modified().unwrap(),
+        modified
+    );
+    let before = std::fs::read(dir.join("globals.yml")).unwrap();
+    assert!(import_postman(&dir, "globals", first, &[])
+        .unwrap_err()
+        .contains("already exists"));
+    assert_eq!(std::fs::read(dir.join("globals.yml")).unwrap(), before);
+    assert_eq!(load(&dir).unwrap().globals.len(), 2);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn desktop_import_refuses_secret_leaks_before_writing() {
+    let dir = temp_dir("desktop-leak");
+    let unsafe_export = POSTMAN.replace("{{baseUrl}}/v1/ping", TOKEN);
+    assert!(
+        import_postman(&dir, "collection", unsafe_export.as_bytes(), &[])
+            .unwrap_err()
+            .contains("secret value")
+    );
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn desktop_import_refuses_shared_secret_file_collisions() {
+    let dir = temp_dir("desktop-secret-collision");
+    import_postman(&dir, "collection", POSTMAN.as_bytes(), &[]).unwrap();
+    let environment = ENVIRONMENT.replace("\"dev\"", "\"Acme API\"");
+    assert!(
+        import_postman(&dir, "environment", environment.as_bytes(), &[])
+            .unwrap_err()
+            .contains(".secrets/acme-api.env")
+    );
+    assert!(!dir.join("environments").exists());
+    assert_eq!(load(&dir).unwrap().collections[0], parsed());
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 fn temp_dir(tag: &str) -> PathBuf {

@@ -24,6 +24,7 @@
         <button id="open-workspace" class="btn btn-ghost" title="Open a workspace folder">
           Open
         </button>
+        <button id="import-postman" class="btn btn-ghost" title="Import Postman JSON into this workspace" disabled>Import</button>
       </div>
 
       <details id="collections-section" class="sidebar-section" open>
@@ -280,20 +281,18 @@
 
       <div class="inspector-body">
         <div class="curl-actions">
-          <button id="copy-curl" class="btn" disabled>Copy as cURL</button>
-          <span id="copy-note" class="muted"></span>
+          <button id="copy-curl" class="btn" disabled title="Copy cURL with secret variables masked">Copy protected</button>
+          <button id="copy-curl-secrets" class="btn btn-ghost" disabled title="Copy cURL with actual secret values to the clipboard">Copy with secrets…</button>
+          <span id="copy-note" class="muted" role="status" aria-live="polite"></span>
         </div>
 
         <pre id="curl" class="code curl">Select a request.</pre>
         <p id="preview-problem" class="curl-problem" hidden></p>
 
-        <p class="hint">
-          Runs in bash or zsh. PowerShell aliases <code>curl</code>, so use
-          <code>curl.exe</code> there.
-        </p>
-
-        <div class="section-title">Details</div>
-        <dl id="summary" class="summary"></dl>
+        <details id="command-details" class="command-details" open>
+          <summary class="section-title">Details</summary>
+          <dl id="summary" class="summary"></dl>
+        </details>
       </div>
     </aside>
 
@@ -322,6 +321,36 @@
         <button id="var-cancel" class="btn btn-ghost">Cancel</button>
       </div>
     </div>
+
+    <dialog id="import-dialog" class="editor-dialog">
+      <form method="dialog">
+        <div class="dialog-head">
+          <strong>Import from Postman</strong>
+          <button type="button" id="import-close" class="icon-btn" title="Close">×</button>
+        </div>
+        <p class="hint">Choose a Postman JSON export. YAML files are created in the current workspace:</p>
+        <p id="import-workspace" class="path"></p>
+        <label class="field">
+          <span class="field-label">Export type</span>
+          <select id="import-kind" class="select">
+            <option value="collection">Collection → collections/</option>
+            <option value="environment">Environment → environments/</option>
+            <option value="globals">Globals → globals.yml</option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="field-label">Additional secret variable names (comma-separated, optional)</span>
+          <input id="import-secrets" class="cell" autocomplete="off" placeholder="apiToken, password" />
+        </label>
+        <p class="hint">Variables marked secret in Postman, or named above, stay in .secrets/. Other values are saved in YAML. Existing collections and environments are never replaced; globals add new names only. Postman event scripts are not imported.</p>
+        <div id="import-note" class="muted dialog-note" role="status" aria-live="polite"></div>
+        <div class="dialog-actions">
+          <span class="spacer"></span>
+          <button type="button" id="import-done" class="btn btn-ghost">Close</button>
+          <button type="button" id="import-choose" class="btn btn-primary">Choose file and import</button>
+        </div>
+      </form>
+    </dialog>
 
     <dialog id="environment-dialog" class="editor-dialog">
       <form method="dialog" id="environment-form">
@@ -358,6 +387,7 @@
       <div id="request-history-list" class="request-history-list"></div>
     </dialog>
 
+    <script src="syntax.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

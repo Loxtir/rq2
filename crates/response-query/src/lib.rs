@@ -17,6 +17,8 @@
 //! - `[a:b]` slices an array, negative indices count from the end
 //! - `[id]` collects one value per element into a flat list
 //! - `children...{ id }` walks a repeated key to any depth
+//! - `children**{ id }` repeats a projection while retaining the nested tree
+//! - `{ * !secret }` omits a key here; `{ * !secret... }` omits it at any depth
 
 pub mod diag;
 pub mod infer;

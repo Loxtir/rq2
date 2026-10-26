@@ -2,10 +2,11 @@
 //!
 //! ```text
 //! selection := '{' field* '}'
-//! field     := alias? name suffix* selection?
+//! field     := '!' name '...'? | alias? name suffix* selection?
 //! alias     := IDENT ':'
 //! name      := IDENT | '*'
 //! suffix    := '...'                    walk this same key transitively
+//!            | '**'                     project a repeated key, keeping its tree
 //!            | '[' INT? ':' INT? ']'     slice an array
 //!            | '[' collect-body ']'      one value per element, flattened
 //!            | '!'
@@ -28,6 +29,10 @@ pub struct Field {
     /// `children...` — apply this same key transitively, producing one flat
     /// list of every node reachable through it.
     pub recursive: bool,
+    /// `children** { id }` — repeat the selection while retaining nested edges.
+    pub tree_recursive: bool,
+    /// `!name` omits this key; `!name...` also omits it throughout this subtree.
+    pub excluded: bool,
     /// Brackets in source order. At most one slice and one collect.
     pub steps: Vec<Step>,
     /// `field!` — fail the projection if the response omits it.
@@ -55,6 +60,9 @@ impl Selection {
     pub fn find(&self, key: &str) -> Option<usize> {
         let mut wildcard = None;
         for (i, f) in self.fields.iter().enumerate() {
+            if f.excluded {
+                continue;
+            }
             if f.is_wildcard() {
                 if wildcard.is_none() {
                     wildcard = Some(i);
@@ -76,6 +84,8 @@ impl Selection {
         if field.is_wildcard()
             || field.alias.is_some()
             || field.recursive
+            || field.tree_recursive
+            || field.excluded
             || field.required
             || !field.steps.is_empty()
             || field.selection.is_some()
@@ -244,6 +254,11 @@ impl<'a> Parser<'a> {
         self.skip_trivia();
         let start = self.pos;
 
+        let excluded = self.peek() == Some(b'!');
+        if excluded {
+            self.pos += 1;
+        }
+
         let mut alias = None;
         let name;
 
@@ -264,26 +279,30 @@ impl<'a> Parser<'a> {
         }
 
         let mut recursive = false;
+        let mut tree_recursive = false;
         let mut required = false;
         let mut steps: Vec<Step> = Vec::new();
 
         loop {
             self.skip_trivia();
-            if self.b[self.pos..].starts_with(b"...") {
-                if recursive {
+            let flat = self.b[self.pos..].starts_with(b"...");
+            let tree = self.b[self.pos..].starts_with(b"**");
+            if flat || tree {
+                if recursive || tree_recursive {
                     return Err(Diag::new(
-                        "`...` may only be written once per field",
+                        "choose one recursion suffix per field: `...` or `**`",
                         Span::point(self.pos),
                     ));
                 }
                 if name == "*" {
                     return Err(Diag::new(
-                        "`...` needs a field name to walk, not `*`",
+                        "recursion needs a field name to walk, not `*`",
                         Span::point(self.pos),
                     ));
                 }
-                recursive = true;
-                self.pos += 3;
+                recursive = flat;
+                tree_recursive = tree;
+                self.pos += if flat { 3 } else { 2 };
                 continue;
             }
             match self.peek() {
@@ -292,6 +311,10 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 Some(b'!') => {
+                    // `id!` is required; `id !secret` starts another field.
+                    if self.b.get(self.pos + 1).is_some_and(|b| !is_delimiter(*b)) {
+                        break;
+                    }
                     self.pos += 1;
                     required = true;
                     continue;
@@ -332,11 +355,30 @@ impl<'a> Parser<'a> {
             None
         };
 
-        if recursive && selection.is_none() && !seen_collect {
+        if excluded
+            && (name == "*"
+                || alias.is_some()
+                || required
+                || tree_recursive
+                || !steps.is_empty()
+                || selection.is_some())
+        {
+            return Err(Diag::new(
+                "an exclusion must be `!field` or `!field...`, without an alias, selection, or other suffixes",
+                self.span_from(start),
+            ));
+        }
+        if tree_recursive && (selection.is_none() || !steps.is_empty()) {
+            return Err(Diag::new(
+                format!("`{name}**` needs a selection set, without slices or collects: `{name}** {{ field }}`"),
+                self.span_from(start),
+            ));
+        }
+        if recursive && !excluded && selection.is_none() && !seen_collect {
             return Err(Diag::new(
                 format!(
-                    "`{name}...` needs to say what to keep: `{name}...{{ field }}` keeps structure, \
-                     `{name}...[field]` returns a flat list"
+                    "`{name}...` needs to say what to keep: `{name}...{{ field }}` returns projected nodes, \
+                     `{name}...[field]` returns collected values"
                 ),
                 self.span_from(start),
             ));
@@ -352,6 +394,8 @@ impl<'a> Parser<'a> {
             name,
             alias,
             recursive,
+            tree_recursive,
+            excluded,
             steps,
             required,
             selection,

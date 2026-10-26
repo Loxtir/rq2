@@ -322,7 +322,9 @@ function variableInfo(name) {
    An input cannot colour part of its own text. A layer above it paints a tint
    behind every token instead: the text stays the real input text (crisp, with a
    caret), and the layer is the only thing that knows where a token is. The
-   layer takes no pointer events; hover is found from the token rectangles. */
+   layer takes no pointer events; hover is found from the token rectangles.
+   Code editors also paint syntax here and hide the textarea's text, but keep
+   its native caret, selection, undo, and input behavior. */
 
 function withVariables(input) {
   if (input.dataset.layered) return input.parentElement;
@@ -340,10 +342,10 @@ function withVariables(input) {
   input.dataset.layered = "1";
 
   input.addEventListener("input", () => paintVariables(input));
-  input.addEventListener("scroll", () => {
-    layer.scrollTop = input.scrollTop;
-    layer.scrollLeft = input.scrollLeft;
-  });
+  input.addEventListener("scroll", () => syncVariableLayer(input, layer));
+  if (input.tagName === "TEXTAREA") {
+    new ResizeObserver(() => syncVariableLayer(input, layer)).observe(input);
+  }
 
   wireVariableHover(wrap);
   paintVariables(input);
@@ -355,12 +357,40 @@ function paintVariables(input) {
   if (!layer) return;
 
   layer.replaceChildren();
-  const text = input.value;
+  const script = input.classList.contains("script-editor");
+  const language = script ? "javascript"
+    : input.id === "body-text" && $("body-language").value === "json" ? "json" : null;
+  input.parentElement.classList.toggle("syntax-editor", Boolean(language));
+  for (const part of syntaxParts(input.value, language)) {
+    const target = part.kind ? document.createElement("span") : layer;
+    if (part.kind) {
+      target.className = part.kind;
+      layer.append(target);
+    }
+    if (script) target.append(document.createTextNode(part.text));
+    else appendVariableText(target, part.text, input.id === "url");
+  }
+  // Textareas retain a final empty line; the overlay must have one too.
+  if (input.value.endsWith("\n")) layer.append(document.createTextNode("\u200b"));
+  syncVariableLayer(input, layer);
+}
+
+function syncVariableLayer(input, layer) {
+  if (input.tagName === "TEXTAREA") {
+    // Exclude the textarea's scrollbars so both layers wrap at the same column.
+    layer.style.width = `${input.clientWidth + 2}px`;
+    layer.style.height = `${input.clientHeight + 2}px`;
+  }
+  layer.scrollTop = input.scrollTop;
+  layer.scrollLeft = input.scrollLeft;
+}
+
+function appendVariableText(layer, text, paths) {
   const tokens = [];
   for (const match of text.matchAll(variablePattern)) {
     tokens.push({ start: match.index, end: match.index + match[0].length, kind: "variable", text: match[0], name: match[1].trim() });
   }
-  if (input.id === "url") {
+  if (paths) {
     const queryAt = text.indexOf("?");
     const path = text.slice(0, queryAt < 0 ? text.length : queryAt);
     for (const match of path.matchAll(/:[^/?#]+/g)) {
@@ -388,8 +418,6 @@ function paintVariables(input) {
   }
 
   if (at < text.length) layer.append(document.createTextNode(text.slice(at)));
-  layer.scrollTop = input.scrollTop;
-  layer.scrollLeft = input.scrollLeft;
 }
 
 function repaintVariables() {
@@ -1208,6 +1236,8 @@ function openRequest(node, collection, path, keepResponse = false) {
   $("request-name").value = state.draft.name;
   $("request-pre-script").value = state.draft.scripts?.pre_request || "";
   $("request-post-script").value = state.draft.scripts?.post_response || "";
+  paintVariables($("request-pre-script"));
+  paintVariables($("request-post-script"));
 
   renderParams();
   renderHeaders();
@@ -1368,6 +1398,8 @@ function paintNodeAuth(inherited) {
 function renderNodeScripts() {
   $("node-pre-script").value = state.draft?.scripts?.pre_request || "";
   $("node-post-script").value = state.draft?.scripts?.post_response || "";
+  paintVariables($("node-pre-script"));
+  paintVariables($("node-post-script"));
 }
 function showNode(kind) {
   $("empty-state").hidden = true;
@@ -1584,7 +1616,6 @@ function updateHeadersCount() {
 function renderBody() {
   const body = state.draft.body;
   $("body-text").value = body?.text || "";
-  paintVariables($("body-text"));
   $("body-language").value = body?.language || "json";
   if (body?.language && $("body-language").value !== body.language) {
     const option = document.createElement("option");
@@ -1592,6 +1623,7 @@ function renderBody() {
     $("body-language").append(option);
     $("body-language").value = body.language;
   }
+  paintVariables($("body-text"));
 }
 
 function readBody() {
@@ -1846,13 +1878,29 @@ async function save() {
 
 /* ---------- command preview ---------- */
 
+function setCurlCopyEnabled(enabled) {
+  $("copy-curl").disabled = !enabled;
+  $("copy-curl-secrets").disabled = !enabled;
+}
+
+function renderCurlPreview(text) {
+  const host = $("curl");
+  host.replaceChildren();
+  for (const part of syntaxParts(text, "shell")) {
+    const token = document.createElement("span");
+    token.className = part.kind;
+    token.textContent = part.text;
+    host.append(token);
+  }
+}
+
 async function refreshPreview() {
   clearTimeout(state.previewTimer);
 
   if (!state.selection) {
     state.preview = "";
     $("curl").textContent = "Select a request.";
-    $("copy-curl").disabled = true;
+    setCurlCopyEnabled(false);
     $("preview-masked").hidden = true;
     $("preview-problem").hidden = true;
     $("summary").replaceChildren();
@@ -1865,7 +1913,7 @@ async function refreshPreview() {
       state.selection.kind === "collection"
         ? "This is a collection. Pick a request to see its command."
         : "This is a folder. Pick a request to see its command.";
-    $("copy-curl").disabled = true;
+    setCurlCopyEnabled(false);
     $("preview-masked").hidden = true;
     $("preview-problem").hidden = true;
     renderSummary();
@@ -1880,15 +1928,15 @@ async function refreshPreview() {
       environment: state.env || null,
     });
     state.preview = preview.text;
-    $("curl").textContent = preview.text;
-    $("copy-curl").disabled = false;
+    renderCurlPreview(preview.text);
+    setCurlCopyEnabled(true);
     $("preview-masked").hidden = !preview.masked;
     $("preview-problem").hidden = !preview.problem;
     $("preview-problem").textContent = preview.problem || "";
   } catch (error) {
     state.preview = "";
     $("curl").textContent = String(error);
-    $("copy-curl").disabled = true;
+    setCurlCopyEnabled(false);
     $("preview-masked").hidden = true;
     $("preview-problem").hidden = true;
   }
@@ -1946,28 +1994,31 @@ function renderSummary() {
   }
 }
 
-async function copyCurl() {
-  if (!state.preview) return;
+async function copyCurl(includeSecrets = false) {
+  if (!state.preview || state.selection?.kind !== "request") return;
+  if (includeSecrets && !window.confirm(
+    "Copy cURL with actual secret values? Anyone with clipboard access, including clipboard history or sync, may be able to read them. Paste only into a trusted location."
+  )) return;
 
+  setCurlCopyEnabled(false);
   try {
-    await navigator.clipboard.writeText(state.preview);
-  } catch {
-    // The clipboard API needs a secure context; the fallback always works in
-    // the webview.
-    const area = document.createElement("textarea");
-    area.value = state.preview;
-    area.style.position = "fixed";
-    area.style.opacity = "0";
-    document.body.append(area);
-    area.select();
-    document.execCommand("copy");
-    area.remove();
+    await invoke("copy_curl", {
+      collection: state.selection.slug,
+      path: state.selection.path,
+      draft: draftForIpc(),
+      environment: state.env || null,
+      includeSecrets,
+    });
+    const message = includeSecrets ? "copied with secrets" : "copied protected";
+    $("copy-note").textContent = message;
+    setTimeout(() => {
+      if ($("copy-note").textContent === message) $("copy-note").textContent = "";
+    }, 1500);
+  } catch (error) {
+    $("copy-note").textContent = String(error);
+  } finally {
+    setCurlCopyEnabled(Boolean(state.preview) && state.selection?.kind === "request");
   }
-
-  $("copy-note").textContent = "copied";
-  setTimeout(() => {
-    if ($("copy-note").textContent === "copied") $("copy-note").textContent = "";
-  }, 1500);
 }
 
 /* ---------- sending ---------- */
@@ -2932,12 +2983,49 @@ async function deleteSelectedEnvironment() {
 
 /* ---------- workspace ---------- */
 
+function openImportDialog() {
+  if (!state.workspace) return;
+  $("import-workspace").textContent = state.workspace.path;
+  $("import-note").textContent = "";
+  $("import-secrets").value = "";
+  $("import-dialog").showModal();
+}
+
+async function importPostman() {
+  const button = $("import-choose");
+  button.disabled = true;
+  $("import-note").textContent = "Choose a JSON file to import…";
+  try {
+    const result = await invoke("import_postman", {
+      kind: $("import-kind").value,
+      secretNames: $("import-secrets").value.split(",").map((name) => name.trim()).filter(Boolean),
+    });
+    if (!result) {
+      $("import-note").textContent = "Import cancelled. No files changed.";
+      return;
+    }
+    state.workspace = result.workspace;
+    renderWorkspace();
+    repaintVariables();
+    refreshPreview();
+    $("import-note").textContent = [
+      "Imported into the workspace. YAML files are saved on disk.",
+      ...result.warnings,
+    ].join("\n");
+  } catch (error) {
+    $("import-note").textContent = String(error);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function renderWorkspace() {
   const workspace = state.workspace;
   $("workspace-name").textContent =
     workspace.collections.map((collection) => collection.name).join(", ") ||
     "empty workspace";
   $("workspace-path").textContent = workspace.path;
+  $("import-postman").disabled = false;
 
   const select = $("environment");
   select.replaceChildren();
@@ -2975,7 +3063,7 @@ function showEmpty() {
   $("node-view").hidden = true;
   state.preview = "";
   $("curl").textContent = "Select a request.";
-  $("copy-curl").disabled = true;
+  setCurlCopyEnabled(false);
   $("preview-masked").hidden = true;
   $("preview-problem").hidden = true;
   $("summary").replaceChildren();
@@ -3043,7 +3131,8 @@ async function boot() {
   $("node-save").addEventListener("click", save);
   $("suggest").addEventListener("click", suggest);
   $("apply-query").addEventListener("click", applyQuery);
-  $("copy-curl").addEventListener("click", copyCurl);
+  $("copy-curl").addEventListener("click", () => copyCurl(false));
+  $("copy-curl-secrets").addEventListener("click", () => copyCurl(true));
   $("tree-search").addEventListener("input", () => {
     state.treeSearch = $("tree-search").value;
     $("tree-search-clear").hidden = !state.treeSearch;
@@ -3080,6 +3169,10 @@ async function boot() {
     if (tab) tab.query = $("query").value;
   });
   $("open-workspace").addEventListener("click", chooseWorkspace);
+  $("import-postman").addEventListener("click", openImportDialog);
+  $("import-choose").addEventListener("click", importPostman);
+  $("import-close").addEventListener("click", () => $("import-dialog").close());
+  $("import-done").addEventListener("click", () => $("import-dialog").close());
   $("environment-add").addEventListener("click", () => openEnvironmentEditor());
   $("environment-edit").addEventListener("click", () => {
     const environment = state.workspace.environments.find((item) => item.name === state.env);
@@ -3131,6 +3224,7 @@ async function boot() {
 
   withVariables($("url"));
   withVariables($("body-text"));
+  for (const input of document.querySelectorAll(".script-editor")) withVariables(input);
 
   $("url").addEventListener("input", () => {
     absorbUrlInput();
@@ -3184,9 +3278,13 @@ async function boot() {
   }
 
   $("body-text").addEventListener("input", readBody);
-  $("body-language").addEventListener("change", readBody);
+  $("body-language").addEventListener("change", () => {
+    paintVariables($("body-text"));
+    readBody();
+  });
   $("body-clear").addEventListener("click", () => {
     $("body-text").value = "";
+    paintVariables($("body-text"));
     readBody();
   });
 

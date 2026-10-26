@@ -145,8 +145,12 @@ Every query is one selection set starting with `{`.
 | `{ * }` | Keep all keys at this object level and their values verbatim. |
 | `{ id! }` | Require `id`; show an error if it is missing. |
 | `{ owner: author { login } }` | Rename `author` to `owner` in the result. |
-| `{ nodes: children...{ id name } }` | Walk the repeated `children` field recursively, keeping each node's `id` and `name`. |
+| `{ nodes: children...{ id name } }` | Walk recursively and flatten projected nodes into one list. |
 | `{ ids: children...[id] }` | Walk recursively and collect each `id` into a flat list. |
+| `{ children** { id name } }` | Keep the nested children tree, selecting `id` and `name` at every depth. |
+| `{ * !debug }` | Keep everything except `debug` at this level. |
+| `{ * !debug... }` | Keep everything except `debug` at any depth, including inside copied subtrees. |
+| `{ * data { * !debug... } }` | Remove `debug` recursively only within `data`; keep sibling subtrees unchanged. |
 
 A field without a nested selection keeps its whole value. For example, `{ data }`
 copies all of `data`; `{ data { id } }` narrows it. The wildcard `*` fills in
@@ -156,8 +160,15 @@ include hyphens, dots, `@`, `$`, and Unicode without quoting.
 Slices come before collection brackets. For example,
 `{ ids: items[:10][id] }` slices the first ten items, then collects their IDs.
 Collection brackets select fields, so do not add a nested `{...}` to that same
-field. Recursive fields must specify either a nested selection or a collection,
-such as `children...{ id }` or `children...[id]`.
+field. Flattening recursive fields must specify either a nested selection or a
+collection, such as `children...{ id }` or `children...[id]`. Tree-preserving
+`children** { id }` automatically repeats the `children` edge, preserving missing,
+empty, and null branches; it requires a selection and does not accept brackets.
+
+Prefix `!field` excludes; suffix `field!` requires. Exclusions use original names,
+before aliases, and override inclusions. Use `*` to keep other fields; exclusions
+alone do not imply it. Dots are literal, so use nested selections to exclude a
+particular path. Exclusions change only the view, not the stored response/history.
 
 ## Putting it together
 

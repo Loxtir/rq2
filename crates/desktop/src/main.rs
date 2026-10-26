@@ -964,6 +964,41 @@ fn refresh_workspace(state: tauri::State<'_, AppState>) -> Result<WorkspaceDto, 
     workspace_dto(&root)
 }
 
+#[derive(Serialize)]
+struct ImportResultDto {
+    workspace: WorkspaceDto,
+    warnings: Vec<String>,
+}
+
+#[tauri::command]
+fn import_postman(
+    kind: String,
+    secret_names: Vec<String>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<ImportResultDto>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let root = workspace_path(&state)?;
+    let Some(file) = app
+        .dialog()
+        .file()
+        .set_title("Import Postman JSON into workspace")
+        .add_filter("Postman JSON", &["json"])
+        .blocking_pick_file()
+    else {
+        return Ok(None);
+    };
+    let path = file.into_path().map_err(|error| error.to_string())?;
+    let bytes =
+        std::fs::read(&path).map_err(|error| format!("reading {}: {error}", path.display()))?;
+    let warnings = store::import_postman(&root, &kind, &bytes, &secret_names)?;
+    Ok(Some(ImportResultDto {
+        workspace: workspace_dto(&root)?,
+        warnings,
+    }))
+}
+
 fn tree(items: &[Item], path: &mut Vec<usize>, collection: &Collection) -> Vec<TreeNode> {
     let mut out = Vec::new();
 
@@ -1625,27 +1660,80 @@ fn curl_preview(
     state: tauri::State<'_, AppState>,
 ) -> Result<PreviewDto, String> {
     let root = workspace_path(&state)?;
-    let located = locate(&root, &collection, environment.as_deref())?;
-    let collection = &located.collection;
-    let resolved = collection
-        .request_at(&path)
-        .ok_or("that request is no longer in the file")?;
-    let request = request_for(draft, &resolved);
-    let auth = auth_for(collection, &path, &request);
-
-    let variables = collection::curl::masked_variables(
-        collection,
-        located.environment.as_ref(),
-        &located.globals,
+    let preview = curl_for(
+        &root,
+        &collection,
         &path,
-    );
-    let preview = collection::curl::render(&request, auth, &variables);
-
+        draft,
+        environment.as_deref(),
+        false,
+    )?;
     Ok(PreviewDto {
         text: preview.text,
         masked: preview.masked,
         problem: preview.problem,
     })
+}
+
+/// Secret-bearing exports stay in Rust and use the same renderer as the preview.
+fn curl_for(
+    root: &std::path::Path,
+    collection: &str,
+    path: &[usize],
+    draft: Option<RequestDraft>,
+    environment: Option<&str>,
+    include_secrets: bool,
+) -> Result<collection::curl::Preview, String> {
+    let located = locate(root, collection, environment)?;
+    let collection = &located.collection;
+    let resolved = collection
+        .request_at(path)
+        .ok_or("that request is no longer in the file")?;
+    let request = request_for(draft, &resolved);
+    let auth = auth_for(collection, path, &request);
+
+    let variables = if include_secrets {
+        collection::send::variables(
+            collection,
+            located.environment.as_ref(),
+            &located.globals,
+            path,
+        )
+    } else {
+        collection::curl::masked_variables(
+            collection,
+            located.environment.as_ref(),
+            &located.globals,
+            path,
+        )
+    };
+    Ok(collection::curl::render(&request, auth, &variables))
+}
+
+#[tauri::command]
+fn copy_curl(
+    collection: String,
+    path: Vec<usize>,
+    draft: Option<RequestDraft>,
+    environment: Option<String>,
+    include_secrets: bool,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+
+    let root = workspace_path(&state)?;
+    let preview = curl_for(
+        &root,
+        &collection,
+        &path,
+        draft,
+        environment.as_deref(),
+        include_secrets,
+    )?;
+    app.clipboard()
+        .write_text(preview.text)
+        .map_err(|_| "Could not write to the system clipboard".to_string())
 }
 
 #[tauri::command]
@@ -1728,12 +1816,14 @@ fn suggest_query(id: u64, state: tauri::State<'_, AppState>) -> Result<String, S
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             initial_workspace,
             pick_workspace,
             open_workspace,
             refresh_workspace,
+            import_postman,
             send,
             list_history,
             set_history_limit,
@@ -1747,9 +1837,97 @@ fn main() {
             update_globals,
             set_variable,
             curl_preview,
+            copy_curl,
             project_body,
             suggest_query
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod curl_tests {
+    use super::*;
+
+    #[test]
+    fn secret_export_is_explicit_and_leaves_the_preview_and_workspace_protected() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir()
+            .join("opencode")
+            .join(format!("rq-curl-{}-{nonce}", std::process::id()));
+        let parsed = collection::postman::parse_collection(
+            br#"{
+            "info":{"name":"Export"},
+            "variable":[
+                {"key":"token","value":"collection-secret-value","type":"secret"},
+                {"key":"authorization","value":"Bearer {{token}}"}
+            ],
+            "auth":{"type":"bearer","bearer":[{"key":"token","value":"{{token}}"}]},
+            "item":[{"name":"Saved","request":{"url":"{{baseUrl}}/saved","method":"GET"}}]
+        }"#,
+            &[],
+        )
+        .unwrap();
+        let environment = collection::postman::parse_environment(
+            br#"{
+            "name":"Dev","values":[
+                {"key":"baseUrl","value":"https://dev.test"},
+                {"key":"token","value":"environment-secret-value","type":"secret"}
+            ]
+        }"#,
+            &[],
+        )
+        .unwrap()
+        .environment;
+        store::write(&root, &store::render(&parsed.collection, &[environment])).unwrap();
+        store::save_globals(
+            &root,
+            vec![Variable {
+                name: "globalToken".to_string(),
+                value: Some("global-secret-value".to_string()),
+                secret: true,
+            }],
+        )
+        .unwrap();
+        let yaml = root.join("collections/export/01-saved.yml");
+        let before = std::fs::read(&yaml).unwrap();
+        let draft = || {
+            serde_json::from_value(serde_json::json!({
+                "name":"Draft", "method":"POST", "url":"{{baseUrl}}/draft",
+                "headers":[{"name":"X-Composed","value":"{{authorization}}"}],
+                "params":[{"name":"token","value":"{{token}}"}],
+                "body":{"mode":"raw","language":"json","text":"{\"key\":\"{{globalToken}}\"}"}
+            }))
+            .unwrap()
+        };
+        let protected = curl_for(&root, "export", &[0], Some(draft()), Some("Dev"), false).unwrap();
+        assert!(protected.masked);
+        assert!(protected.text.contains("https://dev.test/draft"));
+        assert!(!protected.text.contains("collection-secret-value"));
+        assert!(!protected.text.contains("global-secret-value"));
+
+        let revealed = curl_for(&root, "export", &[0], Some(draft()), Some("Dev"), true).unwrap();
+        assert!(!revealed.masked);
+        assert!(revealed.text.contains("curl -X POST"));
+        assert!(revealed
+            .text
+            .contains("Authorization: Bearer collection-secret-value"));
+        assert!(revealed
+            .text
+            .contains("X-Composed: Bearer collection-secret-value"));
+        assert!(revealed.text.contains("token=collection-secret-value"));
+        assert!(revealed.text.contains("global-secret-value"));
+        assert!(!revealed.text.contains("environment-secret-value"));
+        assert_eq!(
+            curl_for(&root, "export", &[0], Some(draft()), Some("Dev"), false)
+                .unwrap()
+                .text,
+            protected.text
+        );
+        assert_eq!(std::fs::read(&yaml).unwrap(), before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

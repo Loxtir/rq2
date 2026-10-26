@@ -29,7 +29,10 @@ body is always kept; the query is re-run against it locally and for free.
 | `id!`                     | fail loudly if the response omits it                |
 | `items[id]`               | one value per element, flattened into a list        |
 | `items[0:5][id]`          | slice first, then collect                           |
-| `children...{ id }`       | walk a repeated key to any depth, keeping structure |
+| `children...{ id }`       | walk a repeated key, flattening projected nodes |
+| `children**{ id }`        | project every level of a repeated key, keeping the tree |
+| `* !secret`              | keep everything except `secret` at this level |
+| `* !secret...`           | keep everything except `secret` at any depth |
 | `children...[id]`         | walk it, then flatten to bare values                |
 | `# comment`               | ignored                                             |
 
@@ -49,14 +52,57 @@ guess the depth, and a deeper response silently truncates.
 {"ids": [2, 4, 7, 5, 3]}
 ```
 
-Depth-first, document order. Leaves without the key are skipped, never errors,
-and there is no depth limit in the query — so nothing is silently dropped.
+Depth-first, document order. Leaves without the key are skipped, never errors.
+You do not have to write a fixed number of levels in the query; the scanner's
+256-level safety limit still applies and reports an error rather than truncating.
 
 The walked edge is consumed, never emitted. That is why `children...{ * }` is
 safe: it gives you every node flattened, minus the nested tree, instead of
 re-emitting each subtree at every level.
 
 `children...[0:3][id]` bounds the *output* without bounding the traversal.
+
+Use `**` instead of `...` to **retain the parent–child structure** while selecting
+only particular fields at every level:
+
+```graphql
+{
+  payload {
+    events {
+      items {
+        definition { item_id }
+        children** { definition { item_id } }
+      }
+    }
+  }
+}
+```
+
+The `children` edge is included automatically at each level. Missing edges stay
+missing; empty arrays and `null` remain unchanged. An alias renames only the
+starting edge, not the nested `children` keys. `**` requires a selection set and
+does not accept slices or collects. Existing `children...{ ... }` queries still
+flatten descendants into one list.
+
+### Excluding fields
+
+```graphql
+{ * !debug }                       # omit debug at this level
+{ * !debug... }                    # omit debug throughout the response
+{ * payload { * !debug... } }       # omit debug only within payload's subtree
+{ * payload { * !largeField } }     # omit one particular nested field
+```
+
+Exclusions match original field names (before aliases), and win over explicit
+selections and `*`. `!debug` does not affect deeper `debug` properties; `!debug...`
+also filters whole subtrees copied by a wildcard or an unprojected field, including
+objects inside arrays. Missing excluded fields are harmless. Exclusions do not
+implicitly select other fields: use `*` for “everything except”. Dots remain
+literal parts of names, so nest selections to address a particular path.
+
+Prefix `!field` excludes a field; suffix `field!` still requires its presence.
+Exclusions are response views, not a security boundary: the original response
+and any stored history remain unchanged.
 
 ## Layout
 
@@ -218,14 +264,26 @@ the last one is remembered. Three panes: the tree, the request, the command.
 - The environment controls add, edit, rename, and delete environments, including
   their TLS verification setting and secret variables. **Globals** opens the
   workspace-wide fallback variable editor.
+- **Import** reads Postman collection, environment, or globals JSON exports into
+  the open workspace, creating YAML under `collections/`, `environments/`, or
+  `globals.yml`. Existing collections and environments are not overwritten;
+  globals add new variable names and reject duplicates. Postman secret variables
+  and any additional secret names entered in the dialog go only into `.secrets/`.
+  Import warnings are shown in the dialog; event scripts are not imported.
 - Edits are drafts, marked with a dot in the tree, and they survive switching
   requests. **Save** is explicit: it re-renders in Rust and writes only the
   difference, so a secret file is never rewritten and a file the tool did not
   write is never deleted. The command pane shows the same request as a runnable
-  cURL, with secrets masked to `***` and a warning when a `:path` value is
-  missing.
+  syntax-highlighted cURL, with secrets masked to `***` and a warning when a
+  `:path` value is missing. **Copy protected** keeps those masks. **Copy with
+  secrets…** asks for confirmation, then resolves the current draft and copies
+  the real values directly from Rust to the system clipboard. The preview stays
+  masked. Clipboard history, synchronization, or other applications may retain
+  the unprotected command; paste it only into a trusted location.
 - Collection, folder, and request scripts can run before a request or after its
   response from their **Scripts** editors; see [Scripts](#scripts) below.
+- JSON request bodies and JavaScript pre-request/post-response scripts have
+  syntax highlighting while retaining native text editing and selection.
 - **Send** uses the current request draft; it becomes **Cancel** while a request
   is pending. The response shows status, timing, size, unresolved variables, TLS
   warnings, and post-response script errors.
@@ -468,8 +526,11 @@ workspace and confirming `.secrets/` never appears:
   `write` refuses to touch the disk if one is found. The scan is the safety net
   for a future importer, not a substitute for the first rule.
 
-Every export path (cURL, copy-as-code, share) must resolve through one place that
-renders `***`, because with a plain file that is the only guard.
+Every export path (cURL, copy-as-code, share) uses the shared renderer and masks
+secret variables by default. The explicit **Copy with secrets…** action is the
+opt-in exception: it uses the same renderer with resolved values and writes
+directly to the native clipboard, never returning secret-bearing cURL text to
+the webview or storing it in workspace files.
 
 These guards protect workspace configuration, not captured response data. Desktop
 history stores response bodies and resolved URLs locally outside the workspace;

@@ -1,3 +1,11 @@
 variables:
 - name: apiOrigin
   value: https://jsonplaceholder.typicode.com
+- name: brand
+  value: north
+- name: milestoneNEXT
+  value: caramel-jp-kr-au-2026
+- name: storeId
+  value: '10701'
+- name: password
+  secret: true

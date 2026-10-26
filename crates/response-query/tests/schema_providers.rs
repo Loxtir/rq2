@@ -279,6 +279,8 @@ fn recursive_and_collect_queries_validate_against_a_recursive_schema() {
     for query in [
         "{ ids: children...[id] }",
         "{ nodes: children...{ id label } }",
+        "{ children** { id label } }",
+        "{ * !missing !secret... children** { id } }",
     ] {
         let parsed = parse(query).unwrap();
         assert!(
@@ -316,6 +318,18 @@ fn recursive_and_collect_queries_validate_against_a_recursive_schema() {
         "{}",
         diags[0].message
     );
+}
+
+#[test]
+fn tree_recursion_rejects_scalar_edges_but_exclusions_need_not_exist_in_the_schema() {
+    let schema = spec().response_schema("getUser").unwrap().unwrap();
+    let parsed = parse("{ id** { * } }").unwrap();
+    let diags = validate(&parsed, &schema);
+    assert_eq!(diags.len(), 1);
+    assert!(diags[0].message.contains("`**` cannot walk"));
+
+    let parsed = parse("{ * !absent !nestedSecret... }").unwrap();
+    assert!(validate(&parsed, &schema).is_empty());
 }
 
 #[test]

@@ -153,10 +153,21 @@ body.dragging * {
 
 .sidebar-section {
   display: flex;
+  flex: 0 0 auto;
   flex-direction: column;
   min-width: 0;
   min-height: 0;
+  overflow: hidden;
   border: 0;
+}
+
+/* Native details content has its own wrapper between summary and the list. */
+.sidebar-section::details-content {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .sidebar-section[open] + .sidebar-section[open] {
@@ -213,7 +224,7 @@ body.dragging * {
   flex: 1 1 auto;
   flex-direction: column;
   min-height: 0;
-  overflow-x: clip;
+  overflow: hidden;
 }
 
 .history-controls {
@@ -777,6 +788,10 @@ body.dragging * {
 
 .dialog-note {
   min-height: 16px;
+}
+
+#import-note {
+  white-space: pre-line;
 }
 
 .check-line {
@@ -1736,38 +1751,42 @@ body.right-closed .request-tabs {
 }
 
 .inspector-body {
+  display: flex;
   flex: 1;
+  flex-direction: column;
   min-height: 0;
-  overflow-y: auto;
+  overflow: hidden;
   padding: 0 12px 18px;
+}
+
+.curl-actions,
+.curl-problem,
+.command-details {
+  flex: 0 0 auto;
 }
 
 .curl-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   margin-bottom: 8px;
 }
 
 .curl {
+  flex: 0 1 auto;
+  min-height: 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   background: var(--bg-sunken);
   border: 1px solid var(--border-soft);
   border-radius: 7px;
-  max-height: 240px;
   font-size: 11.5px;
 }
 
-.inspector .hint {
-  padding: 8px 0 0;
-  line-height: 1.5;
-}
-
-.inspector .hint code {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  color: var(--text-dim);
+.command-details > summary {
+  display: list-item;
+  cursor: pointer;
 }
 
 .summary {
@@ -1896,6 +1915,38 @@ body.right-closed .request-tabs {
   border-radius: 6px;
   white-space: pre-wrap;
   overflow-wrap: break-word;
+}
+
+.syntax-editor > textarea {
+  color: transparent;
+  caret-color: var(--text);
+  tab-size: 2;
+}
+
+.syntax-editor > textarea::selection {
+  color: transparent;
+  background: var(--accent-soft);
+}
+
+.syntax-editor > textarea::placeholder {
+  color: var(--text-faint);
+}
+
+.syntax-editor > .varlayer {
+  color: var(--text);
+  tab-size: 2;
+}
+
+.syntax-keyword {
+  color: #d2a8ff;
+}
+
+.syntax-comment {
+  color: var(--text-dim);
+}
+
+.syntax-function {
+  color: #9dbcfb;
 }
 
 .var-token {

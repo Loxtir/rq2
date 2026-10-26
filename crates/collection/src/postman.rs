@@ -20,6 +20,28 @@ pub struct ParsedEnvironment {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug)]
+pub struct ParsedGlobals {
+    pub variables: Vec<Variable>,
+    pub warnings: Vec<String>,
+}
+
+pub fn parse_globals(bytes: &[u8], extra_secrets: &[String]) -> Result<ParsedGlobals, String> {
+    let doc: Value =
+        serde_json::from_slice(strip_bom(bytes)).map_err(|e| format!("not valid JSON: {e}"))?;
+    if doc.get("_postman_variable_scope").and_then(Value::as_str) != Some("globals")
+        || !doc.get("values").is_some_and(Value::is_array)
+    {
+        return Err("this does not look like a Postman globals export".to_string());
+    }
+    let mut warnings = Vec::new();
+    let variables = parse_variables(doc.get("values"), extra_secrets, &mut warnings);
+    Ok(ParsedGlobals {
+        variables,
+        warnings,
+    })
+}
+
 pub fn parse_collection(bytes: &[u8], extra_secrets: &[String]) -> Result<Parsed, String> {
     let doc: Value =
         serde_json::from_slice(strip_bom(bytes)).map_err(|e| format!("not valid JSON: {e}"))?;
@@ -72,6 +94,14 @@ pub fn parse_environment(
     let Some(name) = doc.get("name").and_then(|v| v.as_str()) else {
         return Err("this does not look like a Postman environment (no `name`)".to_string());
     };
+    if !doc.get("values").is_some_and(Value::is_array)
+        || doc
+            .get("_postman_variable_scope")
+            .and_then(Value::as_str)
+            .is_some_and(|scope| scope != "environment")
+    {
+        return Err("this does not look like a Postman environment export".to_string());
+    }
 
     let mut warnings = Vec::new();
     let variables = parse_variables(doc.get("values"), extra_secrets, &mut warnings);

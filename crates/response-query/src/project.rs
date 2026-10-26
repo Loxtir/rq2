@@ -14,6 +14,8 @@ use crate::syntax::{Field, Selection, Slice};
 struct Watch<'a> {
     edge: Option<&'a str>,
     hit: Option<(usize, usize)>,
+    /// Unlike a flat walk, a tree walk emits the edge and repeats its selection.
+    tree: Option<&'a Field>,
 }
 
 /// What to keep from each node of a list.
@@ -32,7 +34,7 @@ pub fn project(input: &[u8], sel: &Selection) -> Result<Vec<u8>, Diag> {
     let mut sc = Scanner::new(input);
     let mut out = Vec::with_capacity(input.len().min(64 * 1024));
     let mut watch = Watch::default();
-    project_value(&mut sc, sel, &mut out, 0, &mut watch)?;
+    project_value(&mut sc, sel, &mut out, 0, &mut watch, &[])?;
     Ok(out)
 }
 
@@ -53,14 +55,15 @@ fn project_value(
     out: &mut Vec<u8>,
     depth: usize,
     watch: &mut Watch,
+    exclusions: &[&str],
 ) -> Result<(), Diag> {
     if depth > MAX_DEPTH {
         return Err(Diag::new("response nesting is too deep", sc.span_here()));
     }
     sc.skip_ws();
     match sc.peek() {
-        Some(b'{') => project_object(sc, sel, out, depth, watch),
-        Some(b'[') => project_array(sc, sel, out, depth),
+        Some(b'{') => project_object(sc, sel, out, depth, watch, exclusions),
+        Some(b'[') => project_array(sc, sel, out, depth, watch.tree, exclusions),
         None => Err(Diag::new("unexpected end of input", sc.span_here())),
         // Scalars pass through unchanged so a selection over a mixed array works.
         _ => {
@@ -78,7 +81,15 @@ fn project_object(
     out: &mut Vec<u8>,
     depth: usize,
     watch: &mut Watch,
+    exclusions: &[&str],
 ) -> Result<(), Diag> {
+    let mut inherited = exclusions.to_vec();
+    for field in &sel.fields {
+        if field.excluded && field.recursive && !inherited.contains(&field.name.as_str()) {
+            inherited.push(&field.name);
+        }
+    }
+    let exclusions = inherited.as_slice();
     sc.expect(b'{')?;
     out.push(b'{');
     let mut first = true;
@@ -100,12 +111,31 @@ fn project_object(
         sc.skip_ws();
 
         let idx = match_key(sel, key_raw)?;
+        if let Some(idx) = idx {
+            matched[idx] = true;
+        }
         let excluded = match watch.edge {
             Some(edge) => key_equals(key_raw, edge)?,
             None => false,
         };
 
-        if excluded {
+        let hidden = key_matches_any(
+            key_raw,
+            exclusions.iter().copied().chain(
+                sel.fields
+                    .iter()
+                    .filter(|field| field.excluded)
+                    .map(|field| field.name.as_str()),
+            ),
+        )?;
+        let tree = match watch.tree {
+            Some(field) if key_equals(key_raw, &field.name)? => Some(field),
+            _ => None,
+        };
+
+        if hidden {
+            sc.scan_value_end()?;
+        } else if excluded {
             // The edge being walked is never part of the output, even when the
             // selection is `*`. Otherwise every level would re-emit its own
             // subtree and the flat list would be quadratic.
@@ -114,11 +144,16 @@ fn project_object(
             if watch.hit.is_none() {
                 watch.hit = Some((start, end));
             }
-            if let Some(idx) = idx {
-                matched[idx] = true;
+        } else if let Some(field) = tree {
+            if !first {
+                out.push(b',');
             }
+            first = false;
+            // An alias names the starting edge only; descendants keep their key.
+            write_json_string(&decode_string(key_raw)?, out)?;
+            out.push(b':');
+            apply_field(sc, field, out, depth, exclusions)?;
         } else if let Some(idx) = idx {
-            matched[idx] = true;
             let field = &sel.fields[idx];
             if !first {
                 out.push(b',');
@@ -127,7 +162,7 @@ fn project_object(
             let emitted = emit_name(field, key_raw)?;
             write_json_string(&emitted, out)?;
             out.push(b':');
-            apply_field(sc, field, out, depth)?;
+            apply_field(sc, field, out, depth, exclusions)?;
         } else {
             sc.scan_value_end()?;
         }
@@ -160,6 +195,8 @@ fn project_array(
     sel: &Selection,
     out: &mut Vec<u8>,
     depth: usize,
+    tree: Option<&Field>,
+    exclusions: &[&str],
 ) -> Result<(), Diag> {
     sc.expect(b'[')?;
     out.push(b'[');
@@ -179,7 +216,17 @@ fn project_array(
         }
         first = false;
         // The watch belongs to one object level; inside an array it is a new one.
-        project_value(sc, sel, out, depth + 1, &mut Watch::default())?;
+        project_value(
+            sc,
+            sel,
+            out,
+            depth + 1,
+            &mut Watch {
+                tree,
+                ..Watch::default()
+            },
+            exclusions,
+        )?;
         sc.skip_ws();
         match sc.peek() {
             Some(b',') => sc.expect(b',')?,
@@ -198,30 +245,121 @@ fn apply_field(
     field: &Field,
     out: &mut Vec<u8>,
     depth: usize,
+    exclusions: &[&str],
 ) -> Result<(), Diag> {
     sc.skip_ws();
 
     if field.recursive {
-        return apply_recursive(sc, field, out, depth);
+        return apply_recursive(sc, field, out, depth, exclusions);
+    }
+    if field.tree_recursive {
+        let sub = field
+            .selection
+            .as_ref()
+            .expect("tree recursion has a selection");
+        return project_value(
+            sc,
+            sub,
+            out,
+            depth + 1,
+            &mut Watch {
+                tree: Some(field),
+                ..Watch::default()
+            },
+            exclusions,
+        );
     }
 
     let slice = field.slice();
     let collect = field.collect();
 
     if (slice.is_some() || collect.is_some()) && sc.peek() == Some(b'[') {
-        return apply_list(sc, field, slice, collect, out, depth);
+        return apply_list(sc, field, slice, collect, out, depth, exclusions);
     }
 
     match (sc.peek(), field.selection.as_ref()) {
-        (Some(b'{'), Some(sub)) => project_object(sc, sub, out, depth + 1, &mut Watch::default()),
-        (Some(b'['), Some(sub)) => project_array(sc, sub, out, depth + 1),
+        (Some(b'{'), Some(sub)) => {
+            project_value(sc, sub, out, depth + 1, &mut Watch::default(), exclusions)
+        }
+        (Some(b'['), Some(sub)) => project_array(sc, sub, out, depth + 1, None, exclusions),
+        _ => copy_filtered(sc, out, depth + 1, exclusions),
+    }
+}
+
+/// Copies a whole value, filtering inherited recursive exclusions in place.
+/// With no exclusions this retains the original scanner's fast verbatim path.
+fn copy_filtered(
+    sc: &mut Scanner,
+    out: &mut Vec<u8>,
+    depth: usize,
+    exclusions: &[&str],
+) -> Result<(), Diag> {
+    sc.skip_ws();
+    if exclusions.is_empty() {
+        let start = sc.pos();
+        let end = sc.scan_value_end()?;
+        copy_compact(sc.src(), start, end, out);
+        return Ok(());
+    }
+    if depth > MAX_DEPTH {
+        return Err(Diag::new("response nesting is too deep", sc.span_here()));
+    }
+    let open = match sc.peek() {
+        Some(b'{') => b'{',
+        Some(b'[') => b'[',
         _ => {
             let start = sc.pos();
             let end = sc.scan_value_end()?;
             copy_compact(sc.src(), start, end, out);
-            Ok(())
+            return Ok(());
+        }
+    };
+    let close = if open == b'{' { b'}' } else { b']' };
+    sc.expect(open)?;
+    out.push(open);
+    let mut first = true;
+    loop {
+        sc.skip_ws();
+        if sc.peek() == Some(close) {
+            sc.expect(close)?;
+            break;
+        }
+        let key = if open == b'{' {
+            let key = sc.scan_string_raw()?;
+            sc.expect(b':')?;
+            Some(key)
+        } else {
+            None
+        };
+        let hidden = match key {
+            Some(key) => key_matches_any(key, exclusions.iter().copied())?,
+            None => false,
+        };
+        if hidden {
+            sc.scan_value_end()?;
+        } else {
+            if !first {
+                out.push(b',');
+            }
+            first = false;
+            if let Some(key) = key {
+                out.extend_from_slice(key);
+                out.push(b':');
+            }
+            copy_filtered(sc, out, depth + 1, exclusions)?;
+        }
+        sc.skip_ws();
+        if sc.peek() == Some(b',') {
+            sc.expect(b',')?;
+        } else if sc.peek() != Some(close) {
+            return Err(Diag::new(
+                "expected a comma or closing delimiter",
+                sc.span_here(),
+            ));
         }
     }
+    out.push(close);
+    Ok(())
 }
 
 /// `items[0:5]`, `items[id]`, `items[0:5][id]`. The slice narrows first, then
@@ -233,6 +371,7 @@ fn apply_list(
     collect: Option<&Selection>,
     out: &mut Vec<u8>,
     depth: usize,
+    exclusions: &[&str],
 ) -> Result<(), Diag> {
     let elems = sc.split_array_elements()?;
     let len = elems.len() as i64;
@@ -254,6 +393,7 @@ fn apply_list(
             out,
             depth,
             &mut Watch::default(),
+            exclusions,
         )?;
     }
     out.push(b']');
@@ -267,9 +407,10 @@ fn apply_recursive(
     field: &Field,
     out: &mut Vec<u8>,
     depth: usize,
+    exclusions: &[&str],
 ) -> Result<(), Diag> {
     let mut nodes: Vec<Vec<u8>> = Vec::new();
-    collect_edge(sc, field, &mut nodes, depth)?;
+    collect_edge(sc, field, &mut nodes, depth, exclusions)?;
 
     let (start, end) = resolve_range(field.slice(), nodes.len() as i64);
 
@@ -293,6 +434,7 @@ fn collect_edge(
     field: &Field,
     nodes: &mut Vec<Vec<u8>>,
     depth: usize,
+    exclusions: &[&str],
 ) -> Result<(), Diag> {
     if depth > MAX_DEPTH {
         return Err(Diag::new(
@@ -308,14 +450,14 @@ fn collect_edge(
     match sc.peek() {
         Some(b'[') => {
             for (start, end) in sc.split_array_elements()? {
-                descend(sc.src(), start, end, field, nodes, depth + 1)?;
+                descend(sc.src(), start, end, field, nodes, depth + 1, exclusions)?;
             }
             Ok(())
         }
         Some(b'{') => {
             let start = sc.pos();
             let end = sc.scan_value_end()?;
-            descend(sc.src(), start, end, field, nodes, depth + 1)
+            descend(sc.src(), start, end, field, nodes, depth + 1, exclusions)
         }
         None => Err(Diag::new("unexpected end of input", sc.span_here())),
         // A leaf branch: the edge is null or a scalar, so the walk stops here.
@@ -334,10 +476,12 @@ fn descend(
     field: &Field,
     nodes: &mut Vec<Vec<u8>>,
     depth: usize,
+    exclusions: &[&str],
 ) -> Result<(), Diag> {
     let mut watch = Watch {
         edge: Some(&field.name),
         hit: None,
+        tree: None,
     };
     let mut buf = Vec::new();
     emit_one(
@@ -349,12 +493,13 @@ fn descend(
         &mut buf,
         depth,
         &mut watch,
+        exclusions,
     )?;
     nodes.push(buf);
 
     if let Some((child_start, _)) = watch.hit {
         let mut child = Scanner::at(src, child_start);
-        collect_edge(&mut child, field, nodes, depth)?;
+        collect_edge(&mut child, field, nodes, depth, exclusions)?;
     }
     Ok(())
 }
@@ -370,19 +515,25 @@ fn emit_one(
     out: &mut Vec<u8>,
     depth: usize,
     watch: &mut Watch,
+    exclusions: &[&str],
 ) -> Result<(), Diag> {
     match mode(field, collect) {
         Mode::Leaf(leaf) => {
             let mut sc = Scanner::at(src, start);
-            project_leaf(&mut sc, leaf, out, watch)
+            project_leaf(&mut sc, leaf, out, watch, depth + 1, exclusions)
         }
         Mode::Select(sel) => {
             let mut sc = Scanner::at(src, start);
-            project_value(&mut sc, sel, out, depth + 1, watch)
+            project_value(&mut sc, sel, out, depth + 1, watch, exclusions)
         }
         Mode::Verbatim => {
-            copy_compact(src, start, end, out);
-            Ok(())
+            if exclusions.is_empty() {
+                copy_compact(src, start, end, out);
+                Ok(())
+            } else {
+                let mut sc = Scanner::at(src, start);
+                copy_filtered(&mut sc, out, depth + 1, exclusions)
+            }
         }
     }
 }
@@ -407,6 +558,8 @@ fn project_leaf(
     leaf: &str,
     out: &mut Vec<u8>,
     watch: &mut Watch,
+    depth: usize,
+    exclusions: &[&str],
 ) -> Result<(), Diag> {
     sc.skip_ws();
     if sc.peek() != Some(b'{') {
@@ -437,7 +590,9 @@ fn project_leaf(
             None => false,
         };
 
-        if excluded {
+        if key_matches_any(key_raw, exclusions.iter().copied())? {
+            sc.scan_value_end()?;
+        } else if excluded {
             let start = sc.pos();
             let end = sc.scan_value_end()?;
             if watch.hit.is_none() {
@@ -445,9 +600,7 @@ fn project_leaf(
             }
         } else if !found && key_equals(key_raw, leaf)? {
             found = true;
-            let start = sc.pos();
-            let end = sc.scan_value_end()?;
-            copy_compact(sc.src(), start, end, out);
+            copy_filtered(sc, out, depth + 1, exclusions)?;
         } else {
             sc.scan_value_end()?;
         }
@@ -508,6 +661,18 @@ fn key_equals(key_raw: &[u8], name: &str) -> Result<bool, Diag> {
     Ok(std::str::from_utf8(inner)
         .map(|s| s == name)
         .unwrap_or(false))
+}
+
+fn key_matches_any<'a>(
+    key_raw: &[u8],
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<bool, Diag> {
+    for name in names {
+        if key_equals(key_raw, name)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn emit_name(field: &Field, key_raw: &[u8]) -> Result<String, Diag> {

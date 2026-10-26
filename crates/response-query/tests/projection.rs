@@ -302,6 +302,245 @@ fn recursive_walk_handles_a_linked_list() {
 }
 
 #[test]
+fn recursive_tree_preserves_branches_with_only_selected_fields() {
+    assert_eq!(
+        run("{ children** { id } }", TREE),
+        r#"{"children":[{"id":2,"children":[{"id":4},{"id":5,"children":[{"id":7}]}]},{"id":3,"children":[{"id":6}]}]}"#
+    );
+}
+
+#[test]
+fn recursive_tree_projects_nested_definitions_at_every_level() {
+    let input = r#"{"payload":[{"events":[{"items":[{"definition":{"item_id":{"value":"root"},"other":1},"children":[{"definition":{"item_id":{"value":"child"}},"children":[{"definition":{"item_id":{"value":"grandchild"}},"extra":2}]}]}]}]}]}"#;
+    assert_eq!(
+        run("{ payload { events { items { definition { item_id } children** { definition { item_id } } } } } }", input),
+        r#"{"payload":[{"events":[{"items":[{"definition":{"item_id":{"value":"root"}},"children":[{"definition":{"item_id":{"value":"child"}},"children":[{"definition":{"item_id":{"value":"grandchild"}}}]}]}]}]}]}"#
+    );
+}
+
+#[test]
+fn recursive_tree_supports_linked_objects_and_aliases_only_the_starting_edge() {
+    assert_eq!(
+        run(
+            "{ nodes: next** { id } }",
+            r#"{"next":{"id":1,"next":{"id":2,"next":null}}}"#
+        ),
+        r#"{"nodes":{"id":1,"next":{"id":2,"next":null}}}"#
+    );
+}
+
+#[test]
+fn recursive_tree_keeps_null_empty_missing_and_scalar_branches() {
+    assert_eq!(
+        run(
+            "{ children** { id } }",
+            r#"{"children":[{"id":1,"children":[]},{"id":2,"children":null},{"id":3},null,4]}"#
+        ),
+        r#"{"children":[{"id":1,"children":[]},{"id":2,"children":null},{"id":3},null,4]}"#
+    );
+}
+
+#[test]
+fn recursive_tree_wildcard_does_not_copy_unprojected_children() {
+    assert_eq!(
+        run(
+            "{ children** { * !secret } }",
+            r#"{"children":[{"id":1,"secret":2,"children":[{"id":2,"secret":3}]}]}"#
+        ),
+        r#"{"children":[{"id":1,"children":[{"id":2}]}]}"#
+    );
+}
+
+#[test]
+fn recursive_tree_reports_required_fields_missing_in_deep_nodes() {
+    assert!(err(
+        "{ children** { id! } }",
+        r#"{"children":[{"id":1,"children":[{}]}]}"#
+    )
+    .contains("required field `id`"));
+}
+
+#[test]
+fn recursive_tree_keeps_the_existing_depth_limit() {
+    let input = format!("{}null{}", r#"{"next":"#.repeat(300), "}".repeat(300));
+    assert!(err("{ next** { * } }", &input).contains("deep"));
+}
+
+#[test]
+fn exclusion_with_wildcard_omits_only_the_current_level() {
+    let input = r#"{"secret":1,"id":2,"nested":{"secret":3}}"#;
+    assert_eq!(
+        run("{ * !secret }", input),
+        r#"{"id":2,"nested":{"secret":3}}"#
+    );
+    assert_eq!(
+        run("{ !secret * }", input),
+        r#"{"id":2,"nested":{"secret":3}}"#
+    );
+}
+
+#[test]
+fn scoped_exclusion_preserves_other_fields_and_sibling_scopes() {
+    assert_eq!(
+        run(
+            "{ * user { * !secret } }",
+            r#"{"user":{"id":1,"secret":2},"other":{"secret":3}}"#
+        ),
+        r#"{"user":{"id":1},"other":{"secret":3}}"#
+    );
+}
+
+#[test]
+fn exclusions_do_not_add_implicit_wildcards_or_require_missing_fields() {
+    assert_eq!(run("{ !secret }", r#"{"id":1,"secret":2}"#), "{}");
+    assert_eq!(
+        run("{ * !missing !absent... }", r#"{"id":1}"#),
+        r#"{"id":1}"#
+    );
+    assert_eq!(run("{ children** { id } }", "{}"), "{}");
+}
+
+#[test]
+fn recursive_exclusion_filters_verbatim_subtrees_and_mixed_arrays() {
+    assert_eq!(
+        run(
+            "{ * !secret... }",
+            r#"{"secret":0,"nested":{"id":1,"secret":2,"rows":[{"secret":3,"id":4},[{"secret":5}],null,6]}}"#
+        ),
+        r#"{"nested":{"id":1,"rows":[{"id":4},[{}],null,6]}}"#
+    );
+}
+
+#[test]
+fn recursive_exclusion_is_limited_to_its_selected_subtree() {
+    assert_eq!(
+        run(
+            "{ * user { * !secret... } }",
+            r#"{"user":{"nested":{"secret":1,"id":2}},"other":{"secret":3}}"#
+        ),
+        r#"{"user":{"nested":{"id":2}},"other":{"secret":3}}"#
+    );
+}
+
+#[test]
+fn nested_recursive_exclusions_merge_without_affecting_siblings() {
+    assert_eq!(
+        run(
+            "{ * !secret... user { * !token... } }",
+            r#"{"user":{"secret":1,"token":2,"nested":{"secret":3,"token":4,"id":5}},"other":{"secret":6,"token":7}}"#
+        ),
+        r#"{"user":{"nested":{"id":5}},"other":{"token":7}}"#
+    );
+}
+
+#[test]
+fn recursive_tree_handles_escaped_edges_and_nested_arrays() {
+    assert_eq!(
+        run(
+            "{ children** { id } }",
+            r#"{"children":[[{"children":[{"id":2}],"id":1}],{"id":3,"chi\u006cdren":[{"id":4,"ignored":5}]}]}"#
+        ),
+        r#"{"children":[[{"children":[{"id":2}],"id":1}],{"id":3,"children":[{"id":4}]}]}"#
+    );
+}
+
+#[test]
+fn exclusions_win_over_explicit_selections_and_match_source_names_before_aliasing() {
+    assert_eq!(
+        run("{ * hidden: secret !secret }", r#"{"secret":1,"id":2}"#),
+        r#"{"id":2}"#
+    );
+    assert_eq!(
+        run("{ * hidden: secret !hidden }", r#"{"secret":1,"id":2}"#),
+        r#"{"hidden":1,"id":2}"#
+    );
+    assert_eq!(
+        run("{ * secret! !secret }", r#"{"secret":1,"id":2}"#),
+        r#"{"id":2}"#
+    );
+    assert!(err("{ secret! !secret }", "{}").contains("required field"));
+}
+
+#[test]
+fn exclusions_handle_literal_dots_unicode_and_escaped_json_keys() {
+    assert_eq!(
+        run(
+            "{ * !a.b !日本語... !secret... }",
+            r#"{"a.b":1,"a":{"b":2,"日本語":3},"secr\u0065t":4,"nested":{"secr\u0065t":5}}"#
+        ),
+        r#"{"a":{"b":2},"nested":{}}"#
+    );
+}
+
+#[test]
+fn recursive_exclusion_composes_with_slices_and_collects() {
+    assert_eq!(
+        run(
+            "{ !secret... rows: items[:2][id detail] }",
+            r#"{"items":[{"id":1,"detail":{"secret":2,"x":3}},{"id":4,"detail":{"secret":5}},{"id":6}]}"#
+        ),
+        r#"{"rows":[{"id":1,"detail":{"x":3}},{"id":4,"detail":{}}]}"#
+    );
+    assert_eq!(
+        run("{ !id... items[id] }", r#"{"items":[{"id":1},{}]}"#),
+        r#"{"items":[null,null]}"#
+    );
+    assert_eq!(
+        run(
+            "{ !secret... items[detail] }",
+            r#"{"items":[{"detail":{"secret":1,"id":2}},{}]}"#
+        ),
+        r#"{"items":[{"id":2},null]}"#
+    );
+}
+
+#[test]
+fn exclusions_compose_with_both_recursive_modes() {
+    let input = r#"{"children":[{"id":1,"detail":{"secret":2},"children":[{"id":3,"detail":{"secret":4}}]}]}"#;
+    assert_eq!(
+        run("{ !secret... children** { id detail } }", input),
+        r#"{"children":[{"id":1,"detail":{},"children":[{"id":3,"detail":{}}]}]}"#
+    );
+    assert_eq!(
+        run("{ !secret... children... { id detail } }", input),
+        r#"{"children":[{"id":1,"detail":{}},{"id":3,"detail":{}}]}"#
+    );
+    assert_eq!(
+        run("{ children** { id !children } }", input),
+        r#"{"children":[{"id":1}]}"#
+    );
+}
+
+#[test]
+fn recursive_exclusion_reports_excessive_depth_rather_than_leaking_fields() {
+    let input = format!("{}0{}", r#"{"next":"#.repeat(300), "}".repeat(300));
+    assert!(err("{ * !secret... }", &input).contains("deep"));
+}
+
+#[test]
+fn new_syntax_rejects_ambiguous_or_meaningless_combinations() {
+    for query in [
+        "{ children** }",
+        "{ children**[id] }",
+        "{ children**[:2] { id } }",
+        "{ children...** { id } }",
+        "{ children**... { id } }",
+        "{ *** { id } }",
+        "{ !* }",
+        "{ alias: !secret }",
+        "{ !alias: secret }",
+        "{ !secret! }",
+        "{ !secret { id } }",
+        "{ !secret[id] }",
+        "{ !secret** { id } }",
+    ] {
+        assert!(parse(query).is_err(), "should reject {query}");
+    }
+    assert!(parse("{ id! * !secret !token... }").is_ok());
+    assert!(parse("{ items[!secret *] }").is_ok());
+}
+
+#[test]
 fn recursive_walk_reports_too_deep_instead_of_truncating() {
     let mut input = String::new();
     for _ in 0..300 {
