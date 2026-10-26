@@ -9,6 +9,10 @@
 # Local scratch fixtures
 big.json
 
+# Private local collections and environment; never commit these examples.
+/examples/jsonplaceholder/collections/03-navsvc/
+/examples/jsonplaceholder/environments/stage.yml
+
 # Editor / OS
 .vscode/
 .idea/
