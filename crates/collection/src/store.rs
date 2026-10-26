@@ -422,6 +422,9 @@ pub fn write(out: &Path, rendered: &Rendered) -> io::Result<()> {
 /// file move rather than a tree rewrite.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+// Request edits carry a full draft. Keep the public edit shape inline rather
+// than boxing it solely to match the much smaller metadata-only edits.
+#[allow(clippy::large_enum_variant)]
 pub enum Edit {
     Request {
         path: Vec<usize>,
@@ -474,6 +477,9 @@ pub struct RequestDraft {
     pub variables: Option<Vec<Variable>>,
     #[serde(default)]
     pub scripts: Option<Scripts>,
+    /// Omission keeps stored queries; an empty map explicitly removes them.
+    #[serde(default)]
+    pub queries: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug)]
@@ -502,6 +508,7 @@ impl RequestDraft {
                 .unwrap_or_else(|| base.variables.clone()),
             scripts: self.scripts.clone().unwrap_or_else(|| base.scripts.clone()),
             description: base.description.clone(),
+            queries: self.queries.clone().unwrap_or_else(|| base.queries.clone()),
         };
         // A URL typed with `?a=1` still works; the canonical form keeps the
         // query in `params` so a later toggle can disable one entry.

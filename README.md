@@ -287,12 +287,32 @@ the last one is remembered. Three panes: the tree, the request, the command.
 - **Send** uses the current request draft; it becomes **Cancel** while a request
   is pending. The response shows status, timing, size, unresolved variables, TLS
   warnings, and post-response script errors.
+  Its environment badge records where the response came from. Changing, editing,
+  or deleting an environment keeps existing responses and queries usable; the
+  badge turns amber when the response's environment differs from the selection.
+  Older history without a recorded environment is labeled as unknown.
 - The response viewer pretty-prints JSON with syntax highlighting, collapsible
-  objects and arrays, breadcrumb navigation, and key/value search. Large JSON
+  objects and arrays, breadcrumb navigation, and key/value search. Response line
+  numbers cover JSON and plain text without becoming part of copied text. Large JSON
   views use virtualized rows. The **Query** bar re-projects locally as you type;
   **Suggest** infers a starter query from the response without an OpenAPI spec.
   Leave the query empty to inspect the full JSON response. Non-JSON text views
   are capped at 512 KiB; the original bytes remain in Rust.
+  **Save to file** opens a native save dialog and exports the current query's
+  result as formatted JSON. With an empty query it saves the full original body,
+  preserving its bytes even when the text preview is truncated. Line numbers and
+  folded-view markers are not included. Captured responses may contain sensitive
+  data; choose the destination accordingly.
+- Save named projections per request: enter a query and a **Query name**, click
+  **Keep query**, then **Save** the request. The saved-query selector becomes
+  available once a response arrives and immediately applies the chosen view
+  without another HTTP call. Freeform edits remain possible; **Keep query** with
+  the same name updates it after confirmation. **Remove** stages its deletion;
+  **Save** makes query additions, updates, and removals durable. Queries live in
+  the request YAML as a `queries` map from names to query text, so they travel
+  with the request and survive restarts. History tabs remain read-only.
+  The query editor supports multiline text (**Shift+Enter** for a newline;
+  **Enter** applies the query), including comments in saved queries.
 - **History** records successful and failed sends, with a per-request history
   view and read-only tabs for stored responses. Response bodies persist in the
   app's local data directory, with a configurable storage limit (250 MiB by

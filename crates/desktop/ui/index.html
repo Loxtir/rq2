@@ -191,28 +191,42 @@
             <span class="response-title">Response</span>
             <span id="status" class="status status-idle">no response</span>
             <span id="timing" class="muted"></span>
+            <span id="response-environment" class="tag" hidden></span>
             <span id="script-errors" class="status status-error" hidden></span>
             <span id="tls" class="tag tag-warn" hidden>TLS not verified</span>
             <span class="spacer"></span>
             <span id="resolved" class="resolved" hidden></span>
             <span id="sizes" class="muted"></span>
+            <button id="save-response" class="btn btn-ghost" disabled title="Save the current query result, or the full original body if the query is empty. Responses may contain sensitive data.">Save to file</button>
           </div>
+          <div id="response-save-note" class="muted query-note" role="status" hidden></div>
 
           <div class="query-bar">
             <span class="prompt">query</span>
-            <input
+            <textarea
               id="query"
               class="query"
+              rows="1"
+              aria-label="Response projection query"
               spellcheck="false"
               autocomplete="off"
               placeholder="{ id title }"
-            />
+            ></textarea>
             <button id="apply-query" class="btn btn-ghost">Apply</button>
             <button id="suggest" class="btn btn-ghost" title="Infer a query from this response">
               Suggest
             </button>
           </div>
 
+          <div id="saved-query-bar" class="query-bar saved-query-bar">
+            <select id="saved-query" class="select" aria-label="Saved queries" disabled>
+              <option value="">Custom query</option>
+            </select>
+            <input id="query-name" class="select" aria-label="Query name" placeholder="Query name" autocomplete="off" />
+            <button id="store-query" class="btn btn-ghost" title="Add or update this named query in the request draft; Save the request to persist it">Keep query</button>
+            <button id="remove-query" class="btn btn-ghost" disabled>Remove</button>
+          </div>
+          <div id="query-note" class="muted query-note" role="status" hidden></div>
           <div id="query-error" class="query-error" hidden></div>
 
           <div id="response-body" class="code response-body">Send the request to see a response.</div>

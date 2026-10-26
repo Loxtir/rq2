@@ -109,6 +109,8 @@ fn draft(name: &str, method: &str, url: &str) -> RequestDraft {
         body: None,
         auth: Default::default(),
         variables: None,
+        scripts: None,
+        queries: None,
     }
 }
 

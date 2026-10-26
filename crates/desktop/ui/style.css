@@ -948,11 +948,17 @@ body.dragging * {
 
 .response-bar {
   display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
   padding: 7px 11px;
   background: var(--bg-raised);
   border-bottom: 1px solid var(--border-soft);
+}
+
+.response-bar .btn {
+  flex: 0 0 auto;
 }
 
 .response-title {
@@ -996,6 +1002,7 @@ body.dragging * {
 
 .query-bar {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 10px;
   padding: 7px 11px;
@@ -1012,11 +1019,46 @@ body.dragging * {
   opacity: 0.85;
 }
 
+.saved-query-bar {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.saved-query-bar select,
+.saved-query-bar input {
+  flex: 1;
+  min-width: 100px;
+  width: 0;
+  height: 28px;
+  color-scheme: dark;
+}
+
+.saved-query-bar input::placeholder {
+  color: var(--text-faint);
+}
+
+.saved-query-bar select:disabled {
+  color: var(--text-faint);
+  opacity: 0.55;
+}
+
+.saved-query-bar .btn {
+  height: 28px;
+}
+
+.query-note {
+  padding: 5px 12px;
+}
+
 .query {
   flex: 1;
+  resize: none;
+  field-sizing: content;
   min-width: 0;
+  max-height: 160px;
   font-family: var(--mono);
   font-size: 12.5px;
+  line-height: 1.5;
   color: var(--text);
   background: none;
   border: 0;
@@ -1152,8 +1194,58 @@ body.dragging * {
 }
 
 .json-tree {
+  position: relative;
+  counter-reset: response-line;
   min-width: max-content;
+  padding-left: calc(var(--line-number-width) + 18px);
   padding-bottom: 8px;
+}
+
+.json-tree .json-summary,
+.json-tree .json-row,
+.json-tree .json-close {
+  counter-increment: response-line;
+}
+
+.json-tree .json-summary::before,
+.json-tree .json-row::before,
+.json-tree .json-close::before {
+  content: counter(response-line);
+}
+
+.json-tree .json-summary::before,
+.json-tree .json-row::before,
+.json-tree .json-close::before,
+.json-virtual-row::after,
+.response-text::before {
+  position: absolute;
+  left: 0;
+  width: calc(var(--line-number-width) - 1ch);
+  padding-right: 1ch;
+  border-right: 1px solid var(--border-soft);
+  color: var(--text-faint);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-weight: 400;
+  user-select: none;
+  pointer-events: none;
+}
+
+.json-virtual-row::after {
+  content: attr(data-line-number);
+  top: 0;
+}
+
+.response-text {
+  position: relative;
+  min-width: max-content;
+  padding-left: var(--line-number-width);
+}
+
+.response-text::before {
+  content: attr(data-line-numbers);
+  top: 0;
+  white-space: pre;
 }
 
 .json-virtual-tree {
@@ -1305,6 +1397,10 @@ body.dragging * {
 }
 
 ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-corner {
   background: transparent;
 }
 

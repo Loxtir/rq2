@@ -374,6 +374,9 @@ fn persist_script_writes(
 #[derive(Clone, Serialize, Deserialize)]
 struct HistoryEntry {
     id: String,
+    /// Missing in older history; an empty name means no environment.
+    #[serde(default)]
+    environment: Option<String>,
     timestamp: u64,
     name: String,
     #[serde(default)]
@@ -501,12 +504,14 @@ enum TreeNode {
         headers: Vec<KeyValue>,
         body: Option<Body>,
         scripts: Scripts,
+        queries: BTreeMap<String, String>,
     },
 }
 
 #[derive(Serialize)]
 struct ResponseDto {
     id: u64,
+    environment: Option<String>,
     status: u16,
     elapsed_ms: u64,
     bytes: usize,
@@ -690,6 +695,7 @@ fn persist_response(
     collection: &str,
     path: &[usize],
     sent: &collection::send::SentResponse,
+    environment: &str,
 ) -> Option<String> {
     let dir = history_dir(app).ok()?;
     std::fs::create_dir_all(&dir).ok()?;
@@ -703,6 +709,7 @@ fn persist_response(
     );
     let entry = HistoryEntry {
         id: id.clone(),
+        environment: Some(environment.to_string()),
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
@@ -752,6 +759,7 @@ fn persist_failed_request(
     let id = format!("{}-{}", timestamp.as_nanos(), std::process::id());
     let entry = HistoryEntry {
         id: id.clone(),
+        environment: None,
         timestamp: timestamp.as_secs(),
         name: name.to_string(),
         collection: collection.to_string(),
@@ -852,6 +860,7 @@ fn open_history(
     let response_id = responses.insert(body);
     Ok(ResponseDto {
         id: response_id,
+        environment: entry.environment,
         status: entry.status,
         elapsed_ms: entry.elapsed_ms,
         bytes: entry.bytes,
@@ -1024,6 +1033,7 @@ fn tree(items: &[Item], path: &mut Vec<usize>, collection: &Collection) -> Vec<T
                 headers: request.headers.clone(),
                 body: request.body.clone(),
                 scripts: request.scripts.clone(),
+                queries: request.queries.clone(),
             }),
             None => out.push(TreeNode::Folder {
                 name: item.name.clone(),
@@ -1125,6 +1135,7 @@ async fn send(
 ) -> Result<ResponseDto, String> {
     let root = workspace_path(&state)?;
     let response_root = root.clone();
+    let response_environment = environment.clone().unwrap_or_default();
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     state
         .cancellations
@@ -1339,7 +1350,15 @@ async fn send(
             return Err(error);
         }
     };
-    let history_id = persist_response(&app, &name, &method, &collection_slug, &request_path, &sent);
+    let history_id = persist_response(
+        &app,
+        &name,
+        &method,
+        &collection_slug,
+        &request_path,
+        &sent,
+        &response_environment,
+    );
 
     let mut responses = state.responses.lock().map_err(|_| "state poisoned")?;
     let bytes = sent.body.len();
@@ -1347,6 +1366,7 @@ async fn send(
 
     Ok(ResponseDto {
         id,
+        environment: Some(response_environment),
         status: sent.status,
         elapsed_ms: sent.elapsed.as_millis() as u64,
         bytes,
@@ -1736,6 +1756,59 @@ fn copy_curl(
         .map_err(|_| "Could not write to the system clipboard".to_string())
 }
 
+/// Captured response data is exported as-is, never variable-expanded. An empty
+/// query preserves the original bytes, including bodies beyond the display cap.
+fn response_export(body: &[u8], query: &str) -> Result<Vec<u8>, String> {
+    if query.trim().is_empty() {
+        return Ok(body.to_vec());
+    }
+    let selection = parse(query).map_err(|diag| diag.render(query))?;
+    let projected = project(body, &selection).map_err(|diag| diag.render(query))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&projected).map_err(|error| error.to_string())?;
+    serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_response(
+    id: u64,
+    query: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let body = {
+        let responses = state.responses.lock().map_err(|_| "state poisoned")?;
+        responses
+            .bodies
+            .get(&id)
+            .cloned()
+            .ok_or("that response is no longer in memory; send it again")?
+    };
+    let bytes = response_export(&body, &query)?;
+    let is_json = serde_json::from_slice::<serde::de::IgnoredAny>(&bytes).is_ok();
+    let Some(file) = app
+        .dialog()
+        .file()
+        .set_title("Save response — may contain sensitive data")
+        .set_file_name(if is_json {
+            "response.json"
+        } else {
+            "response.txt"
+        })
+        .add_filter("JSON", &["json"])
+        .add_filter("Text", &["txt"])
+        .add_filter("All files", &["*"])
+        .blocking_save_file()
+    else {
+        return Ok(false);
+    };
+    let path = file.into_path().map_err(|error| error.to_string())?;
+    std::fs::write(path, bytes).map_err(|error| format!("Could not save response: {error}"))?;
+    Ok(true)
+}
+
 #[tauri::command]
 fn project_body(
     id: u64,
@@ -1839,10 +1912,69 @@ fn main() {
             curl_preview,
             copy_curl,
             project_body,
+            save_response,
             suggest_query
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod response_export_tests {
+    use super::*;
+
+    #[test]
+    fn empty_query_preserves_original_json_bytes() {
+        let body = b" { \"id\": 42, \"title\": \"Example\" }\r\n";
+        assert_eq!(response_export(body, " \n").unwrap(), body);
+        assert_eq!(response_export(b"", "").unwrap(), b"");
+    }
+
+    #[test]
+    fn export_is_not_truncated_or_lossy_for_non_json_bodies() {
+        let mut body = vec![0xff; RAW_VIEW_LIMIT + 4096];
+        body.extend_from_slice(b"\0last bytes\r\n");
+        assert_eq!(response_export(&body, "").unwrap(), body);
+    }
+
+    #[test]
+    fn query_exports_formatted_projection_not_viewer_decoration() {
+        let body = br#"{"id":42,"title":"Example","hidden":"not selected"}"#;
+        let exported = response_export(body, "{ id title }").unwrap();
+        assert_eq!(
+            String::from_utf8(exported).unwrap(),
+            "{\n  \"id\": 42,\n  \"title\": \"Example\"\n}"
+        );
+        assert!(response_export(body, "not a query").is_err());
+        assert!(response_export(body, "{ missing! }").is_err());
+        assert_eq!(
+            body,
+            br#"{"id":42,"title":"Example","hidden":"not selected"}"#
+        );
+    }
+}
+
+#[cfg(test)]
+mod response_environment_tests {
+    use super::*;
+
+    #[test]
+    fn history_records_response_environment_and_accepts_older_entries() {
+        let legacy = serde_json::json!({
+            "id": "old", "timestamp": 1, "name": "Request", "method": "GET",
+            "url": "https://api.test", "status": 200, "elapsed_ms": 1,
+            "bytes": 2, "content_type": null, "insecure": false, "missing": []
+        });
+        let entry: HistoryEntry = serde_json::from_value(legacy).unwrap();
+        assert_eq!(entry.environment, None);
+        for environment in ["", "Dev", "Stage"] {
+            let mut entry = entry.clone();
+            entry.environment = Some(environment.to_string());
+            let restored: HistoryEntry =
+                serde_json::from_slice(&serde_json::to_vec(&entry).unwrap()).unwrap();
+            assert_eq!(restored.environment.as_deref(), Some(environment));
+        }
+    }
 }
 
 #[cfg(test)]

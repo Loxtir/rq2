@@ -17,6 +17,7 @@ const state = {
   draft: null, // the editable copy of the selection
   saved: "", // JSON of the draft as loaded, for the dirty check
   response: null,
+  savingResponse: false,
   env: "",
   preview: "",
   previewTimer: null,
@@ -924,6 +925,10 @@ function renderRequestTabs() {
 }
 
 function setHistoryViewer(active) {
+  if (active) {
+    $("saved-query-bar").hidden = true;
+    $("query-note").hidden = true;
+  }
   for (const element of document.querySelectorAll("#request-view > .url-bar, #request-view > .meta-bar, #request-view > .tabs, #request-view > .tab-body")) {
     element.hidden = active;
   }
@@ -1202,12 +1207,16 @@ function openRequest(node, collection, path, keepResponse = false) {
     body: clone(node.body || null),
     auth: clone(node.auth ?? "inherit"),
     scripts: clone(node.scripts || { pre_request: "", post_response: "" }),
+    queries: clone(node.queries || {}),
   }));
   state.draft = entry.draft;
   state.saved = entry.saved;
   tab.name = state.draft.name;
   tab.method = state.draft.method;
   tab.url = state.draft.url;
+  $("query-name").value = "";
+  $("query-note").hidden = true;
+  renderSavedQueries();
 
   if (!keepResponse && tab.response) {
     showResponseMetadata(tab.response);
@@ -1750,6 +1759,7 @@ function draftForIpc() {
         : null,
     auth: draft.auth ?? "inherit",
     scripts: draft.scripts || { pre_request: "", post_response: "" },
+    queries: draft.queries || {},
   };
 }
 
@@ -2110,6 +2120,7 @@ async function cancelCurrentRequest(tabKey = state.activeRequestTab) {
 
 function showRequestError(message) {
   state.response = null;
+  renderResponseEnvironment();
   $("status").textContent = "error";
   $("status").className = "status status-error";
   $("timing").textContent = "";
@@ -2125,6 +2136,7 @@ function showRequestError(message) {
 
 function showRequestCancelled() {
   state.response = null;
+  renderResponseEnvironment();
   $("status").textContent = "cancelled";
   $("status").className = "status status-warn";
   $("timing").textContent = "";
@@ -2145,8 +2157,14 @@ function renderResponseText(text) {
   try {
     value = JSON.parse(text);
   } catch {
-    if (/^\s*[\[{]/.test(text)) renderJsonTokens(host, text);
-    else host.textContent = text;
+    const lines = text.split("\n").length;
+    const content = document.createElement("div");
+    content.className = "response-text";
+    content.style.setProperty("--line-number-width", `${String(lines).length + 2}ch`);
+    content.dataset.lineNumbers = Array.from({ length: lines }, (_, index) => index + 1).join("\n");
+    if (/^\s*[\[{]/.test(text)) renderJsonTokens(content, text);
+    else content.textContent = text;
+    host.replaceChildren(content);
     return;
   }
 
@@ -2165,6 +2183,7 @@ function renderResponseText(text) {
   host.append(model.navigation);
   const tree = document.createElement("div");
   tree.className = "json-tree";
+  tree.style.setProperty("--line-number-width", `${String(model.lineCount).length + 2}ch`);
   host.append(tree);
   appendJsonEntry(tree, null, value, [], false, model.nodes);
   updateJsonNavigation(model.navigation, [], model.nodes);
@@ -2327,6 +2346,7 @@ function renderVirtualJson(host, model) {
   createJsonToolbar(model);
   model.tree = document.createElement("div");
   model.tree.className = "json-virtual-tree";
+  model.tree.style.setProperty("--line-number-width", `${String(model.lineCount).length + 2}ch`);
   host.append(model.navigation, model.tree);
   model.lineHeight = parseFloat(getComputedStyle(host).lineHeight) || 18.6;
   model.selected = model.value && typeof model.value === "object" ? model.value : null;
@@ -2400,7 +2420,8 @@ function renderVirtualWindow(model) {
     const element = document.createElement("div");
     element.className = `json-virtual-row json-depth-${Math.min(row.depth, 12)}`;
     element.style.top = `${row.index * lineHeight}px`;
-    element.style.paddingLeft = `${row.depth * 18}px`;
+    element.style.paddingLeft = `calc(var(--line-number-width) + ${row.depth * 18}px)`;
+    element.dataset.lineNumber = row.index + 1;
     element.dataset.jsonPath = JSON.stringify(row.path || []);
     if (model.currentMatch === element.dataset.jsonPath) element.classList.add("json-search-current");
     if (row.kind === "open") {
@@ -2739,7 +2760,38 @@ function navigateJson(path, navigation, nodes) {
   nodes.get(JSON.stringify(path))?.scrollIntoView({ block: "nearest" });
 }
 
+function renderResponseEnvironment() {
+  const badge = $("response-environment");
+  const response = state.response;
+  $("save-response").disabled = !response || state.savingResponse;
+  if (!response) $("response-save-note").hidden = true;
+  badge.hidden = !response;
+  if (!response) return;
+  const environment = response.environment;
+  const known = environment != null;
+  const mismatch = known && environment !== (state.env || "");
+  badge.textContent = known ? environment || "no environment" : "environment unknown";
+  badge.className = mismatch ? "tag tag-warn" : "tag";
+  badge.title = !known
+    ? "This older response has no recorded environment."
+    : mismatch
+      ? `Sent using ${environment || "no environment"}; currently selected: ${state.env || "no environment"}. The stored response is still available.`
+      : `Environment used for this response: ${environment || "no environment"}.`;
+}
+
+function changeEnvironment() {
+  state.env = $("environment").value;
+  $("environment-edit").disabled = !state.env;
+  localStorage.setItem(environmentStorageKey(state.workspace.path), state.env);
+  renderResponseEnvironment();
+  repaintVariables();
+  refreshPreview();
+}
+
 function showResponseMetadata(response) {
+  $("response-save-note").hidden = true;
+  renderResponseEnvironment();
+  renderSavedQueries();
   const status = $("status");
   status.textContent = String(response.status);
   status.className = `status ${statusClass(response.status)}`;
@@ -2764,6 +2816,8 @@ function showResponseMetadata(response) {
 
 function resetResponse(message) {
   state.response = null;
+  renderResponseEnvironment();
+  renderSavedQueries();
   state.projectionVersion += 1;
   const activeTab = state.requestTabs.find((tab) => tab.key === state.activeRequestTab);
   if (activeTab) activeTab.response = null;
@@ -2782,6 +2836,104 @@ function resetResponse(message) {
 }
 
 /* ---------- projection ---------- */
+
+async function saveResponse() {
+  const response = state.response;
+  if (!response || state.savingResponse) return;
+  const query = $("query").value;
+  state.savingResponse = true;
+  renderResponseEnvironment();
+  const note = $("response-save-note");
+  note.hidden = true;
+  try {
+    const saved = await invoke("save_response", { id: response.id, query });
+    if (state.response !== response) return;
+    note.className = "muted query-note";
+    note.textContent = "Response saved.";
+    note.hidden = !saved;
+  } catch (error) {
+    if (state.response !== response) return;
+    note.className = "query-note error-text";
+    note.textContent = String(error);
+    note.hidden = false;
+  } finally {
+    state.savingResponse = false;
+    renderResponseEnvironment();
+  }
+}
+
+function renderSavedQueries() {
+  const editable = state.selection?.kind === "request" && Boolean(state.draft);
+  $("saved-query-bar").hidden = !editable;
+  if (!editable) {
+    $("query-note").hidden = true;
+    return;
+  }
+  const queries = state.draft.queries || {};
+  const select = $("saved-query");
+  const selected = select.value;
+  select.replaceChildren();
+  const custom = document.createElement("option");
+  custom.value = "";
+  custom.textContent = "Custom query";
+  select.append(custom);
+  for (const name of Object.keys(queries).sort()) {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    select.append(option);
+  }
+  select.value = Object.hasOwn(queries, selected) && queries[selected] === $("query").value
+    ? selected
+    : Object.keys(queries).find((name) => queries[name] === $("query").value) || "";
+  select.disabled = !state.response || Object.keys(queries).length === 0;
+  $("remove-query").disabled = !select.value;
+  $("store-query").disabled = !$("query").value.trim() || !$("query-name").value.trim();
+}
+
+function queryEdited() {
+  const tab = state.requestTabs.find((item) => item.key === state.activeTab);
+  if (tab) tab.query = $("query").value;
+  renderSavedQueries();
+}
+
+function selectSavedQuery() {
+  if (state.selection?.kind !== "request" || !state.response) return;
+  const name = $("saved-query").value;
+  if (!Object.hasOwn(state.draft.queries || {}, name)) return;
+  $("query").value = state.draft.queries[name];
+  $("query-name").value = name;
+  queryEdited();
+  void applyQuery();
+}
+
+function storeQuery() {
+  if (state.selection?.kind !== "request" || !state.draft) return;
+  const name = $("query-name").value.trim();
+  const query = $("query").value;
+  if (!name || !query.trim()) return;
+  const queries = state.draft.queries || {};
+  if (Object.hasOwn(queries, name) && queries[name] !== query &&
+      !window.confirm(`Replace the saved query "${name}"?`)) return;
+  // Computed keys also safely support names such as "__proto__".
+  state.draft.queries = { ...queries, [name]: query };
+  $("saved-query").value = name;
+  queryEdited();
+  updateDirty();
+  $("query-note").textContent = "Query kept in draft. Save the request to persist query changes.";
+  $("query-note").hidden = false;
+}
+
+function removeSavedQuery() {
+  if (state.selection?.kind !== "request" || !state.draft) return;
+  const name = $("saved-query").value;
+  if (!Object.hasOwn(state.draft.queries || {}, name)) return;
+  delete state.draft.queries[name];
+  renderSavedQueries();
+  updateDirty();
+  $("query-note").textContent = "Query removed from draft. Save the request to persist query changes.";
+  $("query-note").hidden = false;
+}
 
 async function applyQuery() {
   if (!state.response) return;
@@ -2813,6 +2965,7 @@ async function applyQuery() {
       )} (${saved}%) · ${elapsed(projection.elapsed_ms)}`;
     }
   } catch (error) {
+    if (version !== state.projectionVersion || state.response?.id !== response.id) return;
     $("query-error").hidden = false;
     $("query-error").textContent = String(error);
   }
@@ -2823,6 +2976,7 @@ async function suggest() {
 
   try {
     $("query").value = await invoke("suggest_query", { id: state.response.id });
+    queryEdited();
     await applyQuery();
   } catch (error) {
     $("query-error").hidden = false;
@@ -2948,9 +3102,6 @@ async function saveEnvironmentEditor() {
       localStorage.setItem(environmentStorageKey(workspace.path), name);
     }
     state.workspace = workspace;
-    if (editor.kind === "environment" && state.response) {
-      resetResponse("Environment changed — send again.");
-    }
     state.environmentEditor = null;
     $("environment-dialog").close();
     renderWorkspace();
@@ -2973,7 +3124,6 @@ async function deleteSelectedEnvironment() {
     state.environmentEditor = null;
     $("environment-dialog").close();
     renderWorkspace();
-    if (state.response) resetResponse("Environment deleted — send again.");
     repaintVariables();
     refreshPreview();
   } catch (error) {
@@ -3053,6 +3203,7 @@ function renderWorkspace() {
   select.value = state.env;
   $("environment-edit").disabled = !state.env;
 
+  renderResponseEnvironment();
   renderTree();
 }
 
@@ -3131,6 +3282,7 @@ async function boot() {
   $("node-save").addEventListener("click", save);
   $("suggest").addEventListener("click", suggest);
   $("apply-query").addEventListener("click", applyQuery);
+  $("save-response").addEventListener("click", saveResponse);
   $("copy-curl").addEventListener("click", () => copyCurl(false));
   $("copy-curl-secrets").addEventListener("click", () => copyCurl(true));
   $("tree-search").addEventListener("input", () => {
@@ -3164,10 +3316,11 @@ async function boot() {
     renderTree();
     $("tree-search").focus();
   });
-  $("query").addEventListener("input", () => {
-    const tab = state.requestTabs.find((item) => item.key === state.activeRequestTab);
-    if (tab) tab.query = $("query").value;
-  });
+  $("query").addEventListener("input", queryEdited);
+  $("query-name").addEventListener("input", renderSavedQueries);
+  $("saved-query").addEventListener("change", selectSavedQuery);
+  $("store-query").addEventListener("click", storeQuery);
+  $("remove-query").addEventListener("click", removeSavedQuery);
   $("open-workspace").addEventListener("click", chooseWorkspace);
   $("import-postman").addEventListener("click", openImportDialog);
   $("import-choose").addEventListener("click", importPostman);
@@ -3288,15 +3441,7 @@ async function boot() {
     readBody();
   });
 
-  $("environment").addEventListener("change", () => {
-    state.env = $("environment").value;
-    $("environment-edit").disabled = !state.env;
-    localStorage.setItem(environmentStorageKey(state.workspace.path), state.env);
-    if (state.response) resetResponse("Environment changed — send again.");
-    for (const tab of state.requestTabs) tab.response = null;
-    repaintVariables();
-    refreshPreview();
-  });
+  $("environment").addEventListener("change", changeEnvironment);
 
   document.querySelector('[data-add="header"]').addEventListener("click", () => {
     state.draft.headers.push({ name: "", value: "", disabled: false });
@@ -3351,7 +3496,7 @@ async function boot() {
   });
 
   $("query").addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.ctrlKey && !event.metaKey) {
+    if (event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
       event.preventDefault();
       event.stopPropagation();
       applyQuery();
