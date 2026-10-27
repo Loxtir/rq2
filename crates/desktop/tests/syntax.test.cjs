@@ -26,6 +26,23 @@ test("JSON escapes and variable placeholders remain intact", () => {
   has(parts, "{{count}}", "");
 });
 
+test("JSON line comments are highlighted without treating URLs or escaped quotes as comments", () => {
+  const source = String.raw`{
+  // disabled: {{unused}} "not a string"
+  "url": "https://api.test/path//segment",
+  "text": "escaped \" // still inside", // inline comment
+  "value": {{value}}
+} // final comment`;
+  const parts = syntaxParts(source, "json");
+  has(parts, '// disabled: {{unused}} "not a string"', "syntax-comment");
+  has(parts, '"https://api.test/path//segment"', "json-string");
+  has(parts, String.raw`"escaped \" // still inside"`, "json-string");
+  has(parts, "// inline comment", "syntax-comment");
+  has(parts, "// final comment", "syntax-comment");
+  has(parts, "{{value}}", "");
+  assert.equal(parts.map((part) => part.text).join(""), source);
+});
+
 test("JavaScript highlights scripts without interpreting their contents", () => {
   const source = 'const data = pm.response.json();\n// keep response\nif (data.ok === true) { pm.environment.set("id", data.id); }';
   const parts = syntaxParts(source, "javascript");

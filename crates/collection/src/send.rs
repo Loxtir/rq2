@@ -4,7 +4,7 @@
 //! way. Nothing here knows about files: it takes a request, the resolved auth,
 //! and a variable map.
 
-use crate::model::{Auth, Collection, Environment, RequestDef, Variable};
+use crate::model::{Auth, Body, Collection, Environment, RequestDef, Variable};
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::time::{Duration, Instant};
@@ -363,7 +363,7 @@ pub fn send(
 
     let sent = match &request.body {
         Some(body) => {
-            let text = substitute(body.text.as_deref().unwrap_or_default(), vars, &mut missing);
+            let text = body_text(body, vars, &mut missing);
             if body.language.as_deref() == Some("json") && !has_header(request, "content-type") {
                 call = call.set("Content-Type", "application/json");
             }
@@ -457,7 +457,7 @@ pub async fn send_async(
         call = call.header(name, value);
     }
     if let Some(body) = &request.body {
-        let text = substitute(body.text.as_deref().unwrap_or_default(), vars, &mut missing);
+        let text = body_text(body, vars, &mut missing);
         if body.language.as_deref() == Some("json") && !has_header(request, "content-type") {
             call = call.header(reqwest::header::CONTENT_TYPE, "application/json");
         }
@@ -494,6 +494,54 @@ pub async fn send_async(
         insecure: options.insecure,
         missing,
     })
+}
+
+/// Shared by both transports and cURL. Strip source comments before expansion
+/// so commented-out variables are ignored and substituted values stay verbatim.
+pub(crate) fn body_text(
+    body: &Body,
+    vars: &BTreeMap<String, String>,
+    missing: &mut Vec<String>,
+) -> String {
+    let text = body.text.as_deref().unwrap_or_default();
+    if body.language.as_deref() == Some("json") {
+        substitute(&strip_json_line_comments(text), vars, missing)
+    } else {
+        substitute(text, vars, missing)
+    }
+}
+
+fn strip_json_line_comments(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut quoted = false;
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if quoted {
+            result.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+        } else if ch == '"' {
+            quoted = true;
+            result.push(ch);
+        } else if ch == '/' && chars.peek() == Some(&'/') {
+            chars.next();
+            for comment in chars.by_ref() {
+                if matches!(comment, '\r' | '\n') {
+                    result.push(comment);
+                    break;
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 pub(crate) fn auth_parts(
@@ -553,4 +601,64 @@ fn has_header(request: &RequestDef, name: &str) -> bool {
         .headers
         .iter()
         .any(|header| !header.disabled && header.name.eq_ignore_ascii_case(name))
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+
+    #[test]
+    fn line_comments_are_removed_with_line_endings_preserved() {
+        for (source, expected) in [
+            ("// only a comment", ""),
+            (
+                "// heading\n{\n  \"id\": 1 // inline\n}// eof",
+                "\n{\n  \"id\": 1 \n}",
+            ),
+            ("[1,// first\r\n2// second\r3]// eof", "[1,\r\n2\r3]"),
+            ("// \"quotes\" and \\ escapes\n{}", "\n{}"),
+        ] {
+            assert_eq!(strip_json_line_comments(source), expected);
+        }
+    }
+
+    #[test]
+    fn strings_urls_unicode_and_escaped_quotes_are_unchanged() {
+        let json = serde_json::json!({
+            "url": "https://api.test/path//segment",
+            "even": "\\\\",
+            "odd": "\\\" // still quoted",
+            "unicode": "雪 // 保留",
+        })
+        .to_string();
+        let commented = format!("// heading\n{json} // trailing");
+        assert_eq!(strip_json_line_comments(&commented), format!("\n{json} "));
+        assert_eq!(strip_json_line_comments(&json), json);
+        let incomplete = r#"{"text":"unfinished // still quoted"#;
+        assert_eq!(strip_json_line_comments(incomplete), incomplete);
+    }
+
+    #[test]
+    fn comments_are_stripped_before_variable_expansion_only_for_json() {
+        let text = "// {{unused}}\n{\"value\":\"{{value}}\"}";
+        let vars = BTreeMap::from([("value".to_string(), "https://api.test//path".to_string())]);
+        let mut body = Body {
+            mode: "raw".to_string(),
+            language: Some("json".to_string()),
+            text: Some(text.to_string()),
+        };
+        let mut missing = Vec::new();
+        assert_eq!(
+            body_text(&body, &vars, &mut missing),
+            "\n{\"value\":\"https://api.test//path\"}"
+        );
+        assert!(missing.is_empty());
+        assert_eq!(body.text.as_deref(), Some(text));
+        for language in [Some("text"), Some("javascript"), None] {
+            body.language = language.map(str::to_string);
+            missing.clear();
+            assert!(body_text(&body, &vars, &mut missing).starts_with("// {{unused}}"));
+            assert_eq!(missing, ["unused"]);
+        }
+    }
 }

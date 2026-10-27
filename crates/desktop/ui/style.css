@@ -2108,6 +2108,7 @@ body.right-closed .request-tabs {
 
 .var-popover-create select {
   flex: 1;
+  color-scheme: dark;
 }
 
 .var-popover-actions {

@@ -1920,6 +1920,82 @@ fn main() {
 }
 
 #[cfg(test)]
+mod request_body_tests {
+    use super::*;
+    use std::io::{BufRead, Read, Write};
+
+    #[tokio::test]
+    async fn json_comments_are_omitted_by_both_transports_and_curl() {
+        let source =
+            "{\n// {{unused}}\n\"url\":\"https://api.test//path\",\n\"id\":{{id}} // note\n}";
+        let expected = "{\n\n\"url\":\"https://api.test//path\",\n\"id\":42 \n}";
+        let vars = collection::send::Variables::from(BTreeMap::from([(
+            "id".to_string(),
+            "42".to_string(),
+        )]));
+        for asynchronous in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                    }
+                }
+                let mut body = vec![0; length.expect("content length")];
+                reader.read_exact(&mut body).unwrap();
+                reader
+                    .get_mut()
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .unwrap();
+                body
+            });
+            let request = collection::model::RequestDef {
+                method: "POST".to_string(),
+                url,
+                body: Some(Body {
+                    mode: "raw".to_string(),
+                    language: Some("json".to_string()),
+                    text: Some(source.to_string()),
+                }),
+                ..Default::default()
+            };
+            let preview = collection::curl::render(&request, None, &vars);
+            assert!(preview.text.contains(expected));
+            assert!(!preview.text.contains("unused"));
+            assert!(!preview.text.contains("// note"));
+            let options = collection::send::SendOptions::default();
+            let response = if asynchronous {
+                collection::send::send_async(&request, None, &vars, &options)
+                    .await
+                    .unwrap()
+            } else {
+                collection::send::send(&request, None, &vars, &options).unwrap()
+            };
+            assert_eq!(response.status, 200);
+            assert!(response.missing.is_empty());
+            assert_eq!(server.join().unwrap(), expected.as_bytes());
+            assert_eq!(request.body.unwrap().text.as_deref(), Some(source));
+        }
+    }
+}
+
+#[cfg(test)]
 mod response_export_tests {
     use super::*;
 

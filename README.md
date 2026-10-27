@@ -284,6 +284,10 @@ the last one is remembered. Three panes: the tree, the request, the command.
   response from their **Scripts** editors; see [Scripts](#scripts) below.
 - JSON request bodies and JavaScript pre-request/post-response scripts have
   syntax highlighting while retaining native text editing and selection.
+  JSON request bodies support `//` line comments: they remain in the editor and
+  saved YAML, but are stripped from sent bodies and cURL previews/copies before
+  variable substitution. Quoted strings (including URLs and literal `//`) stay
+  untouched. Other body languages are sent unchanged.
 - **Send** uses the current request draft; it becomes **Cancel** while a request
   is pending. The response shows status, timing, size, unresolved variables, TLS
   warnings, and post-response script errors.

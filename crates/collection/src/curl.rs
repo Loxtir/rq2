@@ -101,8 +101,8 @@ pub fn render(
     }
 
     if let Some(body) = &request.body {
-        if let Some(text) = &body.text {
-            let text = send::substitute(text, variables, &mut missing);
+        if body.text.is_some() {
+            let text = send::body_text(body, variables, &mut missing);
             if body.language.as_deref() == Some("json") && !has_content_type {
                 args.push(format!(
                     "-H {}",

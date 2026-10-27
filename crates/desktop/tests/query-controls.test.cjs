@@ -26,6 +26,11 @@ async function checkQueryControls() {
     openRequest(node, collection, [0]);
     check($("saved-query").disabled, "selector must wait for a response");
     const themed = getComputedStyle(document.querySelector(".sidebar-tools .select"));
+    const scopeStyle = getComputedStyle($("var-create"));
+    for (const property of ["backgroundColor", "color", "fontFamily", "fontSize", "borderRadius", "borderColor", "padding"]) {
+      check(scopeStyle[property] === themed[property], `variable scope dropdown must use the app's ${property}`);
+    }
+    check(scopeStyle.colorScheme === "dark", "variable scope dropdown must keep native options dark");
     for (const id of ["saved-query", "query-name"]) {
       const style = getComputedStyle($(id));
       check(style.backgroundColor === themed.backgroundColor, `${id} must use the app's dark control background`);
