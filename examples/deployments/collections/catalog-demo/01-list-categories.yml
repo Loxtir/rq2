@@ -1,0 +1,11 @@
+name: List categories
+description: Preview-only request demonstrating a tenant-dependent base path and a stable hostname.
+method: GET
+url: '{{baseUrl}}/catalogs/:catalogId/categories'
+path_params:
+  catalogId: demo-catalog
+headers:
+  - name: Accept
+    value: application/json
+  - name: X-Tenant
+    value: '{{tenant}}'

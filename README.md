@@ -27,10 +27,17 @@ body is always kept; the query is re-run against it locally and for free.
 | `metadata { * }`          | one level of keys, values verbatim                  |
 | `owner: author { login }` | alias                                               |
 | `id!`                     | fail loudly if the response omits it                |
+| `status == "ACTIVE"`      | emit this field only when its value equals the literal |
+| `status != "DELETED"`     | emit this field only when its value differs from the literal |
+| `name in ["Mike", "X"]`  | emit this field only when its value is in the list |
+| `name not in ["Mike", "X"]` | emit this field only when its value is not in the list |
+| `profiles[? name == "Mike"] { name age }` | keep only matching array objects, then project |
 | `items[id]`               | one value per element, flattened into a list        |
 | `items[0:5][id]`          | slice first, then collect                           |
 | `children...{ id }`       | walk a repeated key, flattening projected nodes |
 | `children**{ id }`        | project every level of a repeated key, keeping the tree |
+| `items...children[? id == 1] { id }` | start at items, follow children, flatten matching nodes |
+| `items**children[? id == 1] { id }` | follow children, retaining matching nodes and ancestor containers |
 | `* !secret`              | keep everything except `secret` at this level |
 | `* !secret...`           | keep everything except `secret` at any depth |
 | `children...[id]`         | walk it, then flatten to bare values                |
@@ -38,6 +45,173 @@ body is always kept; the query is re-run against it locally and for free.
 
 Field names may contain `-`, `.`, `@`, `$` and unicode, so `content-type` and
 `x-amz-date` work without quoting.
+
+### Conditional fields
+
+Use `==` or `!=` to decide whether to include a field based on its original
+value:
+
+```graphql
+{ id status == "ACTIVE" }
+{ id status != "DELETED" }
+{ count == 42 enabled == true optional == null }
+{ profile != null { displayName } }
+```
+
+For `[{"id":1,"status":"ACTIVE"},{"id":2,"status":"DELETED"}]`, the first two
+queries both return `[{"id":1,"status":"ACTIVE"},{"id":2}]`. A failed comparison
+**omits the field**, not the containing object or array element. Empty objects
+and array positions remain. Missing fields are omitted for both operators;
+missing is not the same as an explicit JSON `null`.
+
+Comparison literals are JSON double-quoted strings, numbers, booleans or `null`.
+Equality is type-sensitive: `42` does not equal `"42"`, and `false` does not
+equal `0`. Strings compare decoded JSON content, including Unicode and escapes.
+Numbers compare exact decimal values: `1`, `1.0`, and `1e0` are equal, without
+rounding large integers through floating point. Matched values keep their
+original JSON representation. Objects and arrays cannot be comparison literals;
+they are unequal to any scalar literal, so `profile != null { name }` can omit a
+null profile while projecting a non-null one. Conditions are checked before
+the nested selection is applied.
+
+Aliases work (`{ current: status == "ACTIVE" }`). An explicit conditional field
+still wins over `*`, even when it fails its condition; wildcard fallback does
+not re-add it. Exclusions still win over both. `status! == "ACTIVE"` requires
+the field to exist, but a present non-matching value is simply omitted.
+
+Use comparisons on named fields, not directly on `*`, exclusions, recursive
+edges or bracket suffixes. Compare fields **inside** those selections instead:
+`{ items[:5] { status != "DELETED" } }` or
+`{ children** { id status == "ACTIVE" } }`.
+Conditional collects such as `{ items[id == 1] }` produce projected objects
+(`[{"id":1},{}]`), not the bare-value shortcut used by unconditional `[id]`.
+Only one comparison is supported per field; there are no boolean expressions,
+field-to-field comparisons or general-purpose scripting. The desktop can resolve
+scoped variables inside comparison strings, as described below.
+The `=` character is reserved for comparison syntax in field names.
+
+### Membership and array filters
+
+Use `in` or `not in` with a comma-separated list of JSON scalars. They use the
+same exact, type-sensitive equality as `==`:
+
+```graphql
+# Keep every profile and its age; emit name only for Mike or X.
+{ profiles { name in ["Mike", "X"] age } }
+
+# Keep only matching profile objects, returning their name and age.
+{ profiles[? name in ["Mike", "X"]] { name age } }
+
+# Exclude those names instead.
+{ profiles[? name not in ["Mike", "X"]] { name age } }
+```
+
+For `{"profiles":[{"name":"Mike","age":30},{"name":"Anna","age":25}]}`,
+the first query retains both profiles, omitting Anna's `name`. The second returns
+`{"profiles":[{"name":"Mike","age":30}]}`. Filters also accept `==` and `!=`:
+`{ profiles[? name == "Mike"] { name age } }`.
+
+Missing fields never match any of these operators, including `not in` and `!=`.
+Explicit `null` matches `[null]`. `in []` never matches; `not in []` matches every
+present value. Object and array field values are not members of any scalar list.
+Lists may mix scalar types, but cannot contain objects, arrays, or expressions.
+Comments and whitespace are allowed; commas separate values and trailing commas
+are rejected.
+
+`[? ...]` filters the immediate **object elements of an array**. Non-object
+elements and objects missing the tested key are removed, even for negation.
+No matches yields `[]`; a missing array field remains omitted. Applying a filter
+to a present non-array value (including `null`) reports an error. Without a
+following selection, matching objects retain their complete contents.
+
+Predicates inspect the original object before projection, aliases, or exclusions,
+so the tested field need not appear in the output. Names match literal keys;
+`profile.name` tests that exact key, not a nested path. Use nested braces to
+follow object fields, ending in one condition:
+
+```graphql
+{
+  payload {
+    events {
+      items[? definition { item_id { value == "2762467" } }] {
+        definition { item_id { value } }
+      }
+    }
+  }
+}
+```
+
+First the predicate inside `[? ...]` decides which **items** survive; then the
+selection after it chooses their output fields. The predicate does not project
+or change the item. For example, the same filter can be followed by `{ label }`
+without returning `definition` at all. Omit the selection to keep whole matching
+items. Use `value == 2762467` without quotes for a numeric ID, or
+`value in ["2762467", "2762468"]` to accept multiple string IDs.
+
+Each predicate is one path with one field at each level, ending in `==`, `!=`,
+`in`, or `not in`. Missing path fields and null, scalar, or array intermediate
+values do not match, including for negated conditions. Nested braces follow
+objects only; they do not implicitly search arrays. Paths are limited to 256
+nested object steps. Aliases, required markers, exclusions, recursion, bracket
+suffixes, and multiple sibling fields are not supported inside predicates.
+There is no `===`, `!==`, or general-purpose expression evaluation.
+
+Slices and filters run in written order:
+
+```graphql
+{ profiles[? name in ["Mike", "X"]][:5] { name age } } # first five matches
+{ profiles[:5][? name in ["Mike", "X"]] { name age } } # matches among first five
+{ profiles[? name == "Mike"][age] }                    # ages of matching profiles
+```
+
+Multiple filters can narrow the same array; collects must come last. Filters can
+also follow `...` and `**` recursive edges, as described under Trees below.
+All operations are local views: the stored response remains unchanged.
+
+### Query editor and variables
+
+The desktop query editor colors field names, strings, numbers, operators, and
+comments. Braces and brackets share a color with their matching partner at each
+depth. Place the caret next to a delimiter to underline its matching pair;
+unmatched delimiters get a wavy underline. Native text editing, selection, undo,
+multiline sizing, and scrolling are retained.
+
+Use the existing `{{name}}` variables **inside double-quoted comparison strings**:
+
+```graphql
+{
+  payload {
+    events {
+      items[? definition { item_id { value == "{{myVar}}" } }] {
+        definition { item_id attributes }
+      }
+    }
+  }
+}
+```
+
+The desktop resolves globals, selected environment, collection,
+folder, and request scopes in the same order as requests. Service collections
+also require a valid selected deployment when resolving variables, and generated
+deployment inputs take precedence. Apply the query again after changing a value
+or environment. Local current values take the place of defaults in their own
+scope, without changing scope precedence. Applying a local value also reapplies
+the displayed response query. Variable tokens use the same hover/edit card as request fields;
+undefined names are amber. Named queries retain placeholders when saved.
+
+Only parsed string literals are expanded, including strings in `in` / `not in`
+lists and embedded text such as `"prefix-{{name}}"`. A variable containing `42`
+remains the string `"42"`, not the number `42`. Unquoted `{{name}}`, substitution
+in field names, and executable expressions are not supported. Comments are never
+expanded. These bindings are a desktop workspace feature, not CLI substitution.
+
+Resolution and secret values stay in Rust. Values containing quotes, newlines,
+backslashes, or braces remain literal data and cannot inject query syntax.
+Undefined or unresolved variables produce an error against the original query,
+without exposing expanded values. Preview and response-file export use the same
+binding rules; neither the stored query nor captured response body is rewritten.
+History-only tabs have no current request scope and cannot resolve query
+variables; literal queries and empty-query exports remain available there.
 
 ### Trees
 
@@ -81,8 +255,65 @@ only particular fields at every level:
 The `children` edge is included automatically at each level. Missing edges stay
 missing; empty arrays and `null` remain unchanged. An alias renames only the
 starting edge, not the nested `children` keys. `**` requires a selection set and
-does not accept slices or collects. Existing `children...{ ... }` queries still
+accepts optional filters, but not slices or collects. Existing `children...{ ... }` queries still
 flatten descendants into one list.
+
+#### Filtering at any depth
+
+When the initial array is `items` but each item's descendants live in `children`,
+write the descendant key immediately after the recursion suffix: `items...children`
+or `items**children`, without whitespace between the suffix and the key.
+This includes the initial items, then follows `children` at every level. With no
+explicit descendant key, `children...` and `children**` continue to follow their
+own key as before. Neither form searches arbitrary object paths.
+
+Use **three dots** for a flat list of matches, in depth-first document order:
+
+```graphql
+{
+  payload {
+    events {
+      items...children[? definition { item_id { value == "{{myVar}}" } }] {
+        definition { item_id attributes }
+      }
+    }
+  }
+}
+```
+
+Use **two stars** to retain hierarchy instead:
+
+```graphql
+{
+  payload {
+    events {
+      items**children[? definition { item_id { value == "{{myVar}}" } }] {
+        definition { item_id attributes }
+      }
+    }
+  }
+}
+```
+
+Both forms evaluate predicates against original node values and continue into
+children even when the parent does not match. Flat output contains only matching
+nodes, never the traversed `children` subtree. Tree output contains projected
+matching nodes and retains non-matching ancestors **only as `children` containers**
+when they lead to a match; it removes branches with no matches. A matching parent
+does not automatically include non-matching descendants. No matches yields `[]`.
+Required output fields are checked only on matching nodes, not ancestor containers.
+Excluding the descendant edge stops traversal through that branch.
+
+For example, an unmatched parent above a matching `{ "id": 2 }` produces
+`[{"id":2}]` in flat mode and `[{"children":[{"id":2}]}]` in tree mode.
+On matching tree nodes, empty child arrays and null/scalar terminal branches
+remain; the filtered starting field must be an array.
+
+All existing predicate operators and desktop string variables work here. Recursive
+flat filters must precede slices: `{ items...children[? id in [1,2]][:5][id] }`
+takes the first five matching values across the complete walk, without stopping
+traversal. Collects still come last. Tree mode requires a selection and supports
+filters only, not slices or collects. The 256-level nesting limit is unchanged.
 
 ### Excluding fields
 
@@ -133,6 +364,7 @@ collection has to survive review and merge:
 
 ```
 collections/acme-orders/collection.yml               name, description, auth, variables
+collections/acme-orders/deployments.yml              optional tenant/platform/slot placements
 collections/acme-orders/01-orders/folder.yml         folder display name, optional auth
 collections/acme-orders/01-orders/01-list-orders.yml name, method, url, params, headers, body
 collections/acme-orders/02-admin/01-purge-cache.yml
@@ -228,6 +460,152 @@ expansion in cURL previews, so composing a secret into another variable cannot
 expose it. Globals and collection, folder, request, and environment secrets are
 stored under `.secrets/`, never in committed YAML.
 
+The desktop separates **saved defaults** from **local current values**. Hover a
+`{{name}}` token and type to automatically update its current value without
+saving a request, collection, or environment. Current values persist beside the
+last-workspace setting in the user config directory:
+
+```text
+%APPDATA%/rq/state.json       last workspace (Windows)
+%APPDATA%/rq/variables.json   local current variable values, grouped by workspace and scope
+```
+
+On macOS this directory is `~/Library/Application Support/rq`; on Linux it is
+`$XDG_CONFIG_HOME/rq` (or `~/.config/rq`). Nothing is written inside the workspace.
+A local override replaces only its own scope's default; a narrower saved
+definition still wins over a wider local value. Requests, cURL previews/copy,
+deployment URL resolution, query comparisons, and response export all use these
+current values. They survive refreshes and app restarts, and other workspaces
+and environments have independent values. Generated deployment inputs stay
+read-only.
+
+**Use saved value** removes the winning local override, restoring the saved
+default (or removing a local-only definition). The collection, environment, and
+globals editors explicitly edit **saved defaults** instead. Saving unrelated
+edits never promotes local current values into YAML. Local config is not an
+encrypted credential vault: secret overrides, like existing `.secrets/` files,
+are stored locally in plaintext; they remain masked in previews and are never
+returned to the webview. Protect the config directory and its backups accordingly.
+
+### Services and deployments
+
+A collection can optionally represent a service deployed across tenants,
+platforms and slots. Ordinary collections need no changes. Configuration is
+edited in YAML; the window provides target selection, not deployment editors.
+
+Each environment owns its platforms and their URL patterns. Platform names must
+be unique across the workspace, including across environments:
+
+```yaml
+# environments/stage.yml
+name: stage
+platforms:
+  - name: stage-a
+    url_template: 'https://{{serviceName}}-{{slot}}.stage-a.example.test/{{tenant}}'
+  - name: stage-b
+    url_template: 'https://{{tenant}}.stage-b.example.test/{{serviceName}}/{{slot}}'
+```
+
+The collection defines its technical service name, independently of its display
+name. Placement records live in a separate file beside `collection.yml`:
+
+```yaml
+# collections/navigation-core/collection.yml
+name: Navigation Core
+service_name: navsvc
+
+# collections/navigation-core/deployments.yml
+deployments:
+  - tenant: acme
+    platform: stage-a
+    slot: stable
+  - tenant: acme
+    platform: stage-a
+    slot: candidate
+  - tenant: globex
+    platform: stage-b
+    slot: stable
+```
+
+Deployments have no variables or repeated environment names. Their environment
+comes from the platform's membership. Tenant/platform/slot combinations must be
+unique per service. Technical names use ASCII letters, digits, `-`, `_`, or `.`.
+Platform templates accept `{{serviceName}}`, `{{tenant}}`, `{{platform}}`,
+`{{slot}}`, and `{{basePath}}`, and must produce an HTTP(S) base URL without embedded credentials,
+query parameters or fragments. A trailing slash is removed.
+
+Requests use `{{baseUrl}}/endpoint`. With Acme / stage-a / candidate selected,
+the example resolves to `https://navsvc-candidate.stage-a.example.test/acme/endpoint`.
+For deployment-enabled collections, `serviceName`, `tenant`, `platform`, `slot`, `basePath`
+and the generated `baseUrl` are read-only built-ins: they override definitions
+in every variable scope before other variables expand. Scripts cannot assign
+them. Ordinary collections retain their existing variable precedence.
+
+Select an environment, then a tenant and a platform/slot deployment above the
+request URL. Only configured placements in that environment are offered. The
+resolved base URL is visible before sending. Selections are remembered locally
+per workspace and collection; an invalidated selection is cleared, never
+replaced with another tenant or target. Missing selections and stale platform
+references prevent sending and cURL export. Response badges and history retain
+the originating service, environment, tenant, platform, slot and resolved base
+URL; switching target leaves the response usable and marks mismatches amber.
+Existing collection/environment saves preserve deployment configuration.
+
+#### Conditional collection base paths
+
+When a path segment differs by tenant but the service name in the hostname must
+stay the same, give the collection an optional `base_path`:
+
+```yaml
+# collection.yml
+name: Catalog Demo
+service_name: shopsvc
+base_path: '/{{tenant == "north" ? serviceName : "legacysvc"}}-{{slot}}'
+
+# The selected platform in environments/stage.yml
+platforms:
+  - name: stage-c
+    url_template: 'https://{{serviceName}}.{{tenant}}.{{platform}}.example.test{{basePath}}'
+```
+
+With slot `stage`, tenant `north` gets
+`https://shopsvc.north.stage-c.example.test/shopsvc-stage`, while tenant `south`
+gets `https://shopsvc.south.stage-c.example.test/legacysvc-stage`. The tenant and
+service identity are unchanged; only the chosen path segment differs. Requests
+still use `{{baseUrl}}/catalogs/:catalogId/categories` without expressions in
+their endpoint paths.
+
+Expressions are supported **only inside the collection's `base_path`**, not in
+platform templates, service names or ordinary request variables. They accept:
+
+- The inputs `serviceName`, `tenant`, `platform`, and `slot`.
+- Single- or double-quoted strings, with escaped quotes and backslashes.
+- String comparisons `==` and `!=`.
+- `condition ? value : fallback`, including nested conditions and parentheses.
+
+There is no JavaScript execution, function access, secret lookup, assignment,
+string concatenation or general-purpose scripting. Adjacent literal text and
+`{{…}}` expressions compose the path. Templates are limited to 16 KiB and
+expressions to 32 nesting levels.
+
+The result must be empty or start with one `/`, without a query, fragment,
+backslash or whitespace. A trailing slash is removed. Platforms used by a
+collection with `base_path` must explicitly include `{{basePath}}`; a missing
+placeholder is an error, never an ignored override. Without `base_path`, the
+built-in `basePath` is empty and existing platform templates work unchanged.
+Resolution errors block sending and cURL export. Rust resolves the path once
+for each preview/send/export; the desktop displays the backend-resolved URL
+and keeps Send disabled while a conditional path is awaiting resolution.
+
+The **Catalog Demo** in `examples/deployments/` demonstrates this without any
+live endpoints or credentials.
+
+The CLI uses the same resolution rules and requires an explicit target:
+
+```powershell
+cargo run -p rq-cli -- send work --collection "Navigation Core" --request "Menu" --environment stage --tenant acme --platform stage-a --slot candidate
+```
+
 The schema is an **internal abstraction** with providers, which is what makes
 spec-less APIs first-class:
 
@@ -255,12 +633,12 @@ the last one is remembered. Three panes: the tree, the request, the command.
   inherited from above.
 - **`{{variables}}`** are tinted in every field. Amber means the name is not
   defined; hovering a defined one opens a card with its value, editable in place.
-  The card shows the winning definition and wider definitions it shadows. Save
-  edits the narrowest existing definition; for a new name, choose whether to
+   The card shows the winning definition and wider definitions it shadows. Typing
+   automatically edits the narrowest existing definition's local current value; for a new name, choose whether to
   create it in the collection, selected environment, or globals. Folder and
   request scopes are edited through the same card. A secret's value never
   crosses into the window, so its box starts empty and empty means "keep the
-  stored value".
+   stored value". A local badge identifies overrides; **Use saved value** clears one.
 - The environment controls add, edit, rename, and delete environments, including
   their TLS verification setting and secret variables. **Globals** opens the
   workspace-wide fallback variable editor.
@@ -342,8 +720,9 @@ folders from outermost to innermost, then request. Scripts are saved in YAML as
   provide `get` / `set`. Getters read the effective merged variables.
   `pm.variables.set` defaults to the current script's scope; its optional third
   argument selects `global`, `environment`, `collection`, `folder`, or `request`.
-- Variable writes persist automatically through the collection store. Existing
-  secret variables stay in `.secrets/`; newly created variables are **not secret**
+- Variable writes persist automatically as local current values in app config,
+  never through shared workspace files. Existing secret flags are retained;
+  newly created variables are **not secret**
   by default, so create a secret variable in the editor before assigning tokens
   from a script. Environment writes require a saved environment.
 - `pm.sendRequest` supports callbacks and `await`, with a URL string or a request

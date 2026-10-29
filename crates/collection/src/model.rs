@@ -22,6 +22,12 @@ fn is_false(flag: &bool) -> bool {
 pub struct Collection {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deployments: Vec<Deployment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// The default for every request that does not say otherwise.
     #[serde(default, skip_serializing_if = "AuthSetting::is_inherit")]
@@ -260,6 +266,8 @@ pub struct Variable {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Environment {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platforms: Vec<Platform>,
     /// Skip certificate verification for this environment.
     ///
     /// Postman exposes this as a global "SSL certificate verification: off";
@@ -270,6 +278,21 @@ pub struct Environment {
     pub insecure: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub variables: Vec<Variable>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Platform {
+    pub name: String,
+    pub url_template: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Deployment {
+    pub tenant: String,
+    pub platform: String,
+    pub slot: String,
 }
 
 /// A request plus the folder trail that leads to it, with its auth already

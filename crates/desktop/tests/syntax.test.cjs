@@ -119,3 +119,59 @@ test("shell quotes, escapes, line continuations, and HTML-like arguments remain 
   has(parts, "# comment", "syntax-comment");
   assert.equal(parts.map((part) => part.text).join(""), source);
 });
+
+test("queries highlight identifiers, comparisons, membership, scalars and comments", () => {
+  const source = '{ payload { items[? item_id { value in ["{{myVar}}", 42, true, null] }] { attributes !secret... children** { id } } } } # note';
+  const parts = syntaxParts(source, "query");
+  assert.equal(parts.map((part) => part.text).join(""), source);
+  for (const field of ["payload", "items", "item_id", "value", "attributes"]) has(parts, field, "json-key");
+  for (const operator of ["in", "?", "!", "...", "**"]) has(parts, operator, "syntax-keyword");
+  has(parts, '"{{myVar}}"', "json-string");
+  has(parts, "42", "json-number");
+  has(parts, "true", "json-boolean");
+  has(parts, "null", "json-null");
+  has(parts, "# note", "syntax-comment");
+});
+
+test("query braces and brackets share colors with their matching partner", () => {
+  const parts = syntaxParts("{ items[? profile { name == \"Mike\" }] { id } }", "query");
+  const stack = [];
+  const colors = new Set();
+  for (const part of parts.filter((part) => part.kind.startsWith("query-bracket"))) {
+    if ("{[".includes(part.text)) { stack.push(part.kind); colors.add(part.kind); }
+    else assert.equal(part.kind, stack.pop());
+  }
+  assert.equal(stack.length, 0);
+  assert.ok(colors.size >= 3);
+});
+
+test("query matching underlines only the caret's pair and ignores quoted or commented braces", () => {
+  const source = '{ name == "{} {{myVar}}" # } ]\n profile { id } }';
+  const parts = syntaxParts(source, "query", source.indexOf("{ id"));
+  const matched = parts.filter((part) => part.kind.includes("query-match"));
+  assert.deepEqual(matched.map((part) => part.text), ["{", "}"]);
+  assert.ok(matched.every((part) => part.kind.startsWith("query-bracket-1")));
+  assert.equal(parts.map((part) => part.text).join(""), source);
+  assert.ok(!syntaxParts(source, "query", source.indexOf("{}") + 1).some((part) => part.kind.includes("query-match")));
+});
+
+test("query highlighting tolerates incomplete input, unmatched delimiters and HTML-like strings", () => {
+  for (const source of ['{ items[? name == "typing', '{ items ]', '{ html == "<img src=x onerror=alert(1)>" }', "{ a.b näme @id $value }"]) {
+    const parts = syntaxParts(source, "query");
+    assert.equal(parts.map((part) => part.text).join(""), source);
+  }
+  assert.ok(syntaxParts("{ items ]", "query").some((part) => part.kind.includes("query-unmatched")));
+});
+
+test("recursive query edges and variable predicates retain highlighting and brace matching", () => {
+  for (const mode of ["...", "**"]) {
+    const source = `{ items${mode}children[? definition { item_id { value == "{{myVar}}" } }] { definition { item_id attributes } } }`;
+    const parts = syntaxParts(source, "query", 0);
+    assert.equal(parts.map((part) => part.text).join(""), source);
+    has(parts, mode, "syntax-keyword");
+    has(parts, "children", "json-key");
+    has(parts, '"{{myVar}}"', "json-string");
+    assert.equal(parts.filter((part) => part.kind.includes("query-match")).length, 2);
+    assert.ok(!parts.some((part) => part.kind.includes("query-unmatched")));
+  }
+});

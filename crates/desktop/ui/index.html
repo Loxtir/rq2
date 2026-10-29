@@ -84,6 +84,11 @@
       </section>
 
       <section id="request-view" class="view" hidden>
+        <div id="deployment-bar" class="deployment-bar" hidden>
+          <label>Tenant <select id="deployment-tenant" class="select" aria-label="Tenant"></select></label>
+          <label>Deployment <select id="deployment-target" class="select" aria-label="Platform and slot"></select></label>
+          <span id="deployment-destination" class="deployment-destination"></span>
+        </div>
         <div class="url-bar">
           <div class="method-picker">
             <button id="method-trigger" class="method-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" title="Method">
@@ -259,8 +264,8 @@
           </label>
 
           <div class="section-title">
-            Variables
-            <span class="muted">resolve <code>{{name}}</code> in every request here</span>
+            Saved variable defaults
+            <span class="muted">shared YAML values; hover a <code>{{name}}</code> token to edit your local current value automatically</span>
           </div>
           <div id="variables" class="rows"></div>
           <button class="btn btn-ghost add-row" data-add="variable">+ Add variable</button>
@@ -331,8 +336,8 @@
         </select>
       </label>
       <div class="var-popover-actions">
-        <button id="var-save" class="btn btn-primary">Save value</button>
-        <button id="var-cancel" class="btn btn-ghost">Cancel</button>
+        <button id="var-reset" class="btn btn-ghost" hidden>Use saved value</button>
+        <button id="var-cancel" class="btn btn-ghost">Close</button>
       </div>
     </div>
 
@@ -380,7 +385,8 @@
           <input id="environment-insecure" type="checkbox" />
           <span>Skip TLS certificate verification for this environment</span>
         </label>
-        <div class="section-title">Variables</div>
+        <div class="section-title">Saved variable defaults</div>
+        <p class="hint">These values are saved in the workspace. To change only your local current value, hover a {{name}} token and type; changes apply automatically.</p>
         <div id="environment-variables" class="rows"></div>
         <button type="button" id="environment-add-variable" class="btn btn-ghost add-row">+ Add variable</button>
         <div id="environment-dialog-note" class="muted dialog-note"></div>

@@ -21,6 +21,9 @@ const state = {
   env: "",
   preview: "",
   previewTimer: null,
+  previewVersion: 0,
+  deploymentSelections: new Map(),
+  deploymentResolution: null,
   environmentEditor: null,
   requestTabs: [],
   activeTab: null,
@@ -245,6 +248,143 @@ const variablePattern = /\{\{([^{}]+)\}\}/g;
 
 /// Every definition of `name` the selection can see, widest first.
 ///
+function selectedCollection() {
+  return state.workspace?.collections.find((collection) => collection.slug === state.selection?.slug);
+}
+
+function deploymentEnabled(collection = selectedCollection()) {
+  return Boolean(collection && (collection.service_name != null || collection.base_path != null || collection.deployments?.length));
+}
+
+function deploymentStorageKey() {
+  return `rq.deployment:${state.workspace.path}:${state.selection.slug}`;
+}
+
+function deploymentChoice() {
+  const key = deploymentStorageKey();
+  if (!state.deploymentSelections.has(key)) {
+    let saved;
+    try { saved = JSON.parse(localStorage.getItem(key)); } catch { /* Ignore obsolete local preferences. */ }
+    state.deploymentSelections.set(key, {
+      tenant: typeof saved?.tenant === "string" ? saved.tenant : "",
+      deployment: saved?.deployment || null,
+    });
+  }
+  return state.deploymentSelections.get(key);
+}
+
+function availableDeployments() {
+  const environment = state.workspace?.environments?.find((item) => item.name === state.env);
+  const platforms = new Set((environment?.platforms || []).map((platform) => platform.name));
+  return (selectedCollection()?.deployments || []).filter((deployment) => platforms.has(deployment.platform));
+}
+
+function sameDeployment(a, b) {
+  return Boolean(a && b && a.tenant === b.tenant && a.platform === b.platform && a.slot === b.slot);
+}
+
+function currentDeployment() {
+  if (!deploymentEnabled()) return null;
+  const choice = deploymentChoice();
+  return availableDeployments().find((deployment) => deployment.tenant === choice.tenant && sameDeployment(deployment, choice.deployment)) || null;
+}
+
+function deploymentResolutionKey() {
+  const deployment = currentDeployment();
+  if (!deployment) return null;
+  const collection = selectedCollection();
+  const platform = state.workspace.environments.find((item) => item.name === state.env)
+    .platforms.find((item) => item.name === deployment.platform);
+  return JSON.stringify([state.workspace.path, collection.slug, state.env, deployment,
+    collection.service_name, collection.base_path, platform.url_template]);
+}
+
+function deploymentInputs() {
+  const deployment = currentDeployment();
+  if (!deployment) return null;
+  const platform = state.workspace.environments.find((item) => item.name === state.env)
+    .platforms.find((item) => item.name === deployment.platform);
+  const inputs = { serviceName: selectedCollection().service_name, basePath: "", ...deployment };
+  const resolved = state.deploymentResolution;
+  if (resolved?.key === deploymentResolutionKey()) {
+    if (!resolved.target) return null;
+    inputs.basePath = resolved.target.base_path || "";
+    inputs.baseUrl = resolved.target.base_url;
+    return inputs;
+  }
+  // Conditional base paths are resolved only in Rust, together with the cURL
+  // preview. Do not duplicate the expression evaluator in the webview.
+  if (selectedCollection().base_path != null) return null;
+  inputs.baseUrl = platform.url_template.replace(/\{\{\s*(\w+)\s*\}\}/g, (token, name) => inputs[name] ?? token).replace(/\/+$/, "");
+  return inputs;
+}
+
+function deploymentUnavailable() {
+  return deploymentEnabled() && (!currentDeployment() || !deploymentInputs());
+}
+
+function renderDeploymentDestination() {
+  if (state.selection?.kind !== "request" || !deploymentEnabled()) return;
+  const inputs = deploymentInputs();
+  const resolution = state.deploymentResolution;
+  const error = resolution?.key === deploymentResolutionKey() ? resolution.error : null;
+  $("deployment-destination").textContent = error || inputs?.baseUrl || (!state.env
+    ? "Select an environment."
+    : !availableDeployments().length ? "No deployments configured for this service in the selected environment."
+      : currentDeployment() ? "Resolving base URL…" : "Select a tenant and deployment before sending.");
+}
+
+function renderDeployments() {
+  const enabled = state.selection?.kind === "request" && deploymentEnabled();
+  $("deployment-bar").hidden = !enabled;
+  if (!enabled) return;
+  const choice = deploymentChoice();
+  const deployments = availableDeployments();
+  const tenants = [...new Set(deployments.map((deployment) => deployment.tenant))].sort();
+  if (!tenants.includes(choice.tenant)) choice.tenant = "";
+  choice.deployment = currentDeployment();
+
+  const addOption = (select, value, text) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = text;
+    select.append(option);
+  };
+  const tenantSelect = $("deployment-tenant");
+  tenantSelect.replaceChildren();
+  addOption(tenantSelect, "", "Select tenant…");
+  for (const tenant of tenants) addOption(tenantSelect, tenant, tenant);
+  tenantSelect.value = choice.tenant;
+  tenantSelect.disabled = !tenants.length;
+
+  const targetSelect = $("deployment-target");
+  targetSelect.replaceChildren();
+  addOption(targetSelect, "", "Select deployment…");
+  for (const deployment of deployments.filter((item) => item.tenant === choice.tenant)) {
+    addOption(targetSelect, JSON.stringify(deployment), `${deployment.platform} / ${deployment.slot}`);
+  }
+  targetSelect.value = choice.deployment ? JSON.stringify(choice.deployment) : "";
+  targetSelect.disabled = !choice.tenant;
+  renderDeploymentDestination();
+  localStorage.setItem(deploymentStorageKey(), JSON.stringify(choice));
+}
+
+function changeDeployment(tenantChanged = false) {
+  const choice = deploymentChoice();
+  if (tenantChanged) {
+    choice.tenant = $("deployment-tenant").value;
+    choice.deployment = null;
+  } else {
+    choice.deployment = $("deployment-target").value ? JSON.parse($("deployment-target").value) : null;
+  }
+  hideVariable();
+  renderDeployments();
+  updateSendButton();
+  renderResponseEnvironment();
+  repaintVariables();
+  refreshPreview();
+}
+
 /// Send order is globals, environment, collection, folders, request: a later
 /// layer overrides an earlier one, so the last entry here is the winner. Folders
 /// come from the tree path of whatever is selected, outermost first.
@@ -253,12 +393,18 @@ function variableScopes(name) {
   const scopes = [];
   if (!workspace) return scopes;
 
-  const push = (variables, label, kind) => {
-    const variable = (variables || []).find((entry) => entry.name === name);
-    if (variable) scopes.push({ label, kind, variable });
+  const push = (variables, label, kind, scope) => {
+    const saved = (variables || []).find((entry) => entry.name === name);
+    const live = (workspace.live_variables || []).find((entry) => entry.variable.name === name
+      && entry.scope.kind === scope.kind
+      && entry.scope.collection === scope.collection
+      && entry.scope.environment === scope.environment
+      && JSON.stringify(entry.scope.path) === JSON.stringify(scope.path));
+    const variable = live?.variable || saved;
+    if (variable) scopes.push({ label, kind, variable, live: Boolean(live) });
   };
 
-  push(workspace.globals, "globals", "globals");
+  push(workspace.globals, "globals", "globals", { kind: "globals" });
 
   const environment = (workspace.environments || []).find(
     (entry) => entry.name === state.env
@@ -267,7 +413,8 @@ function variableScopes(name) {
     push(
       environment.variables,
       `environment ${environment.name}`,
-      "environment"
+      "environment",
+      { kind: "environment", environment: environment.name }
     );
   }
 
@@ -275,14 +422,16 @@ function variableScopes(name) {
     (entry) => entry.slug === state.selection?.slug
   );
   if (!collection) return scopes;
-  push(collection.variables, "collection", "collection");
+  push(collection.variables, "collection", "collection", { kind: "collection", collection: collection.slug });
 
   let items = collection.items;
+  const path = [];
   for (const index of state.selection?.path || []) {
     const node = items?.[index];
     if (!node) break;
     const label = node.kind === "request" ? "request" : `folder ${node.name}`;
-    push(node.variables, label, node.kind);
+    path.push(index);
+    push(node.variables, label, node.kind, { kind: "item", collection: collection.slug, path: [...path] });
     items = node.items;
   }
 
@@ -290,9 +439,16 @@ function variableScopes(name) {
 }
 
 /// The definition the selected request would actually use, plus every wider one
-/// it shadows. Nested `{{...}}` inside a value is expanded by Rust at send time,
+/// it shadows, with local values replacing defaults within each scope.
+/// Nested `{{...}}` inside a value is expanded by Rust at send time,
 /// so the raw value is what the editor shows.
 function variableInfo(name) {
+  if (deploymentEnabled() && ["serviceName", "tenant", "platform", "slot", "basePath", "baseUrl"].includes(name)) {
+    const inputs = deploymentInputs();
+    const value = inputs?.[name] ?? "";
+    return { defined: inputs != null, scope: "selected deployment", kind: "deployment", value,
+      secret: false, hasValue: Boolean(value), readOnly: true, scopes: [] };
+  }
   const scopes = variableScopes(name);
   const winner = scopes[scopes.length - 1];
 
@@ -315,6 +471,7 @@ function variableInfo(name) {
     value: winner.variable.value,
     secret: Boolean(winner.variable.secret),
     hasValue: Boolean(winner.variable.has_value),
+    live: winner.live,
     scopes,
   };
 }
@@ -334,6 +491,7 @@ function withVariables(input) {
   wrap.className = "varfield";
   if (input.classList.contains("body-text")) wrap.classList.add("varfield-body");
   if (input.classList.contains("url-input")) wrap.classList.add("varfield-url");
+  if (input.id === "query") wrap.classList.add("varfield-query");
   const layer = document.createElement("div");
   layer.className = "varlayer";
   layer.setAttribute("aria-hidden", "true");
@@ -344,6 +502,11 @@ function withVariables(input) {
 
   input.addEventListener("input", () => paintVariables(input));
   input.addEventListener("scroll", () => syncVariableLayer(input, layer));
+  if (input.id === "query") {
+    for (const event of ["select", "keyup", "click", "focus", "blur"]) {
+      input.addEventListener(event, () => paintVariables(input));
+    }
+  }
   if (input.tagName === "TEXTAREA") {
     new ResizeObserver(() => syncVariableLayer(input, layer)).observe(input);
   }
@@ -360,15 +523,18 @@ function paintVariables(input) {
   layer.replaceChildren();
   const script = input.classList.contains("script-editor");
   const language = script ? "javascript"
+    : input.id === "query" ? "query"
     : input.id === "body-text" && $("body-language").value === "json" ? "json" : null;
   input.parentElement.classList.toggle("syntax-editor", Boolean(language));
-  for (const part of syntaxParts(input.value, language)) {
+  const caret = document.activeElement === input && input.selectionStart === input.selectionEnd
+    ? input.selectionStart : null;
+  for (const part of syntaxParts(input.value, language, caret)) {
     const target = part.kind ? document.createElement("span") : layer;
     if (part.kind) {
       target.className = part.kind;
       layer.append(target);
     }
-    if (script) target.append(document.createTextNode(part.text));
+    if (script || language === "query" && part.kind === "syntax-comment") target.append(document.createTextNode(part.text));
     else appendVariableText(target, part.text, input.id === "url");
   }
   // Textareas retain a final empty line; the overlay must have one too.
@@ -379,8 +545,9 @@ function paintVariables(input) {
 function syncVariableLayer(input, layer) {
   if (input.tagName === "TEXTAREA") {
     // Exclude the textarea's scrollbars so both layers wrap at the same column.
-    layer.style.width = `${input.clientWidth + 2}px`;
-    layer.style.height = `${input.clientHeight + 2}px`;
+    const border = input.id === "query" ? 0 : 2;
+    layer.style.width = `${input.clientWidth + border}px`;
+    layer.style.height = `${input.clientHeight + border}px`;
   }
   layer.scrollTop = input.scrollTop;
   layer.scrollLeft = input.scrollLeft;
@@ -479,10 +646,12 @@ function showVariable(name, box) {
 
   const info = variableInfo(name);
   $("var-name").textContent = `{{${name}}}`;
-  $("var-scope").textContent = info.scope;
+  $("var-scope").textContent = info.scope + (info.live ? " · local" : "");
   $("var-scope").classList.toggle("tag-warn", !info.defined);
 
   const value = $("var-value");
+  value.readOnly = Boolean(info.readOnly);
+  $("var-reset").hidden = !info.live || Boolean(info.readOnly);
   value.value = info.secret ? "" : info.value ?? "";
   value.placeholder = info.secret
     ? info.hasValue
@@ -493,8 +662,8 @@ function showVariable(name, box) {
   // A name nothing defines has to be created somewhere; a name that exists is
   // edited where it already lives, so no scope picker is needed.
   const createRow = $("var-create-row");
-  createRow.hidden = info.defined;
-  if (!info.defined) {
+  createRow.hidden = info.defined || info.readOnly;
+  if (!info.defined && !info.readOnly) {
     const environmentOption = $("var-create").querySelector(
       'option[value="environment"]'
     );
@@ -507,12 +676,14 @@ function showVariable(name, box) {
   const shadowed = info.scopes.slice(0, -1).map((scope) => scope.label);
   $("var-note").classList.remove("error-text");
   let note;
-  if (info.secret) {
-    note = `Secret stored in .secrets/ for ${info.scope}, never shown here. Leave empty to keep it.`;
+  if (info.readOnly) {
+    note = "Read-only: generated from the service, selected deployment and platform URL template.";
+  } else if (info.secret) {
+    note = `Changes apply automatically to local app config, not the workspace. Secret values stay in Rust; leave empty to keep the current value.`;
   } else if (info.defined) {
-    note = `Saving writes this to ${info.scope}.`;
+    note = `Changes apply automatically to your local current value for ${info.scope}. Shared defaults stay unchanged.`;
   } else {
-    note = "Not defined yet — saving creates it in the scope above.";
+    note = "Typing creates a local-only value in the scope above, not a shared default.";
   }
   if (shadowed.length) {
     note += ` Also set in ${shadowed.join(", ")}, overridden here.`;
@@ -539,67 +710,65 @@ function hideVariable() {
   $("var-popover").hidden = true;
 }
 
-async function saveVariable() {
+let variableWrites = null;
+let variableEditVersion = 0;
+
+async function waitForVariableWrites() {
+  while (variableWrites) await variableWrites;
+}
+
+async function saveVariable(reset = false) {
   const name = varHoverName;
   if (!name) return;
 
   const info = variableInfo(name);
+  if (info.readOnly) return;
   const typed = $("var-value").value;
   // An empty box on a secret means "leave the stored value alone".
   const value = info.secret && typed === "" ? null : typed;
   const create = info.defined ? null : $("var-create").value;
 
-  if (!info.defined && typed === "") {
-    $("var-note").classList.add("error-text");
-    $("var-note").textContent = "Type a value first — an empty one would define nothing.";
-    return;
-  }
-
   $("var-note").classList.remove("error-text");
+  const workspacePath = state.workspace.path;
+  const version = ++variableEditVersion;
+  // Capture the scope and value now, not after an earlier keystroke finishes.
+  const args = {
+    collection: state.selection?.slug ?? "",
+    path: [...(state.selection?.path ?? [])],
+    environment: state.env || null,
+    edit: { name, value, secret: info.secret, create, reset },
+  };
+  const sameScope = () => args.collection === (state.selection?.slug ?? "")
+    && JSON.stringify(args.path) === JSON.stringify(state.selection?.path ?? [])
+    && args.environment === (state.env || null);
+  // Serialize writes so a slower earlier edit cannot overwrite newer typing.
+  const pending = (variableWrites || Promise.resolve()).catch(() => {}).then(() => invoke("set_variable", args));
+  variableWrites = pending;
+  $("var-note").textContent = "Updating local value…";
   try {
-    state.workspace = await invoke("set_variable", {
-      collection: state.selection?.slug ?? "",
-      path: state.selection?.path ?? [],
-      environment: state.env || null,
-      edit: { name, value, secret: info.secret, create },
-    });
+    const workspace = await pending;
+    if (version !== variableEditVersion || state.workspace?.path !== workspacePath) return;
+    state.workspace = workspace;
 
-    patchVariableDrafts(name, value, info.defined ? info.kind : create);
     renderWorkspace();
     repaintVariables();
-    hideVariable();
     refreshPreview();
+    if (state.response) void applyQuery();
+    if (varHoverName === name && sameScope()) {
+      const current = variableInfo(name);
+      $("var-scope").textContent = current.scope + (current.live ? " · local" : "");
+      $("var-reset").hidden = !current.live;
+      $("var-create-row").hidden = current.defined;
+      if (reset) $("var-value").value = current.secret ? "" : current.value ?? "";
+      $("var-note").textContent = reset ? "Using the saved value." : "Local value updated automatically. Shared defaults stay unchanged.";
+    }
   } catch (error) {
+    if (version !== variableEditVersion || state.workspace?.path !== workspacePath || varHoverName !== name || !sameScope()) return;
     $("var-note").textContent = String(error);
     $("var-note").classList.add("error-text");
+  } finally {
+    if (variableWrites === pending) variableWrites = null;
   }
-}
-
-/// A stashed collection draft still holds the old value. Without this, saving
-/// that editor later would quietly undo the edit just made here.
-///
-/// Only the collection editor keeps variables in a draft; a folder's and a
-/// request's are read straight from the tree, which the save reloaded.
-function patchVariableDrafts(name, value, target) {
-  if (target !== "collection" || !state.selection?.slug) return;
-  const entry = drafts.get(`collection:${state.selection.slug}:`);
-  if (!entry) return;
-
-  const wasDirty = JSON.stringify(entry.draft) !== entry.saved;
-  const variable = entry.draft.variables.find((item) => item.name === name);
-  if (variable) {
-    if (value !== null) variable.value = value;
-    if (value !== null) variable.stored = true;
-  } else {
-    entry.draft.variables.push({
-      name,
-      value: value ?? "",
-      secret: false,
-      stored: true,
-    });
-  }
-  if (!wasDirty) entry.saved = JSON.stringify(entry.draft);
-  if (state.draft === entry.draft) updateDirty();
 }
 
 /* ---------- auth ---------- */
@@ -971,6 +1140,12 @@ function renderHistoryEntries(host, entries, emptyMessage) {
     meta.className = "history-entry-meta";
     const responseSize = item.error || item.response_available ? bytes(item.bytes) : "response removed";
     meta.textContent = `${item.error ? "error" : item.status} · ${new Date(item.timestamp * 1000).toLocaleString()} · ${responseSize}`;
+    if (item.deployment) {
+      const target = item.deployment;
+      const label = `${target.environment} · ${target.tenant} · ${target.platform} / ${target.slot}`;
+      meta.textContent += ` · ${label}`;
+      button.title += `\n${target.service_name} · ${label}`;
+    }
     if (item.error) button.title += `\n${item.error}`;
     button.append(method, name, meta);
     button.addEventListener("click", () => openHistoryEntry(item));
@@ -1012,7 +1187,7 @@ async function openHistoryEntry(item) {
 
 function updateSendButton() {
   const pending = state.pendingRequests.has(state.activeRequestTab);
-  $("send").disabled = false;
+  $("send").disabled = !pending && deploymentUnavailable();
   $("send").textContent = pending ? "Cancel" : "Send";
   $("send").classList.toggle("btn-cancel", pending);
 }
@@ -1064,6 +1239,7 @@ function activateRequestTab(key) {
     state.activeRequestTab = null;
     state.selection = null;
     state.draft = null;
+    $("deployment-bar").hidden = true;
     state.response = tab.response;
     state.query = tab.query || "";
     $("empty-state").hidden = true;
@@ -1196,6 +1372,7 @@ function openRequest(node, collection, path, keepResponse = false) {
     $("query").value = tab.query || "";
   }
   state.selection = { kind: "request", slug: collection.slug, path, node, collection };
+  renderDeployments();
   $("request-history").hidden = false;
   const entry = draftFor("request", collection.slug, path, () => ({
     name: node.name,
@@ -1906,6 +2083,10 @@ function renderCurlPreview(text) {
 
 async function refreshPreview() {
   clearTimeout(state.previewTimer);
+  const version = ++state.previewVersion;
+  const resolutionKey = deploymentResolutionKey();
+  state.preview = "";
+  setCurlCopyEnabled(false);
 
   if (!state.selection) {
     state.preview = "";
@@ -1931,12 +2112,23 @@ async function refreshPreview() {
   }
 
   try {
+    if (variableWrites) await waitForVariableWrites();
+    if (version !== state.previewVersion) return;
     const preview = await invoke("curl_preview", {
       collection: state.selection.slug,
       path: state.selection.path,
       draft: draftForIpc(),
       environment: state.env || null,
+      deployment: currentDeployment(),
     });
+    if (version !== state.previewVersion) return;
+    if (preview.deployment) {
+      state.deploymentResolution = { key: resolutionKey, target: preview.deployment, error: null };
+      renderDeploymentDestination();
+      updateSendButton();
+      renderResponseEnvironment();
+      repaintVariables();
+    }
     state.preview = preview.text;
     renderCurlPreview(preview.text);
     setCurlCopyEnabled(true);
@@ -1944,6 +2136,13 @@ async function refreshPreview() {
     $("preview-problem").hidden = !preview.problem;
     $("preview-problem").textContent = preview.problem || "";
   } catch (error) {
+    if (version !== state.previewVersion) return;
+    if (resolutionKey) {
+      state.deploymentResolution = { key: resolutionKey, target: null, error: String(error) };
+      renderDeploymentDestination();
+      updateSendButton();
+      repaintVariables();
+    }
     state.preview = "";
     $("curl").textContent = String(error);
     setCurlCopyEnabled(false);
@@ -2011,14 +2210,17 @@ async function copyCurl(includeSecrets = false) {
   )) return;
 
   setCurlCopyEnabled(false);
+  const args = {
+    collection: state.selection.slug,
+    path: state.selection.path,
+    draft: draftForIpc(),
+    environment: state.env || null,
+    includeSecrets,
+    deployment: currentDeployment(),
+  };
   try {
-    await invoke("copy_curl", {
-      collection: state.selection.slug,
-      path: state.selection.path,
-      draft: draftForIpc(),
-      environment: state.env || null,
-      includeSecrets,
-    });
+    if (variableWrites) await waitForVariableWrites();
+    await invoke("copy_curl", args);
     const message = includeSecrets ? "copied with secrets" : "copied protected";
     $("copy-note").textContent = message;
     setTimeout(() => {
@@ -2041,6 +2243,7 @@ async function send() {
     await cancelCurrentRequest(tabKey);
     return;
   }
+  if (deploymentUnavailable()) return;
   const tab = state.requestTabs.find((item) => item.key === tabKey);
   const requestId = `${tabKey}:${Date.now()}:${Math.random()}`;
   state.pendingRequests.add(tabKey);
@@ -2054,14 +2257,17 @@ async function send() {
   resetResponse("Waiting for response…");
   updateSendButton();
 
+  const args = {
+    collection: state.selection.slug,
+    path: state.selection.path,
+    draft: draftForIpc(),
+    environment: state.env || null,
+    requestId,
+    deployment: currentDeployment(),
+  };
   try {
-    const response = await invoke("send", {
-      collection: state.selection.slug,
-      path: state.selection.path,
-      draft: draftForIpc(),
-      environment: state.env || null,
-      requestId,
-    });
+    if (variableWrites) await waitForVariableWrites();
+    const response = await invoke("send", args);
     if (tab && state.requestTabs.includes(tab)) {
       tab.response = response;
       tab.error = null;
@@ -2769,20 +2975,35 @@ function renderResponseEnvironment() {
   if (!response) return;
   const environment = response.environment;
   const known = environment != null;
-  const mismatch = known && environment !== (state.env || "");
-  badge.textContent = known ? environment || "no environment" : "environment unknown";
+  const target = response.deployment;
+  const current = currentDeployment();
+  const targetMismatch = state.selection?.kind === "request" && Boolean(target) &&
+    (!sameDeployment(target, current) || target.service_name !== selectedCollection()?.service_name ||
+      target.base_url !== deploymentInputs()?.baseUrl);
+  const mismatch = (known && environment !== (state.env || "")) || targetMismatch;
+  const origin = known ? environment || "no environment" : "environment unknown";
+  badge.textContent = target
+    ? `${origin} · ${target.service_name} · ${target.tenant} · ${target.platform} / ${target.slot}`
+    : deploymentEnabled() ? `${origin} · deployment unknown` : origin;
   badge.className = mismatch ? "tag tag-warn" : "tag";
   badge.title = !known
     ? "This older response has no recorded environment."
     : mismatch
-      ? `Sent using ${environment || "no environment"}; currently selected: ${state.env || "no environment"}. The stored response is still available.`
-      : `Environment used for this response: ${environment || "no environment"}.`;
+      ? `Sent using ${badge.textContent}; currently selected: ${state.env || "no environment"}${current ? ` · ${current.tenant} · ${current.platform} / ${current.slot}` : ""}. The stored response is still available.`
+      : target
+        ? `Deployment used for this response: ${badge.textContent}\n${target.base_url}`
+        : deploymentEnabled()
+          ? "This older response has no recorded deployment."
+          : `Environment used for this response: ${environment || "no environment"}.`;
 }
 
 function changeEnvironment() {
   state.env = $("environment").value;
   $("environment-edit").disabled = !state.env;
   localStorage.setItem(environmentStorageKey(state.workspace.path), state.env);
+  hideVariable();
+  renderDeployments();
+  updateSendButton();
   renderResponseEnvironment();
   repaintVariables();
   refreshPreview();
@@ -2837,16 +3058,28 @@ function resetResponse(message) {
 
 /* ---------- projection ---------- */
 
+function queryContext() {
+  if (state.selection?.kind !== "request") return null;
+  return {
+    collection: state.selection.slug,
+    path: state.selection.path,
+    environment: state.env || null,
+    deployment: currentDeployment(),
+  };
+}
+
 async function saveResponse() {
   const response = state.response;
   if (!response || state.savingResponse) return;
   const query = $("query").value;
+  const context = queryContext();
   state.savingResponse = true;
   renderResponseEnvironment();
   const note = $("response-save-note");
   note.hidden = true;
   try {
-    const saved = await invoke("save_response", { id: response.id, query });
+    if (variableWrites) await waitForVariableWrites();
+    const saved = await invoke("save_response", { id: response.id, query, context });
     if (state.response !== response) return;
     note.className = "muted query-note";
     note.textContent = "Response saved.";
@@ -2863,6 +3096,8 @@ async function saveResponse() {
 }
 
 function renderSavedQueries() {
+  withVariables($("query"));
+  paintVariables($("query"));
   const editable = state.selection?.kind === "request" && Boolean(state.draft);
   $("saved-query-bar").hidden = !editable;
   if (!editable) {
@@ -2941,11 +3176,15 @@ async function applyQuery() {
   const response = state.response;
   const version = ++state.projectionVersion;
   const query = $("query").value;
+  const context = queryContext();
 
   try {
+    if (variableWrites) await waitForVariableWrites();
+    if (version !== state.projectionVersion || state.response?.id !== response.id) return;
     const projection = await invoke("project_body", {
       id: response.id,
       query,
+      context,
     });
     if (version !== state.projectionVersion || state.response?.id !== response.id) return;
 
@@ -3203,6 +3442,8 @@ function renderWorkspace() {
   select.value = state.env;
   $("environment-edit").disabled = !state.env;
 
+  renderDeployments();
+  updateSendButton();
   renderResponseEnvironment();
   renderTree();
 }
@@ -3442,6 +3683,8 @@ async function boot() {
   });
 
   $("environment").addEventListener("change", changeEnvironment);
+  $("deployment-tenant").addEventListener("change", () => changeDeployment(true));
+  $("deployment-target").addEventListener("change", () => changeDeployment());
 
   document.querySelector('[data-add="header"]').addEventListener("click", () => {
     state.draft.headers.push({ name: "", value: "", disabled: false });
@@ -3475,12 +3718,14 @@ async function boot() {
   const popover = $("var-popover");
   popover.addEventListener("mouseenter", () => clearTimeout(varHideTimer));
   popover.addEventListener("mouseleave", scheduleHideVariable);
-  $("var-save").addEventListener("click", saveVariable);
+  $("var-value").addEventListener("input", () => saveVariable());
+  $("var-create").addEventListener("change", () => saveVariable());
+  $("var-reset").addEventListener("click", () => saveVariable(true));
   $("var-cancel").addEventListener("click", hideVariable);
   $("var-value").addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
-      saveVariable();
+      hideVariable();
     } else if (event.key === "Escape") {
       event.preventDefault();
       hideVariable();

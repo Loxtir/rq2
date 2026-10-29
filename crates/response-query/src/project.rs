@@ -4,8 +4,9 @@
 //! are byte slices of the original buffer with whitespace stripped.
 
 use crate::diag::{Diag, Span};
+use crate::literal::ScalarLiteral;
 use crate::scan::{copy_compact, decode_string, strip_bom, Scanner, MAX_DEPTH};
-use crate::syntax::{Field, Selection, Slice};
+use crate::syntax::{Condition, Field, Selection, Slice, Step};
 
 /// Set while projecting one node of a recursive walk. It tells the projector
 /// to leave the traversed edge out of the output, and records where that edge
@@ -129,7 +130,7 @@ fn project_object(
             ),
         )?;
         let tree = match watch.tree {
-            Some(field) if key_equals(key_raw, &field.name)? => Some(field),
+            Some(field) if key_equals(key_raw, field.edge())? => Some(field),
             _ => None,
         };
 
@@ -155,14 +156,18 @@ fn project_object(
             apply_field(sc, field, out, depth, exclusions)?;
         } else if let Some(idx) = idx {
             let field = &sel.fields[idx];
-            if !first {
-                out.push(b',');
+            if condition_matches(sc, field)? {
+                if !first {
+                    out.push(b',');
+                }
+                first = false;
+                let emitted = emit_name(field, key_raw)?;
+                write_json_string(&emitted, out)?;
+                out.push(b':');
+                apply_field(sc, field, out, depth, exclusions)?;
+            } else {
+                sc.scan_value_end()?;
             }
-            first = false;
-            let emitted = emit_name(field, key_raw)?;
-            write_json_string(&emitted, out)?;
-            out.push(b':');
-            apply_field(sc, field, out, depth, exclusions)?;
         } else {
             sc.scan_value_end()?;
         }
@@ -240,6 +245,40 @@ fn project_array(
     Ok(())
 }
 
+fn condition_matches(sc: &Scanner<'_>, field: &Field) -> Result<bool, Diag> {
+    let Some(condition) = &field.condition else {
+        return Ok(true);
+    };
+    let (expected, negate): (&[ScalarLiteral], bool) = match condition {
+        Condition::Equal(value) => (std::slice::from_ref(value), false),
+        Condition::NotEqual(value) => (std::slice::from_ref(value), true),
+        Condition::In(values) => (values, false),
+        Condition::NotIn(values) => (values, true),
+    };
+    // Different JSON types cannot be equal. In particular, != null works for
+    // containers without materializing them or decoding unrelated strings.
+    let same_type = expected.iter().any(|expected| {
+        matches!(
+            (expected, sc.peek()),
+            (ScalarLiteral::Null, Some(b'n'))
+                | (ScalarLiteral::Bool(_), Some(b't' | b'f'))
+                | (ScalarLiteral::String(_), Some(b'"'))
+                | (ScalarLiteral::Number(_), Some(b'-' | b'0'..=b'9'))
+        )
+    });
+    let equal = if !same_type {
+        false
+    } else {
+        let mut probe = *sc;
+        let start = probe.pos();
+        let end = probe.scan_value_end()?;
+        let actual = ScalarLiteral::parse(&sc.src()[start..end])
+            .map_err(|message| Diag::new(message, Span::new(start, end)))?;
+        expected.contains(&actual)
+    };
+    Ok(equal != negate)
+}
+
 fn apply_field(
     sc: &mut Scanner,
     field: &Field,
@@ -249,10 +288,24 @@ fn apply_field(
 ) -> Result<(), Diag> {
     sc.skip_ws();
 
+    let filtered = field
+        .steps
+        .iter()
+        .any(|step| matches!(step, Step::Filter(_)));
+    if filtered && sc.peek() != Some(b'[') {
+        return Err(Diag::new(
+            "an array filter needs an array value",
+            field.span,
+        ));
+    }
     if field.recursive {
         return apply_recursive(sc, field, out, depth, exclusions);
     }
     if field.tree_recursive {
+        if filtered {
+            filter_tree(sc, field, out, depth + 1, exclusions)?;
+            return Ok(());
+        }
         let sub = field
             .selection
             .as_ref()
@@ -272,8 +325,7 @@ fn apply_field(
 
     let slice = field.slice();
     let collect = field.collect();
-
-    if (slice.is_some() || collect.is_some()) && sc.peek() == Some(b'[') {
+    if (slice.is_some() || collect.is_some() || filtered) && sc.peek() == Some(b'[') {
         return apply_list(sc, field, slice, collect, out, depth, exclusions);
     }
 
@@ -362,8 +414,8 @@ fn copy_filtered(
     Ok(())
 }
 
-/// `items[0:5]`, `items[id]`, `items[0:5][id]`. The slice narrows first, then
-/// the collect runs once per surviving element.
+/// Slices and filters narrow element spans in source order, then the collect
+/// or nested selection runs once per surviving element. Bodies stay in place.
 fn apply_list(
     sc: &mut Scanner,
     field: &Field,
@@ -373,8 +425,33 @@ fn apply_list(
     depth: usize,
     exclusions: &[&str],
 ) -> Result<(), Diag> {
-    let elems = sc.split_array_elements()?;
+    let mut elems = sc.split_array_elements()?;
+    let filtered = field
+        .steps
+        .iter()
+        .any(|step| matches!(step, Step::Filter(_)));
+    if filtered {
+        for step in &field.steps {
+            match step {
+                Step::Filter(predicate) => {
+                    let mut kept = Vec::with_capacity(elems.len());
+                    for (start, end) in elems {
+                        if filter_matches(&Scanner::at(sc.src(), start), predicate)? {
+                            kept.push((start, end));
+                        }
+                    }
+                    elems = kept;
+                }
+                Step::Slice(slice) => {
+                    let (start, end) = resolve_range(Some(*slice), elems.len() as i64);
+                    elems = elems.into_iter().take(end).skip(start).collect();
+                }
+                Step::Collect(_) => {}
+            }
+        }
+    }
     let len = elems.len() as i64;
+    let slice = if filtered { None } else { slice };
     let (start, end) = resolve_range(slice, len);
 
     out.push(b'[');
@@ -398,6 +475,172 @@ fn apply_list(
     }
     out.push(b']');
     Ok(())
+}
+
+fn filter_matches(sc: &Scanner<'_>, predicate: &Field) -> Result<bool, Diag> {
+    let mut probe = *sc;
+    let mut predicate = predicate;
+    loop {
+        let Some(value) = field_value(&probe, &predicate.name)? else {
+            return Ok(false);
+        };
+        if let Some(selection) = &predicate.selection {
+            predicate = &selection.fields[0];
+            probe = value;
+        } else {
+            return condition_matches(&value, predicate);
+        }
+    }
+}
+
+/// A scanner positioned at one literal object key, without materializing it.
+fn field_value<'a>(sc: &Scanner<'a>, name: &str) -> Result<Option<Scanner<'a>>, Diag> {
+    let mut probe = *sc;
+    probe.skip_ws();
+    if probe.peek() != Some(b'{') {
+        return Ok(None);
+    }
+    probe.expect(b'{')?;
+    loop {
+        probe.skip_ws();
+        if probe.peek() == Some(b'}') {
+            return Ok(None);
+        }
+        let key = probe.scan_string_raw()?;
+        probe.expect(b':')?;
+        probe.skip_ws();
+        if key_equals(key, name)? {
+            return Ok(Some(probe));
+        }
+        probe.scan_value_end()?;
+        probe.skip_ws();
+        match probe.peek() {
+            Some(b',') => probe.expect(b',')?,
+            Some(b'}') => return Ok(None),
+            _ => return Err(Diag::new("expected `,` or `}`", probe.span_here())),
+        }
+    }
+}
+
+fn recursive_match(sc: &Scanner<'_>, field: &Field) -> Result<bool, Diag> {
+    for step in &field.steps {
+        if let Step::Filter(predicate) = step {
+            if !filter_matches(sc, predicate)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn recursive_child<'a>(
+    sc: &Scanner<'a>,
+    field: &Field,
+    exclusions: &[&str],
+) -> Result<Option<Scanner<'a>>, Diag> {
+    let selection = field.collect().or(field.selection.as_ref());
+    if exclusions.contains(&field.edge())
+        || selection.is_some_and(|selection| {
+            selection
+                .fields
+                .iter()
+                .any(|excluded| excluded.excluded && excluded.name == field.edge())
+        })
+    {
+        return Ok(None);
+    }
+    field_value(sc, field.edge())
+}
+
+/// Prune unmatched branches, retaining ancestors only as edge containers.
+/// Each level holds projected bytes, never a response DOM.
+fn filter_tree(
+    sc: &mut Scanner,
+    field: &Field,
+    out: &mut Vec<u8>,
+    depth: usize,
+    exclusions: &[&str],
+) -> Result<bool, Diag> {
+    if depth > MAX_DEPTH {
+        return Err(Diag::new("response nesting is too deep", sc.span_here()));
+    }
+    sc.skip_ws();
+    if sc.peek() == Some(b'[') {
+        let mut kept = false;
+        out.push(b'[');
+        for (start, _) in sc.split_array_elements()? {
+            let mut element = Scanner::at(sc.src(), start);
+            let mut projected = Vec::new();
+            if filter_tree(&mut element, field, &mut projected, depth + 1, exclusions)? {
+                if kept {
+                    out.push(b',');
+                }
+                out.extend_from_slice(&projected);
+                kept = true;
+            }
+        }
+        out.push(b']');
+        return Ok(kept);
+    }
+    let start = sc.pos();
+    let end = sc.scan_value_end()?;
+    if sc.src()[start] != b'{' {
+        copy_compact(sc.src(), start, end, out);
+        return Ok(false);
+    }
+    let selection = field
+        .selection
+        .as_ref()
+        .expect("tree recursion has a selection");
+    let mut inherited = exclusions.to_vec();
+    for excluded in &selection.fields {
+        if excluded.excluded && excluded.recursive && !inherited.contains(&excluded.name.as_str()) {
+            inherited.push(&excluded.name);
+        }
+    }
+    let exclusions = inherited.as_slice();
+    let original = Scanner::at(sc.src(), start);
+    let matched = recursive_match(&original, field)?;
+    let mut children = Vec::new();
+    let child = recursive_child(&original, field, exclusions)?;
+    let child_matched = if let Some(mut child) = child {
+        filter_tree(&mut child, field, &mut children, depth + 1, exclusions)?
+    } else {
+        false
+    };
+    if !matched && !child_matched {
+        out.extend_from_slice(b"null");
+        return Ok(false);
+    }
+    let mut projected = Vec::new();
+    if matched {
+        let mut probe = original;
+        project_value(
+            &mut probe,
+            selection,
+            &mut projected,
+            depth,
+            &mut Watch {
+                edge: Some(field.edge()),
+                ..Watch::default()
+            },
+            exclusions,
+        )?;
+    } else {
+        projected.extend_from_slice(b"{}");
+    }
+    if child.is_some() {
+        projected.pop();
+        if projected.len() > 1 {
+            projected.push(b',');
+        }
+        write_json_string(field.edge(), &mut projected)?;
+        projected.push(b':');
+        projected.extend_from_slice(&children);
+        projected.push(b'}');
+    }
+    out.extend_from_slice(&projected);
+    Ok(true)
 }
 
 /// `children...` — every node reachable through this same key, flattened into
@@ -478,8 +721,15 @@ fn descend(
     depth: usize,
     exclusions: &[&str],
 ) -> Result<(), Diag> {
+    let original = Scanner::at(src, start);
+    if !recursive_match(&original, field)? {
+        if let Some(mut child) = recursive_child(&original, field, exclusions)? {
+            collect_edge(&mut child, field, nodes, depth, exclusions)?;
+        }
+        return Ok(());
+    }
     let mut watch = Watch {
-        edge: Some(&field.name),
+        edge: Some(field.edge()),
         hit: None,
         tree: None,
     };

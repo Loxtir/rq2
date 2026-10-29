@@ -14,6 +14,9 @@
 //! - a field with no selection set returns its value verbatim
 //! - `*` matches every key not listed explicitly
 //! - `field!` fails loudly when the response omits it
+//! - `field == "value"` and `field != "value"` conditionally emit a field
+//! - `field in ["a", "b"]` and `field not in [...]` test scalar membership
+//! - `items[? name == "Mike"] { name age }` filters objects before projection
 //! - `[a:b]` slices an array, negative indices count from the end
 //! - `[id]` collects one value per element into a flat list
 //! - `children...{ id }` walks a repeated key to any depth
@@ -22,6 +25,7 @@
 
 pub mod diag;
 pub mod infer;
+pub mod literal;
 pub mod openapi;
 pub mod project;
 pub mod scaffold;
@@ -37,5 +41,5 @@ pub use scaffold::scaffold;
 pub use schema::{
     fields_at, merge, to_json_schema, ScalarKind, Schema, SchemaField, SchemaKind, Source,
 };
-pub use syntax::{parse, Field, Selection, Slice, Step};
+pub use syntax::{parse, Condition, Field, Selection, Slice, Step};
 pub use validate::validate;

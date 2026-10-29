@@ -1,0 +1,16 @@
+deployments:
+  - tenant: acme
+    platform: stage-a
+    slot: stable
+  - tenant: acme
+    platform: stage-a
+    slot: candidate
+  - tenant: globex
+    platform: stage-b
+    slot: stable
+  - tenant: acme
+    platform: prod-a
+    slot: stable
+  - tenant: globex
+    platform: prod-b
+    slot: stable

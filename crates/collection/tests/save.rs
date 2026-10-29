@@ -42,6 +42,10 @@ fn bearer() -> AuthSetting {
 
 fn collection(variables: Vec<Variable>) -> Collection {
     Collection {
+        service_name: None,
+        base_path: None,
+        deployments: Vec::new(),
+        scripts: Default::default(),
         name: "Acme Orders".to_string(),
         description: Some("Order endpoints".to_string()),
         auth: bearer(),
@@ -51,11 +55,13 @@ fn collection(variables: Vec<Variable>) -> Collection {
                 name: "Orders".to_string(),
                 auth: Default::default(),
                 variables: Vec::new(),
+                scripts: Default::default(),
                 request: None,
                 items: vec![Item {
                     name: "List orders".to_string(),
                     auth: Default::default(),
                     variables: Vec::new(),
+                    scripts: Default::default(),
                     request: Some(RequestDef {
                         method: "GET".to_string(),
                         url: "{{baseUrl}}/orders".to_string(),
@@ -76,6 +82,7 @@ fn collection(variables: Vec<Variable>) -> Collection {
                 name: "Create order".to_string(),
                 auth: Default::default(),
                 variables: Vec::new(),
+                scripts: Default::default(),
                 request: Some(RequestDef {
                     method: "POST".to_string(),
                     url: "{{baseUrl}}/orders".to_string(),
@@ -205,6 +212,7 @@ fn a_secret_keeps_its_value_when_the_editor_omits_it() {
         &root,
         "acme-orders",
         &Edit::Collection {
+            scripts: Default::default(),
             name: "Acme Orders".to_string(),
             description: Some("Order endpoints".to_string()),
             variables: edited.clone(),
@@ -244,6 +252,7 @@ fn renaming_the_collection_moves_its_secrets_with_it() {
         &root,
         "acme-orders",
         &Edit::Collection {
+            scripts: Default::default(),
             name: "Acme Commerce".to_string(),
             description: None,
             variables: vec![Variable {
@@ -277,6 +286,7 @@ fn leaves_files_it_did_not_write() {
         &root,
         "acme-orders",
         &Edit::Folder {
+            scripts: Default::default(),
             path: vec![0],
             name: "Orders v2".to_string(),
             auth: AuthSetting::Inherit,
@@ -371,6 +381,7 @@ fn an_environment_variable_can_be_saved_on_its_own() {
     // Environment files are not the collection's; write one through the same
     // machinery by rendering it with the collection, then edit just its value.
     let environment = collection::model::Environment {
+        platforms: Vec::new(),
         name: "dev".to_string(),
         insecure: false,
         variables: vec![variable("baseUrl", "https://dev.acme.test", false)],
@@ -434,6 +445,7 @@ fn refuses_an_empty_name_without_touching_the_disk() {
         &root,
         "acme-orders",
         &Edit::Collection {
+            scripts: Default::default(),
             name: "   ".to_string(),
             description: None,
             variables: Vec::new(),

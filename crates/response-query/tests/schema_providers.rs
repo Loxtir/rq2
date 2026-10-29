@@ -477,6 +477,38 @@ fn validates_good_query_against_spec() {
 }
 
 #[test]
+fn field_conditions_preserve_schema_validation_and_typo_diagnostics() {
+    let schema =
+        infer(&[br#"{"id":1,"status":"ACTIVE","profile":{"name":"Ada"},"items":[{"id":1}]}"#])
+            .unwrap();
+    for query in [
+        r#"{ id == 1 status != "DELETED" }"#,
+        r#"{ profile != null { name == "Ada" } }"#,
+        "{ items[:2] { id != 0 } }",
+        "{ items[id == 1] }",
+    ] {
+        assert!(
+            validate(&parse(query).unwrap(), &schema).is_empty(),
+            "{query}"
+        );
+    }
+    let source = "{\n  statuz == \"ACTIVE\"\n}";
+    let diagnostics = validate(&parse(source).unwrap(), &schema);
+    assert_eq!(diagnostics.len(), 1);
+    assert!(diagnostics[0].message.contains("did you mean `status`"));
+    assert_eq!(diagnostics[0].line_col(source).0, 2);
+}
+
+#[test]
+fn scaffolding_skips_names_with_the_new_comparison_delimiter() {
+    let schema = infer(&[br#"{"safe":1,"a=b":2,"a==b":3}"#]).unwrap();
+    let source = scaffold(&schema, 3);
+    assert!(!source.contains('='));
+    assert!(source.contains("safe"));
+    assert!(validate(&parse(&source).unwrap(), &schema).is_empty());
+}
+
+#[test]
 fn flags_typos_with_a_suggestion() {
     let schema = spec().response_schema("getUser").unwrap().unwrap();
     let query = parse("{ profil }").unwrap();

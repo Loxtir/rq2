@@ -18,6 +18,10 @@ fn var(name: &str, value: Option<&str>) -> Variable {
 
 fn collection(variables: Vec<Variable>) -> Collection {
     Collection {
+        service_name: None,
+        base_path: None,
+        deployments: Vec::new(),
+        scripts: Default::default(),
         name: "Test".to_string(),
         description: None,
         auth: Default::default(),
@@ -26,6 +30,7 @@ fn collection(variables: Vec<Variable>) -> Collection {
             name: "Request".to_string(),
             auth: Default::default(),
             variables: Vec::new(),
+            scripts: Default::default(),
             request: Some(RequestDef {
                 method: "GET".to_string(),
                 url: "{{baseUrl}}/posts".to_string(),
@@ -38,6 +43,7 @@ fn collection(variables: Vec<Variable>) -> Collection {
 
 fn environment(name: &str, insecure: bool, variables: Vec<Variable>) -> Environment {
     Environment {
+        platforms: Vec::new(),
         name: name.to_string(),
         insecure,
         variables,
@@ -142,11 +148,13 @@ fn composition_follows_the_scope_chain() {
         name: "Folder".to_string(),
         auth: Default::default(),
         variables: vec![var("host", Some("https://{{region}}.test"))],
+        scripts: Default::default(),
         request: None,
         items: vec![Item {
             name: "Request".to_string(),
             auth: Default::default(),
             variables: Vec::new(),
+            scripts: Default::default(),
             request: Some(RequestDef {
                 method: "GET".to_string(),
                 url: "{{host}}/orders".to_string(),
@@ -173,11 +181,13 @@ fn the_narrowest_layer_wins_at_every_step() {
         name: "Folder".to_string(),
         auth: Default::default(),
         variables: vec![var("who", Some("folder"))],
+        scripts: Default::default(),
         request: None,
         items: vec![Item {
             name: "Request".to_string(),
             auth: Default::default(),
             variables: Vec::new(),
+            scripts: Default::default(),
             request: Some(RequestDef {
                 method: "GET".to_string(),
                 url: "/".to_string(),

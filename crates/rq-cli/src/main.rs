@@ -88,6 +88,8 @@ enum Cmd {
         /// Environment name, e.g. `dev`.
         #[arg(long)]
         environment: Option<String>,
+        #[command(flatten)]
+        deployment: DeploymentArgs,
         /// Write the body here instead of stdout.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -123,6 +125,17 @@ enum ImportSource {
         #[arg(long = "secret")]
         secret: Vec<String>,
     },
+}
+
+#[derive(clap::Args)]
+struct DeploymentArgs {
+    /// Tenant for a deployment-enabled service.
+    #[arg(long, requires_all = ["platform", "slot", "environment"])]
+    tenant: Option<String>,
+    #[arg(long, requires_all = ["tenant", "slot", "environment"])]
+    platform: Option<String>,
+    #[arg(long, requires_all = ["tenant", "platform", "environment"])]
+    slot: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -176,6 +189,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             request,
             collection,
             environment,
+            deployment,
             out,
             timeout,
             insecure,
@@ -184,6 +198,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             request,
             collection,
             environment,
+            deployment,
             out,
             timeout,
             insecure,
@@ -388,11 +403,13 @@ fn describe(schema: &Schema) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_send(
     workspace: PathBuf,
     request_name: String,
     collection_name: Option<String>,
     environment_name: Option<String>,
+    deployment: DeploymentArgs,
     out: Option<PathBuf>,
     timeout: u64,
     insecure_flag: bool,
@@ -460,7 +477,24 @@ fn cmd_send(
         ),
     };
 
-    let vars = collection::send::variables(collection, environment, &loaded.globals, &found.path);
+    let selection = match (deployment.tenant, deployment.platform, deployment.slot) {
+        (Some(tenant), Some(platform), Some(slot)) => Some(collection::model::Deployment {
+            tenant,
+            platform,
+            slot,
+        }),
+        (None, None, None) => None,
+        _ => bail!("pass --tenant, --platform and --slot together"),
+    };
+    let target = collection::deployment::resolve(collection, environment, selection.as_ref())
+        .map_err(anyhow::Error::msg)?;
+    let vars = collection::send::variables_for_target(
+        collection,
+        environment,
+        &loaded.globals,
+        &found.path,
+        target.as_ref(),
+    );
     let insecure = insecure_flag || environment.is_some_and(|environment| environment.insecure);
     let sent = collection::send::send(
         found.request,
@@ -661,4 +695,41 @@ fn generate(target_lines: usize, seed: u64) -> String {
     });
 
     serde_json::to_string_pretty(&doc).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod deployment_args_tests {
+    use super::*;
+
+    #[test]
+    fn deployment_flags_require_a_complete_explicit_target() {
+        let base = ["rq", "send", "work", "--request", "Menu"];
+        assert!(Cli::try_parse_from(base).is_ok());
+        for incomplete in [
+            vec!["--tenant", "acme"],
+            vec!["--platform", "stage-a"],
+            vec!["--slot", "candidate"],
+            vec![
+                "--tenant",
+                "acme",
+                "--platform",
+                "stage-a",
+                "--slot",
+                "candidate",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(base.into_iter().chain(incomplete)).is_err());
+        }
+        assert!(Cli::try_parse_from(base.into_iter().chain([
+            "--environment",
+            "stage",
+            "--tenant",
+            "acme",
+            "--platform",
+            "stage-a",
+            "--slot",
+            "candidate",
+        ]))
+        .is_ok());
+    }
 }

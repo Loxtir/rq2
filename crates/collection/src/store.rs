@@ -25,7 +25,8 @@
 //!    after.
 
 use crate::model::{
-    AuthSetting, Body, Collection, Environment, Item, KeyValue, RequestDef, Scripts, Variable,
+    AuthSetting, Body, Collection, Deployment, Environment, Item, KeyValue, RequestDef, Scripts,
+    Variable,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -68,6 +69,10 @@ pub type SecretValues = Vec<(String, Option<String>)>;
 struct CollectionFile {
     name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    service_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     #[serde(default, skip_serializing_if = "AuthSetting::is_inherit")]
     auth: AuthSetting,
@@ -75,6 +80,12 @@ struct CollectionFile {
     variables: Vec<Variable>,
     #[serde(default, skip_serializing_if = "Scripts::is_empty")]
     scripts: Scripts,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeploymentsFile {
+    deployments: Vec<Deployment>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -158,12 +169,22 @@ fn collection_files(collection: &Collection) -> (Files, SecretValues) {
     strip_secrets(committed.all_variables_mut());
     let meta = CollectionFile {
         name: committed.name,
+        service_name: committed.service_name,
+        base_path: committed.base_path,
         description: committed.description,
         auth: committed.auth,
         variables: committed.variables,
         scripts: committed.scripts,
     };
     files.insert(format!("{root}/collection.yml"), yaml(&meta));
+    if !committed.deployments.is_empty() {
+        files.insert(
+            format!("{root}/deployments.yml"),
+            yaml(&DeploymentsFile {
+                deployments: committed.deployments,
+            }),
+        );
+    }
 
     // Rendered from `committed`: a folder or request may declare a secret too,
     // and its value must not be written to that file.
@@ -698,6 +719,7 @@ pub fn create_environment(
     }
     let environment = Environment {
         name,
+        platforms: Vec::new(),
         insecure,
         variables,
     };
@@ -929,6 +951,7 @@ pub fn load(root: &Path) -> Result<Workspace, String> {
     let values = read_env(&root.join(".secrets").join("globals.env"));
     attach_secrets(globals.iter_mut(), &values);
 
+    crate::deployment::validate(&collections, &environments)?;
     Ok(Workspace {
         collections,
         environments,
@@ -944,6 +967,16 @@ fn load_collection(dir: &Path) -> Result<Collection, String> {
 
     Ok(Collection {
         name: meta.name,
+        service_name: meta.service_name,
+        base_path: meta.base_path,
+        deployments: if dir.join("deployments.yml").is_file() {
+            let path = dir.join("deployments.yml");
+            let file: DeploymentsFile = serde_norway::from_str(&read(&path)?)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            file.deployments
+        } else {
+            Vec::new()
+        },
         description: meta.description,
         auth: meta.auth,
         variables: meta.variables,

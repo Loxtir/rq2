@@ -1,0 +1,7 @@
+deployments:
+  - tenant: north
+    platform: stage-c
+    slot: stage
+  - tenant: south
+    platform: stage-c
+    slot: stage

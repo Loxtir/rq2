@@ -19,6 +19,10 @@ fn variable(name: &str, value: &str, secret: bool) -> Variable {
 
 fn collection(auth: AuthSetting, variables: Vec<Variable>) -> Collection {
     Collection {
+        service_name: None,
+        base_path: None,
+        deployments: Vec::new(),
+        scripts: Default::default(),
         name: "Acme".to_string(),
         description: None,
         auth,
@@ -123,6 +127,7 @@ fn a_collection_value_wins_over_the_environment() {
         vec![variable("baseUrl", "https://prod.test", false)],
     );
     let environment = Environment {
+        platforms: Vec::new(),
         name: "Dev".to_string(),
         insecure: false,
         variables: vec![variable("baseUrl", "https://dev.test", false)],

@@ -1,0 +1,4 @@
+name: Navigation Demo
+service_name: navigation-demo
+description: Fictional service for previewing tenant, platform and slot selection. No live endpoints.
+auth: none

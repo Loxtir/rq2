@@ -16,12 +16,15 @@ use collection::model::{
     AuthSetting, Body, Collection, Environment, Item, KeyValue, Scripts, Variable,
 };
 use collection::store::{self, Edit, RequestDraft};
-use response_query::{infer, parse, project, scaffold};
+use response_query::{infer, project, scaffold};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
+
+mod live;
+mod query;
 
 /// Raw bodies larger than this are still kept, but the raw view is truncated so
 /// a careless click does not push tens of megabytes through IPC.
@@ -74,6 +77,7 @@ fn scripts_for_path(
     scopes
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_script(
     script: &str,
     request: &mut collection::model::RequestDef,
@@ -82,6 +86,7 @@ fn apply_script(
     scopes: &[String],
     insecure: bool,
     response: Option<(u16, u64, usize, &str)>,
+    read_only: &[&str],
 ) -> Result<BTreeMap<String, BTreeMap<String, String>>, String> {
     if script.trim().is_empty() {
         return Ok(BTreeMap::new());
@@ -93,6 +98,7 @@ fn apply_script(
         "scopes": scopes,
         "insecure": insecure,
         "writes": {},
+        "readOnly": read_only,
         "response": response.map(|(code, time, size, body)| serde_json::json!({"code":code,"responseTime":time,"responseSize":size,"body":body})),
     });
     let initial_text = serde_json::to_string(&initial).map_err(|e| e.to_string())?;
@@ -104,6 +110,7 @@ fn apply_script(
         const stringify = (v) => typeof v === 'string' ? v : JSON.stringify(v);
         const set = (name, value, target) => {{
           name = String(name); value = stringify(value);
+          if (__rq.readOnly.includes(name)) throw new Error(name + ' is read-only and comes from the selected deployment');
           target = target || __rq.scope;
           if (typeof target === 'object') target = target.scope;
           if (target === 'globals') target = 'global';
@@ -260,18 +267,26 @@ fn send_script_request(payload: &str) -> Result<serde_json::Value, String> {
     }))
 }
 
-fn apply_variable_writes(variables: &mut Vec<Variable>, writes: BTreeMap<String, String>) {
+fn script_variable_edits(
+    variables: &[Variable],
+    scope: live::Scope,
+    writes: BTreeMap<String, String>,
+) -> Vec<live::Entry> {
+    let mut edits = Vec::new();
     for (name, value) in writes {
-        if let Some(variable) = variables.iter_mut().find(|variable| variable.name == name) {
-            variable.value = Some(value);
-        } else {
-            variables.push(Variable {
+        let secret = variables
+            .iter()
+            .any(|variable| variable.name == name && variable.secret);
+        edits.push(live::Entry {
+            scope: scope.clone(),
+            variable: Variable {
                 name,
                 value: Some(value),
-                secret: false,
-            });
-        }
+                secret,
+            },
+        });
     }
+    edits
 }
 
 fn variables_at_path(collection: &Collection, path: &[usize]) -> Option<Vec<Variable>> {
@@ -283,8 +298,7 @@ fn variables_at_path(collection: &Collection, path: &[usize]) -> Option<Vec<Vari
     Some(item_variables(items.get(*last)?).to_vec())
 }
 
-/// Persist script writes through the collection store so secrets remain split
-/// into `.secrets/` and every edit follows the renderer's leak checks.
+/// Script writes update local current values, never shared defaults.
 fn persist_script_writes(
     root: &std::path::Path,
     collection_slug: &str,
@@ -295,12 +309,26 @@ fn persist_script_writes(
     }
     let root_key = root.display().to_string();
     let collection_key = format!("{root_key}::{collection_slug}");
-    let mut workspace = store::load(root)?;
+    let workspace = live::load(root)?;
+    let mut edits = Vec::new();
 
+    if workspace.collections.iter().any(|collection| {
+        store::slugify(&collection.name) == collection_slug
+            && collection::deployment::enabled(collection)
+    }) && writes.values().any(|values| {
+        values
+            .keys()
+            .any(|name| collection::deployment::RESERVED.contains(&name.as_str()))
+    }) {
+        return Err("deployment template inputs and baseUrl are read-only".into());
+    }
     for (scope, values) in writes {
         if scope == format!("global::{root_key}") {
-            apply_variable_writes(&mut workspace.globals, values);
-            store::save_globals(root, workspace.globals.clone())?;
+            edits.extend(script_variable_edits(
+                &workspace.globals,
+                live::Scope::Globals,
+                values,
+            ));
             continue;
         }
 
@@ -313,11 +341,13 @@ fn persist_script_writes(
                 .ok_or_else(|| {
                     "pm.environment.set requires a selected, saved environment".to_string()
                 })?;
-            let name = environment.name.clone();
-            let insecure = environment.insecure;
-            let mut variables = environment.variables.clone();
-            apply_variable_writes(&mut variables, values);
-            store::update_environment(root, slug, name, insecure, variables)?;
+            edits.extend(script_variable_edits(
+                &environment.variables,
+                live::Scope::Environment {
+                    environment: environment.name.clone(),
+                },
+                values,
+            ));
             continue;
         }
 
@@ -328,16 +358,13 @@ fn persist_script_writes(
                 .iter()
                 .find(|collection| store::slugify(&collection.name) == collection_slug)
                 .ok_or_else(|| "script collection scope no longer exists".to_string())?;
-            let mut variables = collection.variables.clone();
-            apply_variable_writes(&mut variables, values);
-            let edit = Edit::Collection {
-                name: collection.name.clone(),
-                description: collection.description.clone(),
-                variables,
-                auth: collection.auth.clone(),
-                scripts: collection.scripts.clone(),
-            };
-            store::save(root, collection_slug, &edit)?;
+            edits.extend(script_variable_edits(
+                &collection.variables,
+                live::Scope::Collection {
+                    collection: collection_slug.into(),
+                },
+                values,
+            ));
             continue;
         }
 
@@ -363,12 +390,18 @@ fn persist_script_writes(
         }
         let path =
             matched_path.ok_or_else(|| format!("unsupported script variable scope: {scope}"))?;
-        let mut variables = variables_at_path(collection, &path)
+        let variables = variables_at_path(collection, &path)
             .ok_or_else(|| "script variable target no longer exists".to_string())?;
-        apply_variable_writes(&mut variables, values);
-        store::save(root, collection_slug, &Edit::Variables { path, variables })?;
+        edits.extend(script_variable_edits(
+            &variables,
+            live::Scope::Item {
+                collection: collection_slug.into(),
+                path,
+            },
+            values,
+        ));
     }
-    Ok(())
+    live::write(root, edits, false)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -377,6 +410,8 @@ struct HistoryEntry {
     /// Missing in older history; an empty name means no environment.
     #[serde(default)]
     environment: Option<String>,
+    #[serde(default)]
+    deployment: Option<collection::deployment::Target>,
     timestamp: u64,
     name: String,
     #[serde(default)]
@@ -430,6 +465,13 @@ struct WorkspaceDto {
     environments: Vec<EnvironmentDto>,
     /// `globals.yml`: the widest variable layer, shared by every collection.
     globals: Vec<VariableDto>,
+    live_variables: Vec<LiveVariableDto>,
+}
+
+#[derive(Serialize)]
+struct LiveVariableDto {
+    scope: live::Scope,
+    variable: VariableDto,
 }
 
 /// Persisted between launches. Kept as an object so a recent-workspaces list
@@ -443,6 +485,7 @@ struct AppConfig {
 #[derive(Serialize)]
 struct EnvironmentDto {
     name: String,
+    platforms: Vec<collection::model::Platform>,
     /// Shown in the UI next to the selector, so an unverified connection is
     /// never a surprise.
     insecure: bool,
@@ -452,6 +495,9 @@ struct EnvironmentDto {
 #[derive(Serialize)]
 struct CollectionDto {
     name: String,
+    service_name: Option<String>,
+    base_path: Option<String>,
+    deployments: Vec<collection::model::Deployment>,
     slug: String,
     description: Option<String>,
     /// The collection's own setting, in the same shape the editor sends back.
@@ -512,6 +558,7 @@ enum TreeNode {
 struct ResponseDto {
     id: u64,
     environment: Option<String>,
+    deployment: Option<collection::deployment::Target>,
     status: u16,
     elapsed_ms: u64,
     bytes: usize,
@@ -541,6 +588,7 @@ struct ProjectionDto {
 #[derive(Serialize)]
 struct PreviewDto {
     text: String,
+    deployment: Option<collection::deployment::Target>,
     /// True when a secret was substituted with `***`, so the command as shown is
     /// not runnable until the value is supplied.
     masked: bool,
@@ -688,6 +736,11 @@ fn prune_history(dir: &std::path::Path, limit: u64) -> Result<u64, String> {
     Ok(total)
 }
 
+struct ResponseContext {
+    environment: String,
+    deployment: Option<collection::deployment::Target>,
+}
+
 fn persist_response(
     app: &tauri::AppHandle,
     name: &str,
@@ -695,7 +748,7 @@ fn persist_response(
     collection: &str,
     path: &[usize],
     sent: &collection::send::SentResponse,
-    environment: &str,
+    context: &ResponseContext,
 ) -> Option<String> {
     let dir = history_dir(app).ok()?;
     std::fs::create_dir_all(&dir).ok()?;
@@ -709,7 +762,8 @@ fn persist_response(
     );
     let entry = HistoryEntry {
         id: id.clone(),
-        environment: Some(environment.to_string()),
+        environment: Some(context.environment.clone()),
+        deployment: context.deployment.clone(),
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
@@ -745,7 +799,7 @@ fn persist_failed_request(
     collection: &str,
     path: &[usize],
     url: &str,
-    error: &str,
+    failure: (&str, &ResponseContext),
 ) {
     let Some(dir) = history_dir(app).ok() else {
         return;
@@ -759,7 +813,8 @@ fn persist_failed_request(
     let id = format!("{}-{}", timestamp.as_nanos(), std::process::id());
     let entry = HistoryEntry {
         id: id.clone(),
-        environment: None,
+        environment: Some(failure.1.environment.clone()),
+        deployment: failure.1.deployment.clone(),
         timestamp: timestamp.as_secs(),
         name: name.to_string(),
         collection: collection.to_string(),
@@ -772,7 +827,7 @@ fn persist_failed_request(
         content_type: None,
         insecure: false,
         missing: Vec::new(),
-        error: Some(error.to_string()),
+        error: Some(failure.0.to_string()),
         response_available: false,
     };
     if std::fs::write(dir.join(format!("{id}.body")), []).is_err() {
@@ -861,6 +916,7 @@ fn open_history(
     Ok(ResponseDto {
         id: response_id,
         environment: entry.environment,
+        deployment: entry.deployment,
         status: entry.status,
         elapsed_ms: entry.elapsed_ms,
         bytes: entry.bytes,
@@ -902,12 +958,22 @@ fn remember_workspace(app: &tauri::AppHandle, root: &std::path::Path) {
 
 fn workspace_dto(root: &std::path::Path) -> Result<WorkspaceDto, String> {
     let loaded = store::load(root)?;
+    let live_variables = live::entries(root)?
+        .iter()
+        .map(|entry| LiveVariableDto {
+            scope: entry.scope.clone(),
+            variable: variable_dto(&entry.variable),
+        })
+        .collect();
 
     let collections = loaded
         .collections
         .iter()
         .map(|collection| CollectionDto {
             name: collection.name.clone(),
+            service_name: collection.service_name.clone(),
+            base_path: collection.base_path.clone(),
+            deployments: collection.deployments.clone(),
             slug: store::slugify(&collection.name),
             description: collection.description.clone(),
             auth: collection.auth.clone(),
@@ -922,6 +988,7 @@ fn workspace_dto(root: &std::path::Path) -> Result<WorkspaceDto, String> {
         .iter()
         .map(|environment| EnvironmentDto {
             name: environment.name.clone(),
+            platforms: environment.platforms.clone(),
             insecure: environment.insecure,
             variables: environment.variables.iter().map(variable_dto).collect(),
         })
@@ -932,6 +999,7 @@ fn workspace_dto(root: &std::path::Path) -> Result<WorkspaceDto, String> {
         collections,
         environments,
         globals: loaded.globals.iter().map(variable_dto).collect(),
+        live_variables,
     })
 }
 
@@ -1074,7 +1142,7 @@ fn locate(
     slug: &str,
     environment: Option<&str>,
 ) -> Result<Located, String> {
-    let loaded = store::load(root)?;
+    let loaded = live::load(root)?;
 
     let collection = loaded
         .collections
@@ -1124,12 +1192,14 @@ fn auth_for<'a>(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn send(
     app: tauri::AppHandle,
     collection: String,
     path: Vec<usize>,
     draft: Option<RequestDraft>,
     environment: Option<String>,
+    deployment: Option<collection::model::Deployment>,
     request_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<ResponseDto, String> {
@@ -1149,6 +1219,11 @@ async fn send(
         let request_path = path.clone();
         let located = locate(&root, &collection, environment.as_deref())?;
         let collection = &located.collection;
+        let target = collection::deployment::resolve(
+            collection,
+            located.environment.as_ref(),
+            deployment.as_ref(),
+        )?;
         let resolved = collection
             .request_at(&path)
             .ok_or("that request is no longer in the file")?;
@@ -1160,11 +1235,12 @@ async fn send(
             .as_ref()
             .is_some_and(|environment| environment.insecure);
 
-        let base_vars = collection::send::variables(
+        let base_vars = collection::send::variables_for_target(
             collection,
             located.environment.as_ref(),
             &located.globals,
             &path,
+            target.as_ref(),
         );
         let mut variable_map = base_vars
             .iter()
@@ -1200,6 +1276,11 @@ async fn send(
                 &scope_keys,
                 insecure,
                 None,
+                if target.is_some() {
+                    &collection::deployment::RESERVED
+                } else {
+                    &[]
+                },
             )?;
             for (target, values) in writes {
                 runtime_writes.entry(target).or_default().extend(values);
@@ -1207,11 +1288,12 @@ async fn send(
         }
         persist_script_writes(&root, &collection_slug, runtime_writes)?;
         let updated = locate(&root, &collection_slug, environment.as_deref())?;
-        let effective = collection::send::variables(
+        let effective = collection::send::variables_for_target(
             &updated.collection,
             updated.environment.as_ref(),
             &updated.globals,
             &request_path,
+            target.as_ref(),
         );
         variable_map = effective
             .iter()
@@ -1220,6 +1302,7 @@ async fn send(
         let vars = collection::send::Variables::from(variable_map.clone());
         Ok::<_, String>((
             name,
+            target,
             collection_slug,
             request_path,
             request.method.clone(),
@@ -1241,6 +1324,7 @@ async fn send(
     let sent = match prepared {
         Ok(Ok((
             name,
+            target,
             collection_slug,
             request_path,
             method,
@@ -1261,6 +1345,7 @@ async fn send(
                 Ok(sent) => {
                     let post_root = response_root.clone();
                     let post_collection = collection_slug.clone();
+                    let deployment_enabled = target.is_some();
                     let post = tauri::async_runtime::spawn_blocking(move || {
                         let mut writes_all = BTreeMap::<String, BTreeMap<String, String>>::new();
                         let mut script_errors = Vec::new();
@@ -1287,6 +1372,11 @@ async fn send(
                                     sent.body.len(),
                                     &body,
                                 )),
+                                if deployment_enabled {
+                                    &collection::deployment::RESERVED
+                                } else {
+                                    &[]
+                                },
                             ) {
                                 Ok(writes) => {
                                     for (target, values) in writes {
@@ -1307,6 +1397,7 @@ async fn send(
                     .map_err(|error| format!("post-response script task failed: {error}"))?;
                     Ok((
                         name,
+                        target,
                         collection_slug,
                         request_path,
                         method,
@@ -1316,6 +1407,7 @@ async fn send(
                 }
                 Err(error) => Ok((
                     name,
+                    target,
                     collection_slug,
                     request_path,
                     method,
@@ -1332,7 +1424,11 @@ async fn send(
         .lock()
         .map_err(|_| "state poisoned")?
         .remove(&request_id);
-    let (name, collection_slug, request_path, method, requested_url, sent) = sent?;
+    let (name, target, collection_slug, request_path, method, requested_url, sent) = sent?;
+    let response_context = ResponseContext {
+        environment: response_environment,
+        deployment: target,
+    };
     let (sent, script_errors) = match sent {
         Ok((sent, errors)) => (sent, errors),
         Err(error) => {
@@ -1344,7 +1440,7 @@ async fn send(
                     &collection_slug,
                     &request_path,
                     &requested_url,
-                    &error,
+                    (&error, &response_context),
                 );
             }
             return Err(error);
@@ -1357,7 +1453,7 @@ async fn send(
         &collection_slug,
         &request_path,
         &sent,
-        &response_environment,
+        &response_context,
     );
 
     let mut responses = state.responses.lock().map_err(|_| "state poisoned")?;
@@ -1366,7 +1462,8 @@ async fn send(
 
     Ok(ResponseDto {
         id,
-        environment: Some(response_environment),
+        environment: Some(response_context.environment),
+        deployment: response_context.deployment,
         status: sent.status,
         elapsed_ms: sent.elapsed.as_millis() as u64,
         bytes,
@@ -1457,7 +1554,7 @@ fn update_globals(
 /// It edits the narrowest definition that binds the name, in the same order a
 /// send uses: request, folder, collection, environment, globals. A name nothing
 /// defines is created where the card asks — the collection by default.
-/// The variable the hover card is writing. Grouped so the command keeps a
+/// The variable the hover card is applying locally. Grouped so the command keeps a
 /// readable signature and the JSON payload names its fields.
 #[derive(Deserialize)]
 struct VariableEdit {
@@ -1470,6 +1567,8 @@ struct VariableEdit {
     /// `environment`, or `globals`.
     #[serde(default)]
     create: Option<String>,
+    #[serde(default)]
+    reset: bool,
 }
 
 #[tauri::command]
@@ -1485,6 +1584,7 @@ fn set_variable(
         value,
         secret,
         create,
+        reset,
     } = edit;
     let root = workspace_path(&state)?;
     let name = name.trim().to_string();
@@ -1493,139 +1593,25 @@ fn set_variable(
     }
     let path = path.unwrap_or_default();
 
-    let mut workspace = store::load(&root)?;
-    let index = workspace
-        .collections
-        .iter()
-        .position(|candidate| store::slugify(&candidate.name) == collection)
-        .ok_or_else(|| format!("no collection called `{collection}`"))?;
-    let slug = store::slugify(&workspace.collections[index].name);
-
-    // 1. The item at `path`, then each folder above it, innermost first.
-    if !path.is_empty() {
-        let mut targets = vec![path.clone()];
-        targets.extend((1..path.len()).rev().map(|end| path[..end].to_vec()));
-
-        for target in targets {
-            let Some(item) = item_at(&workspace.collections[index].items, &target) else {
-                continue;
-            };
-            if !item_variables(item)
-                .iter()
-                .any(|variable| variable.name == name)
-            {
-                continue;
-            }
-
-            let mut variables = item_variables(item).to_vec();
-            if let Some(variable) = variables.iter_mut().find(|variable| variable.name == name) {
-                update_variable(variable, value.clone(), secret);
-            }
-            store::save(
-                &root,
-                &slug,
-                &Edit::Variables {
-                    path: target,
-                    variables,
-                },
-            )?;
-            return workspace_dto(&root);
-        }
-    }
-
-    // 2. The collection's own variables.
-    if workspace.collections[index]
-        .variables
-        .iter()
-        .any(|variable| variable.name == name)
-    {
-        let target = &mut workspace.collections[index];
-        if let Some(variable) = target
-            .variables
-            .iter_mut()
-            .find(|variable| variable.name == name)
-        {
-            update_variable(variable, value.clone(), secret);
-        }
-        save_collection(&root, target)?;
-        return workspace_dto(&root);
-    }
-
-    // 3. The selected environment.
-    if let Some(environment_name) = environment.as_deref() {
-        if let Some(target) = workspace
-            .environments
-            .iter_mut()
-            .find(|candidate| candidate.name == environment_name)
-        {
-            if target
-                .variables
-                .iter()
-                .any(|variable| variable.name == name)
-            {
-                if let Some(variable) = target
-                    .variables
-                    .iter_mut()
-                    .find(|variable| variable.name == name)
-                {
-                    update_variable(variable, value.clone(), secret);
-                }
-                let slug = store::slugify(&target.name);
-                let variables = target.variables.clone();
-                store::save_environment(&root, &slug, variables)?;
-                return workspace_dto(&root);
-            }
-        }
-    }
-
-    // 4. Globals, the widest layer.
-    if workspace
-        .globals
-        .iter()
-        .any(|variable| variable.name == name)
-    {
-        if let Some(variable) = workspace
-            .globals
-            .iter_mut()
-            .find(|variable| variable.name == name)
-        {
-            update_variable(variable, value.clone(), secret);
-        }
-        store::save_globals(&root, workspace.globals.clone())?;
-        return workspace_dto(&root);
-    }
-
-    // Nothing defines it: create it where the card asked.
-    let variable = Variable {
-        name,
-        value,
-        secret,
-    };
-    match create.as_deref().unwrap_or("collection") {
-        "globals" => {
-            workspace.globals.push(variable);
-            store::save_globals(&root, workspace.globals.clone())?;
-        }
-        "environment" => {
-            let Some(environment_name) = environment.as_deref() else {
-                return Err("no environment is selected".to_string());
-            };
-            let target = workspace
-                .environments
-                .iter_mut()
-                .find(|candidate| candidate.name == environment_name)
-                .ok_or_else(|| format!("no environment called `{environment_name}`"))?;
-            target.variables.push(variable);
-            let slug = store::slugify(&target.name);
-            let variables = target.variables.clone();
-            store::save_environment(&root, &slug, variables)?;
-        }
-        _ => {
-            workspace.collections[index].variables.push(variable);
-            save_collection(&root, &workspace.collections[index])?;
-        }
-    }
-
+    let mut workspace = live::load(&root)?;
+    let scope = live::target(
+        &mut workspace,
+        &collection,
+        &path,
+        environment.as_deref(),
+        &name,
+        create.as_deref(),
+    )?;
+    let mut variable = live::variables_mut(&mut workspace, &scope)
+        .and_then(|variables| variables.iter().find(|variable| variable.name == name))
+        .cloned()
+        .unwrap_or(Variable {
+            name,
+            value: None,
+            secret,
+        });
+    update_variable(&mut variable, value, secret);
+    live::write(&root, vec![live::Entry { scope, variable }], reset)?;
     workspace_dto(&root)
 }
 
@@ -1639,16 +1625,6 @@ fn update_variable(variable: &mut Variable, value: Option<String>, secret: bool)
     variable.secret = secret;
 }
 
-fn item_at<'a>(items: &'a [Item], path: &[usize]) -> Option<&'a Item> {
-    let (first, rest) = path.split_first()?;
-    let item = items.get(*first)?;
-    if rest.is_empty() {
-        Some(item)
-    } else {
-        item_at(&item.items, rest)
-    }
-}
-
 /// A folder's variables, or a request's.
 fn item_variables(item: &Item) -> &[Variable] {
     match &item.request {
@@ -1657,42 +1633,25 @@ fn item_variables(item: &Item) -> &[Variable] {
     }
 }
 
-/// Saves a collection's variables without touching its tree; the collection is
-/// reloaded from disk, so only the fields the edit owns are carried over.
-fn save_collection(root: &std::path::Path, collection: &Collection) -> Result<(), String> {
-    let slug = store::slugify(&collection.name);
-    let edit = Edit::Collection {
-        name: collection.name.clone(),
-        description: collection.description.clone(),
-        variables: collection.variables.clone(),
-        auth: collection.auth.clone(),
-        scripts: collection.scripts.clone(),
-    };
-    store::save(root, &slug, &edit).map(|_| ())
-}
-
 #[tauri::command]
 fn curl_preview(
     collection: String,
     path: Vec<usize>,
     draft: Option<RequestDraft>,
     environment: Option<String>,
+    deployment: Option<collection::model::Deployment>,
     state: tauri::State<'_, AppState>,
 ) -> Result<PreviewDto, String> {
     let root = workspace_path(&state)?;
-    let preview = curl_for(
+    curl_for(
         &root,
         &collection,
         &path,
         draft,
         environment.as_deref(),
+        deployment.as_ref(),
         false,
-    )?;
-    Ok(PreviewDto {
-        text: preview.text,
-        masked: preview.masked,
-        problem: preview.problem,
-    })
+    )
 }
 
 /// Secret-bearing exports stay in Rust and use the same renderer as the preview.
@@ -1702,10 +1661,13 @@ fn curl_for(
     path: &[usize],
     draft: Option<RequestDraft>,
     environment: Option<&str>,
+    deployment: Option<&collection::model::Deployment>,
     include_secrets: bool,
-) -> Result<collection::curl::Preview, String> {
+) -> Result<PreviewDto, String> {
     let located = locate(root, collection, environment)?;
     let collection = &located.collection;
+    let target =
+        collection::deployment::resolve(collection, located.environment.as_ref(), deployment)?;
     let resolved = collection
         .request_at(path)
         .ok_or("that request is no longer in the file")?;
@@ -1713,29 +1675,39 @@ fn curl_for(
     let auth = auth_for(collection, path, &request);
 
     let variables = if include_secrets {
-        collection::send::variables(
+        collection::send::variables_for_target(
             collection,
             located.environment.as_ref(),
             &located.globals,
             path,
+            target.as_ref(),
         )
     } else {
-        collection::curl::masked_variables(
+        collection::curl::masked_variables_for_target(
             collection,
             located.environment.as_ref(),
             &located.globals,
             path,
+            target.as_ref(),
         )
     };
-    Ok(collection::curl::render(&request, auth, &variables))
+    let preview = collection::curl::render(&request, auth, &variables);
+    Ok(PreviewDto {
+        text: preview.text,
+        masked: preview.masked,
+        problem: preview.problem,
+        deployment: target,
+    })
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn copy_curl(
     collection: String,
     path: Vec<usize>,
     draft: Option<RequestDraft>,
     environment: Option<String>,
+    deployment: Option<collection::model::Deployment>,
     include_secrets: bool,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -1749,6 +1721,7 @@ fn copy_curl(
         &path,
         draft,
         environment.as_deref(),
+        deployment.as_ref(),
         include_secrets,
     )?;
     app.clipboard()
@@ -1758,11 +1731,20 @@ fn copy_curl(
 
 /// Captured response data is exported as-is, never variable-expanded. An empty
 /// query preserves the original bytes, including bodies beyond the display cap.
+#[cfg(test)]
 fn response_export(body: &[u8], query: &str) -> Result<Vec<u8>, String> {
+    response_export_with_variables(body, query, || Ok(BTreeMap::new().into()))
+}
+
+fn response_export_with_variables(
+    body: &[u8],
+    query: &str,
+    load: impl FnOnce() -> Result<collection::send::Variables, String>,
+) -> Result<Vec<u8>, String> {
     if query.trim().is_empty() {
         return Ok(body.to_vec());
     }
-    let selection = parse(query).map_err(|diag| diag.render(query))?;
+    let selection = query::parse(query, load)?;
     let projected = project(body, &selection).map_err(|diag| diag.render(query))?;
     let value: serde_json::Value =
         serde_json::from_slice(&projected).map_err(|error| error.to_string())?;
@@ -1773,6 +1755,7 @@ fn response_export(body: &[u8], query: &str) -> Result<Vec<u8>, String> {
 fn save_response(
     id: u64,
     query: String,
+    context: Option<query::Context>,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<bool, String> {
@@ -1786,7 +1769,12 @@ fn save_response(
             .cloned()
             .ok_or("that response is no longer in memory; send it again")?
     };
-    let bytes = response_export(&body, &query)?;
+    let bytes = response_export_with_variables(&body, &query, || {
+        let context = context
+            .as_ref()
+            .ok_or("select a request to resolve query variables")?;
+        context.variables(&workspace_path(&state)?)
+    })?;
     let is_json = serde_json::from_slice::<serde::de::IgnoredAny>(&bytes).is_ok();
     let Some(file) = app
         .dialog()
@@ -1813,6 +1801,7 @@ fn save_response(
 fn project_body(
     id: u64,
     query: String,
+    context: Option<query::Context>,
     state: tauri::State<'_, AppState>,
 ) -> Result<ProjectionDto, String> {
     let body = {
@@ -1847,7 +1836,12 @@ fn project_body(
         });
     }
 
-    let selection = parse(&query).map_err(|diag| diag.render(&query))?;
+    let selection = query::parse(&query, || {
+        let context = context
+            .as_ref()
+            .ok_or("select a request to resolve query variables")?;
+        context.variables(&workspace_path(&state)?)
+    })?;
 
     let started = std::time::Instant::now();
     let projected = project(&body, &selection).map_err(|diag| diag.render(&query))?;
@@ -1888,6 +1882,12 @@ fn suggest_query(id: u64, state: tauri::State<'_, AppState>) -> Result<String, S
 
 fn main() {
     tauri::Builder::default()
+        .setup(|app| {
+            if let Some(path) = config_path(app.handle()) {
+                live::initialize(path.with_file_name("variables.json"));
+            }
+            Ok(())
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState::default())
@@ -1917,6 +1917,191 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod deployment_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn both_transports_send_to_the_selected_target() {
+        use std::io::{BufRead, Write};
+        for (asynchronous, tenant) in [(false, "north"), (false, "south"), (true, "north"), (true, "south")] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let template = format!(
+                "http://{}/{{{{serviceName}}}}{{{{basePath}}}}",
+                listener.local_addr().unwrap()
+            );
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                reader
+                    .get_mut()
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .unwrap();
+                request_line
+            });
+            let mut collection: Collection = serde_norway::from_str(
+                "name: Navigation\nservice_name: navsvc\ndeployments:\n - {tenant: acme, platform: stage-a, slot: candidate}\nvariables:\n - {name: baseUrl, value: 'https://wrong.test'}",
+            ).unwrap();
+            collection.deployments[0].tenant = tenant.into();
+            collection.base_path =
+                Some("/{{tenant == 'north' ? serviceName : 'shared'}}-{{slot}}".into());
+            let environment = collection::Environment {
+                name: "stage".into(),
+                insecure: false,
+                variables: Vec::new(),
+                platforms: vec![collection::model::Platform {
+                    name: "stage-a".into(),
+                    url_template: template,
+                }],
+            };
+            let target = collection::deployment::resolve(
+                &collection,
+                Some(&environment),
+                Some(&collection.deployments[0]),
+            )
+            .unwrap();
+            let variables = collection::send::variables_for_target(
+                &collection,
+                Some(&environment),
+                &[],
+                &[],
+                target.as_ref(),
+            );
+            let request = collection::model::RequestDef {
+                method: "GET".into(),
+                url: "{{baseUrl}}/menu".into(),
+                ..Default::default()
+            };
+            let options = collection::send::SendOptions::default();
+            let sent = if asynchronous {
+                collection::send::send_async(&request, None, &variables, &options)
+                    .await
+                    .unwrap()
+            } else {
+                collection::send::send(&request, None, &variables, &options).unwrap()
+            };
+            assert_eq!(sent.status, 200);
+            assert_eq!(
+                server.join().unwrap(),
+                format!(
+                    "GET /navsvc/{}-candidate/menu HTTP/1.1\r\n",
+                    if tenant == "north" {
+                        "navsvc"
+                    } else {
+                        "shared"
+                    }
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn curl_exports_require_a_valid_target_and_use_the_generated_destination() {
+        let root = std::env::temp_dir().join("opencode").join(format!(
+            "rq-target-export-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut collection: Collection = serde_norway::from_str(
+            "name: Navigation\nservice_name: navsvc\ndeployments:\n - {tenant: acme, platform: stage-a, slot: candidate}\nvariables:\n - {name: baseUrl, value: 'https://wrong.test'}\n - {name: token, value: 'private-token', secret: true}\nitems:\n - name: Menu\n   request:\n     method: GET\n     url: '{{baseUrl}}/menu'\n     headers:\n      - {name: Authorization, value: 'Bearer {{token}}'}\n",
+        ).unwrap();
+        collection.base_path =
+            Some("/{{tenant == 'acme' ? serviceName : 'shared'}}-{{slot}}/{{tenant}}".into());
+        let environment: collection::Environment = serde_norway::from_str(
+            "name: stage\nplatforms:\n - name: stage-a\n   url_template: 'https://{{serviceName}}.stage-a.test{{basePath}}'",
+        ).unwrap();
+        store::write(&root, &store::render(&collection, &[environment])).unwrap();
+        let choice = &collection.deployments[0];
+        assert!(curl_for(&root, "navigation", &[0], None, Some("stage"), None, false).is_err());
+        assert!(curl_for(&root, "navigation", &[0], None, None, Some(choice), false).is_err());
+        let protected = curl_for(
+            &root,
+            "navigation",
+            &[0],
+            None,
+            Some("stage"),
+            Some(choice),
+            false,
+        )
+        .unwrap();
+        let revealed = curl_for(
+            &root,
+            "navigation",
+            &[0],
+            None,
+            Some("stage"),
+            Some(choice),
+            true,
+        )
+        .unwrap();
+        for preview in [&protected, &revealed] {
+            assert!(preview.text.contains(
+                "https://navsvc.stage-a.test/navsvc-candidate/acme/menu"
+            ));
+            assert!(!preview.text.contains("wrong.test"));
+            assert_eq!(
+                preview.deployment.as_ref().unwrap().base_path,
+                "/navsvc-candidate/acme"
+            );
+        }
+        assert!(protected.masked);
+        assert!(!protected.text.contains("private-token"));
+        assert!(revealed.text.contains("private-token"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scripts_cannot_assign_generated_target_inputs_but_ordinary_variables_still_work() {
+        for name in collection::deployment::RESERVED {
+            let mut request = collection::model::RequestDef::default();
+            let mut variables = BTreeMap::new();
+            let error = apply_script(
+                &format!("pm.variables.set('{name}', 'wrong');"),
+                &mut request,
+                &mut variables,
+                "collection::test",
+                &[],
+                false,
+                None,
+                &collection::deployment::RESERVED,
+            )
+            .unwrap_err();
+            assert!(error.contains("read-only"), "{error}");
+            assert!(!variables.contains_key(name));
+        }
+        let mut request = collection::model::RequestDef::default();
+        let mut variables = BTreeMap::new();
+        apply_script(
+            "pm.variables.set('baseUrl', 'https://ordinary.test');",
+            &mut request,
+            &mut variables,
+            "collection::test",
+            &[],
+            false,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(variables["baseUrl"], "https://ordinary.test");
+    }
 }
 
 #[cfg(test)]
@@ -2028,6 +2213,100 @@ mod response_export_tests {
             br#"{"id":42,"title":"Example","hidden":"not selected"}"#
         );
     }
+
+    #[test]
+    fn query_exports_apply_equality_and_inequality_without_modifying_the_body() {
+        let body = br#"[{"id":1,"status":"ACTIVE"},{"id":2,"status":"DELETED"}]"#;
+        for query in [
+            r#"{ id status == "ACTIVE" }"#,
+            r#"{ id status != "DELETED" }"#,
+        ] {
+            let exported = response_export(body, query).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&exported).unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!([{"id":1,"status":"ACTIVE"},{"id":2}])
+            );
+        }
+        assert_eq!(response_export(body, "").unwrap(), body.to_vec());
+    }
+
+    #[test]
+    fn query_exports_apply_array_filters_and_membership_without_modifying_the_body() {
+        let body = br#"{"profiles":[{"name":"Mike","age":30},{"name":"Anna","age":25},{"name":"X","age":40}]}"#;
+        for (query, expected) in [
+            (
+                r#"{ profiles[? name in ["Mike", "X"]] { name age } }"#,
+                serde_json::json!({"profiles":[{"name":"Mike","age":30},{"name":"X","age":40}]}),
+            ),
+            (
+                r#"{ profiles[? name not in ["Mike", "X"]] { age } }"#,
+                serde_json::json!({"profiles":[{"age":25}]}),
+            ),
+            (
+                r#"{ profiles { name in ["Mike", "X"] age } }"#,
+                serde_json::json!({"profiles":[{"name":"Mike","age":30},{"age":25},{"name":"X","age":40}]}),
+            ),
+        ] {
+            let exported = response_export(body, query).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&exported).unwrap();
+            assert_eq!(value, expected);
+        }
+        assert_eq!(response_export(body, "").unwrap(), body.to_vec());
+    }
+
+    #[test]
+    fn query_exports_filter_nested_values_before_projecting_other_fields() {
+        let body = br#"{"items":[{"definition":{"item_id":{"value":"2762467"}},"label":"keep"},{"definition":{"item_id":{"value":"other"}},"label":"drop"}]}"#;
+        let query = r#"{ items[? definition { item_id { value in ["2762467"] } }] { label } }"#;
+        let exported = response_export(body, query).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&exported).unwrap();
+        assert_eq!(value, serde_json::json!({"items":[{"label":"keep"}]}));
+        assert_eq!(response_export(body, "").unwrap(), body.to_vec());
+    }
+
+    #[test]
+    fn query_variable_export_matches_projection_and_preserves_original_body_and_query() {
+        let body = br#"{"items":[{"id":"2762467"},{"id":"other"}]}"#;
+        let query = r#"{ items[? id == "{{myVar}}"] { id } }"#;
+        let load = || Ok(BTreeMap::from([("myVar".into(), "2762467".into())]).into());
+        let selection = query::parse(query, load).unwrap();
+        let projected = project(body, &selection).unwrap();
+        let exported = response_export_with_variables(body, query, load).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&projected).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&exported).unwrap()
+        );
+        assert!(query.contains("{{myVar}}"));
+        assert_eq!(
+            response_export_with_variables(body, "", || panic!(
+                "empty query must not load variables"
+            ))
+            .unwrap(),
+            body.to_vec()
+        );
+    }
+
+    #[test]
+    fn recursive_filter_exports_keep_both_shapes_and_query_variable_binding() {
+        let body = br#"{"items":[{"id":"other","children":[{"id":"2762467","hidden":1}]}]}"#;
+        let load = || Ok(BTreeMap::from([("myVar".into(), "2762467".into())]).into());
+        for (mode, expected) in [
+            ("...", serde_json::json!({"items":[{"id":"2762467"}]})),
+            (
+                "**",
+                serde_json::json!({"items":[{"children":[{"id":"2762467"}]}]}),
+            ),
+        ] {
+            let query = format!("{{ items{mode}children[? id == \"{{{{myVar}}}}\"] {{ id }} }}");
+            let exported = response_export_with_variables(body, &query, load).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&exported).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(response_export(body, "").unwrap(), body.to_vec());
+    }
 }
 
 #[cfg(test)]
@@ -2043,12 +2322,23 @@ mod response_environment_tests {
         });
         let entry: HistoryEntry = serde_json::from_value(legacy).unwrap();
         assert_eq!(entry.environment, None);
+        assert_eq!(entry.deployment, None);
         for environment in ["", "Dev", "Stage"] {
             let mut entry = entry.clone();
             entry.environment = Some(environment.to_string());
+            entry.deployment = Some(collection::deployment::Target {
+                base_path: String::new(),
+                service_name: "navsvc".into(),
+                environment: environment.into(),
+                tenant: "acme".into(),
+                platform: "stage-a".into(),
+                slot: "candidate".into(),
+                base_url: "https://navsvc-candidate.stage-a.test/acme".into(),
+            });
             let restored: HistoryEntry =
                 serde_json::from_slice(&serde_json::to_vec(&entry).unwrap()).unwrap();
             assert_eq!(restored.environment.as_deref(), Some(environment));
+            assert_eq!(restored.deployment, entry.deployment);
         }
     }
 }
@@ -2111,13 +2401,31 @@ mod curl_tests {
             }))
             .unwrap()
         };
-        let protected = curl_for(&root, "export", &[0], Some(draft()), Some("Dev"), false).unwrap();
+        let protected = curl_for(
+            &root,
+            "export",
+            &[0],
+            Some(draft()),
+            Some("Dev"),
+            None,
+            false,
+        )
+        .unwrap();
         assert!(protected.masked);
         assert!(protected.text.contains("https://dev.test/draft"));
         assert!(!protected.text.contains("collection-secret-value"));
         assert!(!protected.text.contains("global-secret-value"));
 
-        let revealed = curl_for(&root, "export", &[0], Some(draft()), Some("Dev"), true).unwrap();
+        let revealed = curl_for(
+            &root,
+            "export",
+            &[0],
+            Some(draft()),
+            Some("Dev"),
+            None,
+            true,
+        )
+        .unwrap();
         assert!(!revealed.masked);
         assert!(revealed.text.contains("curl -X POST"));
         assert!(revealed
@@ -2130,9 +2438,17 @@ mod curl_tests {
         assert!(revealed.text.contains("global-secret-value"));
         assert!(!revealed.text.contains("environment-secret-value"));
         assert_eq!(
-            curl_for(&root, "export", &[0], Some(draft()), Some("Dev"), false)
-                .unwrap()
-                .text,
+            curl_for(
+                &root,
+                "export",
+                &[0],
+                Some(draft()),
+                Some("Dev"),
+                None,
+                false
+            )
+            .unwrap()
+            .text,
             protected.text
         );
         assert_eq!(std::fs::read(&yaml).unwrap(), before);

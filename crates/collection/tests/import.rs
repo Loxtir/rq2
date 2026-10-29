@@ -367,6 +367,7 @@ fn auth_is_written_only_where_it_is_set() {
 fn two_requests_with_the_same_name_get_different_files() {
     let mut collection = parsed();
     collection.items.push(Item {
+        scripts: Default::default(),
         name: "List orders".to_string(),
         auth: AuthSetting::Inherit,
         variables: Vec::new(),
@@ -392,6 +393,10 @@ fn two_requests_with_the_same_name_get_different_files() {
 #[test]
 fn a_name_with_no_usable_characters_still_gets_a_directory() {
     let collection = Collection {
+        service_name: None,
+        base_path: None,
+        deployments: Vec::new(),
+        scripts: Default::default(),
         name: "///".to_string(),
         description: None,
         auth: AuthSetting::Inherit,
@@ -480,6 +485,10 @@ fn writing_refuses_when_a_secret_would_leak() {
     // A secret value that also appears in a committed file is exactly the bug
     // the guard exists for.
     let collection = Collection {
+        service_name: None,
+        base_path: None,
+        deployments: Vec::new(),
+        scripts: Default::default(),
         name: "leaky".to_string(),
         description: None,
         auth: AuthSetting::Inherit,
@@ -490,6 +499,7 @@ fn writing_refuses_when_a_secret_would_leak() {
         }],
         items: vec![Item {
             name: "r".to_string(),
+            scripts: Default::default(),
             auth: AuthSetting::Inherit,
             variables: Vec::new(),
             request: Some(RequestDef {

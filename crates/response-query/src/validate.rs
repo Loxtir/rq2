@@ -2,7 +2,7 @@
 
 use crate::diag::Diag;
 use crate::schema::{Schema, SchemaKind};
-use crate::syntax::Selection;
+use crate::syntax::{Field, Selection, Step};
 
 pub fn validate(sel: &Selection, schema: &Schema) -> Vec<Diag> {
     let mut out = Vec::new();
@@ -11,12 +11,16 @@ pub fn validate(sel: &Selection, schema: &Schema) -> Vec<Diag> {
 }
 
 fn walk(sel: &Selection, schema: &Schema, out: &mut Vec<Diag>) {
+    walk_fields(&sel.fields, schema, out, false);
+}
+
+fn walk_fields(selection: &[Field], schema: &Schema, out: &mut Vec<Diag>, filter_path: bool) {
     let node = unwrap_arrays(schema);
     let SchemaKind::Object(fields) = &node.kind else {
         return;
     };
 
-    for field in &sel.fields {
+    for field in selection {
         if field.is_wildcard() || field.excluded {
             continue;
         }
@@ -38,6 +42,74 @@ fn walk(sel: &Selection, schema: &Schema, out: &mut Vec<Diag>) {
             }
             Some(schema_field) => {
                 let target = unwrap_arrays(&schema_field.schema);
+
+                if let (Some(edge), SchemaKind::Object(properties)) =
+                    (&field.recursive_edge, &target.kind)
+                {
+                    match properties.get(edge) {
+                        Some(child)
+                            if !matches!(
+                                unwrap_arrays(&child.schema).kind,
+                                SchemaKind::Object(_) | SchemaKind::Any
+                            ) =>
+                        {
+                            out.push(Diag::new(
+                                format!(
+                                    "recursive edge `{edge}` is not an object or list of objects"
+                                ),
+                                field.span,
+                            ));
+                        }
+                        None if !target.open => {
+                            let hint = suggest(edge, properties.keys())
+                                .map(|name| format!(" — did you mean `{name}`?"))
+                                .unwrap_or_default();
+                            out.push(Diag::new(
+                                format!("recursive edge `{edge}` is not a field here{hint}"),
+                                field.span,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+
+                if filter_path
+                    && field.selection.is_some()
+                    && matches!(schema_field.schema.kind, SchemaKind::Array(_))
+                {
+                    out.push(Diag::new(
+                        format!(
+                            "`{}` is an array; a nested filter path needs an object",
+                            field.name
+                        ),
+                        field.span,
+                    ));
+                    continue;
+                }
+
+                for step in &field.steps {
+                    if let Step::Filter(predicate) = step {
+                        if !matches!(
+                            schema_field.schema.kind,
+                            SchemaKind::Array(_) | SchemaKind::Any
+                        ) {
+                            out.push(Diag::new(
+                                format!(
+                                    "`{}` is not a list, so `[? ...]` has nothing to filter",
+                                    field.name
+                                ),
+                                field.span,
+                            ));
+                        } else {
+                            walk_fields(
+                                std::slice::from_ref(predicate),
+                                &schema_field.schema,
+                                out,
+                                true,
+                            );
+                        }
+                    }
+                }
 
                 if (field.recursive || field.tree_recursive)
                     && !matches!(target.kind, SchemaKind::Object(_) | SchemaKind::Any)
@@ -75,7 +147,7 @@ fn walk(sel: &Selection, schema: &Schema, out: &mut Vec<Diag>) {
                 if let Some(sub) = &field.selection {
                     match &target.kind {
                         SchemaKind::Object(_) | SchemaKind::Any => {
-                            walk(sub, &schema_field.schema, out);
+                            walk_fields(&sub.fields, &schema_field.schema, out, filter_path);
                         }
                         _ => out.push(Diag::new(
                             format!(

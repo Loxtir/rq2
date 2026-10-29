@@ -30,6 +30,16 @@ pub fn masked_variables(
     globals: &[Variable],
     path: &[usize],
 ) -> Variables {
+    masked_variables_for_target(collection, environment, globals, path, None)
+}
+
+pub fn masked_variables_for_target(
+    collection: &Collection,
+    environment: Option<&Environment>,
+    globals: &[Variable],
+    path: &[usize],
+    target: Option<&crate::deployment::Target>,
+) -> Variables {
     let mut variables = send::raw_variables(collection, environment, globals, path);
 
     let none: &[Variable] = &[];
@@ -46,6 +56,9 @@ pub fn masked_variables(
         }
     }
 
+    if let Some(target) = target {
+        target.insert_into(&mut variables);
+    }
     send::expand(variables)
 }
 

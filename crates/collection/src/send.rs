@@ -89,7 +89,21 @@ pub fn variables(
     globals: &[Variable],
     path: &[usize],
 ) -> Variables {
-    expand(raw_variables(collection, environment, globals, path))
+    variables_for_target(collection, environment, globals, path, None)
+}
+
+pub fn variables_for_target(
+    collection: &Collection,
+    environment: Option<&Environment>,
+    globals: &[Variable],
+    path: &[usize],
+    target: Option<&crate::deployment::Target>,
+) -> Variables {
+    let mut variables = raw_variables(collection, environment, globals, path);
+    if let Some(target) = target {
+        target.insert_into(&mut variables);
+    }
+    expand(variables)
 }
 
 /// The merged layers before expansion, so the cURL renderer can replace a

@@ -1,0 +1,14 @@
+name: Get menu
+description: Preview-only request. The fictional .example.test destination has no server.
+method: GET
+url: '{{baseUrl}}/navigation/menu'
+params:
+  - name: locale
+    value: en-GB
+headers:
+  - name: Accept
+    value: application/json
+  - name: X-Tenant
+    value: '{{tenant}}'
+  - name: X-Slot
+    value: '{{slot}}'

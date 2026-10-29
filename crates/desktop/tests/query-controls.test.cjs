@@ -17,6 +17,7 @@ async function checkQueryControls() {
   document.body.append(result);
   const check = (condition, message) => { if (!condition) throw new Error(message); };
   try {
+    await boot();
     const query = "{\n  # keep the comment on its own line\n  id\n  title\n}";
     const node = { kind: "request", name: "First", method: "GET", url: "https://api.test", queries: { Brief: query } };
     const collection = { slug: "queries", name: "Queries", items: [node] };
@@ -63,6 +64,48 @@ async function checkQueryControls() {
     await new Promise((resolve) => setTimeout(resolve, 50));
     check($("query").getBoundingClientRect().height > singleLineHeight * 3, "multiline queries must expand the editor");
     check(window.calls.some((call) => call.command === "project_body" && call.args.query === query), "selection must apply the exact multiline query");
+    collection.variables = [{ name: "myVar", value: "2762467" }];
+    const colored = '{ payload {\n items[? definition { item_id { value == "{{myVar}}" } }] { definition { item_id attributes } }\n} }';
+    $("query").value = colored;
+    queryEdited();
+    const layer = $("query").parentElement.querySelector(".varlayer");
+    check(layer && layer.textContent === colored, "query highlighting must preserve every source character");
+    check($("query").parentElement.classList.contains("syntax-editor"), "query must use the native-textarea syntax overlay");
+    check(layer.querySelector('[data-name="myVar"]')?.textContent === "{{myVar}}", "query variables must use the shared hover tokens");
+    $("query").focus();
+    $("query").setSelectionRange(0, 0);
+    paintVariables($("query"));
+    const pair = layer.querySelectorAll(".query-match");
+    check(pair.length === 2, "the caret's matching braces must be underlined");
+    check(getComputedStyle(pair[0]).color === getComputedStyle(pair[1]).color, "matching braces must have the same depth color");
+    check(getComputedStyle(pair[0]).textDecorationLine === "underline", "matching braces need a visible underline");
+    const editorStyle = getComputedStyle($("query"));
+    const layerStyle = getComputedStyle(layer);
+    for (const property of ["fontFamily", "fontSize", "lineHeight", "paddingTop", "paddingLeft", "tabSize"]) {
+      check(editorStyle[property] === layerStyle[property], `query overlay must align ${property}`);
+    }
+    showVariable("myVar", $("query").getBoundingClientRect());
+    check($("var-value").value === "2762467", "query variables must share the existing variable card");
+    check(!$("var-save"), "automatic variable editing must not require an Apply button");
+    check($("var-cancel").textContent === "Close", "closing the variable editor must not imply cancelling applied edits");
+    const originalSaveVariable = saveVariable;
+    let automaticEdits = 0;
+    saveVariable = async () => { automaticEdits++; };
+    $("var-value").value = "2762468";
+    $("var-value").dispatchEvent(new Event("input", { bubbles: true }));
+    saveVariable = originalSaveVariable;
+    check(automaticEdits === 1, "typing a variable value must apply it automatically without a click or blur");
+    check(!$("var-popover").hidden, "typing must leave the variable editor open");
+    hideVariable();
+    $("query").value = '{\n' + '  id\n'.repeat(30) + '}';
+    queryEdited();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    $("query").scrollTop = 90;
+    $("query").dispatchEvent(new Event("scroll"));
+    check(layer.scrollTop === $("query").scrollTop && layer.scrollTop > 0, "query highlighting must follow textarea scrolling");
+    $("query").value = '{ html == "<img src=x onerror=alert(1)>" }';
+    queryEdited();
+    check(!layer.querySelector("img"), "query highlighting must never interpret HTML");
     $("query-name").value = "Tree";
     $("query").value = "{ children** { id } }";
     storeQuery();
@@ -85,6 +128,43 @@ async function checkQueryControls() {
       for (const control of main.children) check(control.getBoundingClientRect().height > 0, "query control is not visible");
       for (const control of main.children) check(Math.abs(control.getBoundingClientRect().height - 28) <= 1, "query controls must have matching compact heights");
     }
+    collection.service_name = "navsvc";
+    collection.deployments = [
+      { tenant: "acme", platform: "stage-a", slot: "candidate" },
+      { tenant: "globex", platform: "stage-b", slot: "stable" },
+    ];
+    state.workspace.environments[1].platforms = [
+      { name: "stage-a", url_template: "https://{{serviceName}}-{{slot}}.stage-a.test/{{tenant}}" },
+      { name: "stage-b", url_template: "https://{{tenant}}.stage-b.test/{{serviceName}}" },
+    ];
+    openRequest(node, collection, [0], true);
+    check(!$("deployment-bar").hidden, "deployment controls must show for a service collection");
+    check($("send").disabled, "sending must wait for an explicit deployment selection");
+    $("deployment-tenant").value = "acme";
+    changeDeployment(true);
+    $("deployment-target").value = JSON.stringify(collection.deployments[0]);
+    changeDeployment();
+    check(!$("send").disabled, "a configured deployment must enable sending");
+    check($("deployment-destination").textContent === "https://navsvc-candidate.stage-a.test/acme", "resolved deployment destination must be visible");
+    for (const id of ["deployment-tenant", "deployment-target"]) {
+      const style = getComputedStyle($(id));
+      check(style.backgroundColor === themed.backgroundColor && style.colorScheme === "dark", `${id} must use dark controls and native popups`);
+    }
+    const deploymentBar = $("deployment-bar");
+    deploymentBar.style.width = "340px";
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    check(deploymentBar.scrollWidth <= deploymentBar.clientWidth + 1, "deployment controls must wrap without overflow");
+    collection.base_path = "/{{tenant == 'acme' ? serviceName : 'shared'}}-{{slot}}";
+    state.workspace.environments[1].platforms[0].url_template = "https://{{serviceName}}.stage-a.test{{basePath}}";
+    renderDeployments();
+    updateSendButton();
+    check($("send").disabled, "conditional base paths must wait for backend resolution");
+    await refreshPreview();
+    check(!$("send").disabled, "a backend-resolved base path must enable sending");
+    check($("deployment-destination").textContent === "https://navsvc.stage-a.test/navsvc-candidate", "the destination must use the backend-resolved base path");
+    showVariable("basePath", $("url").getBoundingClientRect());
+    check($("var-value").value === "/navsvc-candidate" && $("var-value").readOnly, "generated basePath must be visible and read-only");
+    check($("var-value").readOnly, "generated basePath must not allow automatic variable edits");
     result.textContent = JSON.stringify({ ok: true });
   } catch (error) {
     result.textContent = JSON.stringify({ error: error.message });
@@ -100,6 +180,17 @@ test("saved-query controls preserve multiline queries and fit narrow panes in Ed
     const app = fs.readFileSync(path.join(ui, "app.js"), "utf8").replace(/\nboot\(\);\s*$/, "\n");
     const setup = `window.calls = []; window.__TAURI__ = { core: { invoke: async (command, args) => {
       window.calls.push({command, args});
+      if (command === "initial_workspace") return null;
+      if (command === "curl_preview" && args.deployment) {
+        const collection = state.workspace.collections.find((item) => item.slug === args.collection);
+        if (collection.base_path != null) {
+          const basePath = "/navsvc-" + args.deployment.slot;
+          return { text: "curl https://navsvc.stage-a.test" + basePath, masked: false, deployment: {
+            ...args.deployment, service_name: collection.service_name, environment: args.environment,
+            base_path: basePath, base_url: "https://navsvc.stage-a.test" + basePath,
+          } };
+        }
+      }
       return command === "curl_preview" ? { text: "curl https://api.test", masked: false } : { text: '{"id":1}', bytes: 8, elapsed_ms: 0 };
     } } };`;
     const html = fs.readFileSync(path.join(ui, "index.html"), "utf8")

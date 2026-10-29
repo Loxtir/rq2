@@ -62,6 +62,7 @@ fn unwrap_arrays(schema: &Schema) -> &Schema {
 fn is_expressible(name: &str) -> bool {
     !name.is_empty()
         && !name.chars().any(|c| {
-            matches!(c, '{' | '}' | ':' | '[' | ']' | '!' | '*' | ',' | '#') || c.is_whitespace()
+            matches!(c, '{' | '}' | ':' | '[' | ']' | '!' | '*' | ',' | '#' | '=')
+                || c.is_whitespace()
         })
 }

@@ -74,6 +74,9 @@ pub fn parse_collection(bytes: &[u8], extra_secrets: &[String]) -> Result<Parsed
     Ok(Parsed {
         collection: Collection {
             name,
+            service_name: None,
+            base_path: None,
+            deployments: Vec::new(),
             description: text_of(info.and_then(|i| i.get("description"))),
             auth: parse_auth(doc.get("auth"), &mut warnings),
             variables,
@@ -109,6 +112,7 @@ pub fn parse_environment(
     Ok(ParsedEnvironment {
         environment: Environment {
             name: name.to_string(),
+            platforms: Vec::new(),
             // Nothing in a Postman export records this; it was an app-level
             // setting there, so it defaults to verifying.
             insecure: false,

@@ -1,6 +1,7 @@
 // Small, error-tolerant lexers: highlighting must work while code is incomplete.
 // Parts retain the exact source text; the editor renders them with text nodes.
-function syntaxParts(text, language) {
+function syntaxParts(text, language, caret = null) {
+  if (language === "query") return querySyntaxParts(text, caret);
   if (!language) return [{ text, kind: "" }];
   const pattern = language === "json"
     ? /(?<comment>\/\/[^\r\n]*)|(?<variable>\{\{[^{}]+\}\})|(?<string>"(?:\\[\s\S]|[^"\\])*"?)|(?<number>-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)|(?<literal>\b(?:true|false|null)\b)|(?<punctuation>[{}\[\],:])/g
@@ -27,6 +28,54 @@ function syntaxParts(text, language) {
     at = match.index + match[0].length;
   }
   if (at < text.length) parts.push({ text: text.slice(at), kind: "" });
+  return parts;
+}
+
+function querySyntaxParts(text, caret) {
+  const pattern = /(?<comment>#[^\r\n]*)|(?<string>"(?:\\[\s\S]|[^"\\])*"?)|(?<variable>\{\{[^{}]+\}\})|(?<operator>==|!=|\.\.\.|\*\*|[!?*:])|(?<bracket>[{}\[\]])|(?<number>-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)|(?<name>[^\s{}\[\]:!*#=,?".]+(?:\.(?!\.\.)[^\s{}\[\]:!*#=,?".]*)*)/g;
+  const parts = [];
+  const stack = [];
+  const brackets = [];
+  let at = 0;
+  for (const match of text.matchAll(pattern)) {
+    if (match.index > at) parts.push({ text: text.slice(at, match.index), kind: "" });
+    const type = Object.keys(match.groups).find((key) => match.groups[key] !== undefined);
+    let kind = type === "string" ? "json-string"
+      : type === "comment" ? "syntax-comment"
+      : type === "number" ? "json-number"
+      : type === "operator" ? "syntax-keyword" : "";
+    if (type === "name") {
+      kind = ["in", "not"].includes(match[0]) ? "syntax-keyword"
+        : match[0] === "null" ? "json-null"
+        : ["true", "false"].includes(match[0]) ? "json-boolean" : "json-key";
+    }
+    const part = { text: match[0], kind };
+    if (type === "bracket") {
+      const bracket = { part, offset: match.index, partner: null };
+      const opening = "{[".includes(match[0]);
+      const top = stack[stack.length - 1];
+      if (opening) {
+        part.kind = `query-bracket-${stack.length % 6}`;
+        stack.push(bracket);
+      } else if (top && "{[".indexOf(top.part.text) === "}]".indexOf(match[0])) {
+        stack.pop();
+        part.kind = top.part.kind;
+        bracket.partner = top;
+        top.partner = bracket;
+      } else part.kind = "query-unmatched";
+      brackets.push(bracket);
+    }
+    parts.push(part);
+    at = match.index + match[0].length;
+  }
+  if (at < text.length) parts.push({ text: text.slice(at), kind: "" });
+  for (const bracket of stack) bracket.part.kind += " query-unmatched";
+  const active = brackets.find((bracket) => bracket.offset === caret)
+    || brackets.find((bracket) => bracket.offset === caret - 1 && caret !== null);
+  if (active?.partner) {
+    active.part.kind += " query-match";
+    active.partner.part.kind += " query-match";
+  }
   return parts;
 }
 

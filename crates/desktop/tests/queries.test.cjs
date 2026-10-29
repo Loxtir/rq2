@@ -42,7 +42,7 @@ function harness(confirm = true, invoke) {
   const source = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
   vm.runInContext(source.replace(/\nboot\(\);\s*$/, "\n"), context);
   vm.runInContext(`
-    for (const name of ["hideVariable", "paintVariables", "renderParams", "renderHeaders",
+    for (const name of ["hideVariable", "withVariables", "paintVariables", "renderParams", "renderHeaders",
       "renderBody", "renderRequestAuth", "updateAuthTag", "markSelected", "renderRequestTabs",
       "updateSendButton", "refreshPreview", "updateMethodSelectStyle", "renderResponseText", "renderWorkspace", "repaintVariables"]) {
       globalThis[name] = () => {};
@@ -85,6 +85,232 @@ test("selecting a query projects the current response without sending HTTP", asy
   assert.equal(h.calls[0].args.id, 7);
   assert.equal(h.calls[0].args.query, "{ id }");
   assert.equal(h.state.requestTabs[0].query, "{ id }");
+});
+
+test("query variables stay as placeholders in saves and both projection IPC paths", async () => {
+  const h = harness();
+  h.state.env = "Stage";
+  h.state.response = { id: 7, bytes: 20 };
+  const query = '{ items[? definition { item_id { value == "{{myVar}}" } }] { definition { item_id attributes } } }';
+  h.element("query").value = query;
+  h.element("query-name").value = "By ID";
+  h.context.storeQuery();
+  assert.equal(h.context.draftForIpc().queries["By ID"], query);
+  await h.context.applyQuery();
+  await h.context.saveResponse();
+  for (const command of ["project_body", "save_response"]) {
+    const call = h.calls.find((call) => call.command === command);
+    assert.equal(call.args.query, query);
+    assert.deepEqual(JSON.parse(JSON.stringify(call.args.context)), {
+      collection: "queries", path: [0], environment: "Stage", deployment: null,
+    });
+    assert.equal(Object.hasOwn(call.args, "variables"), false);
+  }
+});
+
+test("live values are scoped overrides, not a highest-priority layer or saved defaults", () => {
+  const h = harness();
+  const collection = h.state.workspace.collections[0];
+  collection.variables = [{ name: "id", value: "saved", has_value: true }];
+  h.nodes[0].variables = [{ name: "id", value: "request", has_value: true }];
+  h.state.workspace.live_variables = [{ scope: { kind: "collection", collection: "queries" },
+    variable: { name: "id", value: "local", has_value: true } }];
+  assert.equal(h.context.variableInfo("id").value, "request");
+  h.open(1);
+  assert.equal(h.context.variableInfo("id").value, "local");
+  assert.equal(h.context.variableInfo("id").live, true);
+  assert.equal(collection.variables[0].value, "saved");
+  h.state.workspace.live_variables.push({ scope: { kind: "environment", environment: "Stage" },
+    variable: { name: "envOnly", value: "stage-local", has_value: true } });
+  h.state.workspace.environments = [{ name: "Stage", variables: [] }, { name: "Dev", variables: [] }];
+  h.state.env = "Stage";
+  assert.equal(h.context.variableInfo("envOnly").value, "stage-local");
+  h.state.env = "Dev";
+  assert.equal(h.context.variableInfo("envOnly").defined, false);
+});
+
+test("applying a live value leaves collection drafts and Save payloads unchanged and reapplies the query", async () => {
+  let h;
+  h = harness(true, (command, args) => {
+    assert.equal(command, "set_variable");
+    const workspace = JSON.parse(JSON.stringify(h.state.workspace));
+    workspace.live_variables = [{ scope: { kind: "collection", collection: "queries" },
+      variable: { name: args.edit.name, value: args.edit.value, has_value: true } }];
+    return workspace;
+  });
+  h.state.workspace.collections[0].variables = [{ name: "id", value: "saved", has_value: true }];
+  vm.runInContext(`varHoverName = "id";
+    drafts.set("collection:queries:", { draft: { variables: [{ name: "id", value: "saved" }] }, saved: "unchanged" });
+    applyQuery = () => { globalThis.queryApplied = true; };`, h.context);
+  const before = vm.runInContext('JSON.stringify(drafts.get("collection:queries:"))', h.context);
+  const request = JSON.stringify(h.context.draftForIpc());
+  h.state.response = { id: 7 };
+  h.element("var-value").value = "current";
+  await h.context.saveVariable();
+  assert.equal(h.context.variableInfo("id").value, "current");
+  assert.equal(h.context.queryApplied, true);
+  assert.equal(h.state.workspace.collections[0].variables[0].value, "saved");
+  assert.equal(vm.runInContext('JSON.stringify(drafts.get("collection:queries:"))', h.context), before);
+  assert.equal(JSON.stringify(h.context.draftForIpc()), request);
+  assert.equal(h.calls[0].args.edit.reset, false);
+});
+
+test("reset clears a local-only value without writing a shared default", async () => {
+  let h;
+  h = harness(true, (_command, args) => {
+    assert.equal(args.edit.reset, true);
+    return { ...h.state.workspace, live_variables: [] };
+  });
+  h.state.workspace.live_variables = [{ scope: { kind: "collection", collection: "queries" },
+    variable: { name: "new", value: "local", has_value: true } }];
+  vm.runInContext('varHoverName = "new";', h.context);
+  await h.context.saveVariable(true);
+  assert.equal(h.context.variableInfo("new").defined, false);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0].command, "set_variable");
+});
+
+test("secret live edits omit unchanged values and generated deployment inputs cannot be edited", async () => {
+  let h;
+  h = harness(true, (_command, args) => {
+    assert.equal(args.edit.value, null);
+    assert.equal(args.edit.secret, true);
+    return h.state.workspace;
+  });
+  h.state.workspace.collections[0].variables = [{ name: "token", value: null, has_value: true, secret: true }];
+  vm.runInContext('varHoverName = "token";', h.context);
+  await h.context.saveVariable();
+  assert.equal(h.calls.length, 1);
+  h.state.workspace.collections[0].service_name = "demo";
+  vm.runInContext('varHoverName = "tenant";', h.context);
+  await h.context.saveVariable();
+  assert.equal(h.calls.length, 1);
+});
+
+test("rapid automatic edits are serialized and keep the latest typed value without closing the editor", async () => {
+  const pending = [];
+  let h;
+  h = harness(true, (command, args) => {
+    assert.equal(command, "set_variable");
+    return new Promise((resolve) => pending.push(() => resolve({ ...h.state.workspace,
+      live_variables: [{ scope: { kind: "collection", collection: "queries" },
+        variable: { name: "id", value: args.edit.value, has_value: true } }] })));
+  });
+  h.state.workspace.collections[0].variables = [{ name: "id", value: "saved", has_value: true }];
+  vm.runInContext('varHoverName = "id"; hideVariable = () => { globalThis.editorClosed = true; };', h.context);
+  h.element("var-value").value = "a";
+  const first = h.context.saveVariable();
+  h.element("var-value").value = "ab";
+  const second = h.context.saveVariable();
+  await new Promise(setImmediate);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0].args.edit.value, "a");
+  pending.shift()();
+  await first;
+  await new Promise(setImmediate);
+  assert.equal(h.calls.length, 2);
+  assert.equal(h.calls[1].args.edit.value, "ab");
+  pending.shift()();
+  await second;
+  assert.equal(h.context.variableInfo("id").value, "ab");
+  assert.equal(h.element("var-value").value, "ab");
+  assert.equal(h.context.editorClosed, undefined);
+});
+
+test("query and response export wait for automatic variable writes, including newer typing", async () => {
+  const pending = [];
+  let h;
+  h = harness(true, (command, args) => {
+    if (command === "set_variable") return new Promise((resolve) => pending.push(() => resolve({ ...h.state.workspace,
+      live_variables: [{ scope: { kind: "collection", collection: "queries" },
+        variable: { name: "id", value: args.edit.value, has_value: true } }] })));
+    if (command === "save_response") return true;
+    return { text: '{"id":"ab"}', bytes: 11, elapsed_ms: 0 };
+  });
+  h.state.workspace.collections[0].variables = [{ name: "id", value: "saved", has_value: true }];
+  vm.runInContext('varHoverName = "id";', h.context);
+  h.element("var-value").value = "a";
+  const first = h.context.saveVariable();
+  h.state.response = { id: 7, bytes: 20 };
+  h.element("query").value = '{ id == "{{id}}" }';
+  const projected = h.context.applyQuery();
+  const exported = h.context.saveResponse();
+  h.element("var-value").value = "ab";
+  const second = h.context.saveVariable();
+  await new Promise(setImmediate);
+  assert.deepEqual(h.calls.map((call) => call.command), ["set_variable"]);
+  pending.shift()();
+  await first;
+  await new Promise(setImmediate);
+  assert.deepEqual(h.calls.map((call) => call.command), ["set_variable", "set_variable"]);
+  pending.shift()();
+  await Promise.all([second, projected, exported]);
+  assert.ok(h.calls.some((call) => call.command === "project_body"));
+  assert.ok(h.calls.some((call) => call.command === "save_response"));
+  assert.equal(h.context.variableInfo("id").value, "ab");
+});
+
+test("queued edits keep their original scope and cannot replace a different workspace", async () => {
+  let finish;
+  const h = harness(true, () => new Promise((resolve) => { finish = resolve; }));
+  h.state.workspace.collections[0].variables = [{ name: "id", value: "saved", has_value: true }];
+  vm.runInContext('varHoverName = "id";', h.context);
+  h.element("var-value").value = "new";
+  h.state.env = "Stage";
+  const edit = h.context.saveVariable();
+  h.state.selection.path = [1];
+  h.state.env = "Dev";
+  const workspace = { path: "other-workspace", collections: [], environments: [] };
+  h.state.workspace = workspace;
+  await new Promise(setImmediate);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls[0].args.path)), [0]);
+  assert.equal(h.calls[0].args.environment, "Stage");
+  finish({ path: "test", collections: [] });
+  await edit;
+  assert.equal(h.state.workspace, workspace);
+});
+
+test("Send and cURL copy wait for automatic edits before using the live value", async () => {
+  let finish;
+  let h;
+  h = harness(true, (command) => {
+    if (command === "set_variable") return new Promise((resolve) => { finish = () => resolve(h.state.workspace); });
+    if (command === "send") throw new Error("stop after checking send order");
+    return true;
+  });
+  h.state.workspace.collections[0].variables = [{ name: "id", value: "saved", has_value: true }];
+  vm.runInContext('varHoverName = "id"; resetResponse = () => {}; showRequestError = () => {};', h.context);
+  h.element("var-value").value = "current";
+  const edit = h.context.saveVariable();
+  h.state.preview = "curl https://api.test";
+  const copied = h.context.copyCurl();
+  const sent = h.context.send();
+  await new Promise(setImmediate);
+  assert.deepEqual(h.calls.map((call) => call.command), ["set_variable"]);
+  finish();
+  await Promise.all([edit, copied, sent]);
+  assert.ok(h.calls.some((call) => call.command === "copy_curl"));
+  assert.ok(h.calls.some((call) => call.command === "send"));
+});
+
+test("automatic typing can clear a value even before a new local definition finishes saving", async () => {
+  const values = [];
+  let h;
+  h = harness(true, (_command, args) => {
+    values.push(args.edit.value);
+    return { ...h.state.workspace, live_variables: [{ scope: { kind: "collection", collection: "queries" },
+      variable: { name: "new", value: args.edit.value, has_value: true } }] };
+  });
+  vm.runInContext('varHoverName = "new";', h.context);
+  h.element("var-create").value = "collection";
+  h.element("var-value").value = "a";
+  const first = h.context.saveVariable();
+  h.element("var-value").value = "";
+  const second = h.context.saveVariable();
+  await Promise.all([first, second]);
+  assert.deepEqual(values, ["a", ""]);
+  assert.equal(h.context.variableInfo("new").value, "");
+  assert.equal(h.context.variableInfo("new").defined, true);
 });
 
 test("rapid query selection ignores stale errors from the previous projection", async () => {
@@ -308,14 +534,14 @@ test("editing or deleting an environment leaves the stored response intact", asy
   assert.equal(h.state.env, "");
 });
 
-test("Save to file sends only the response ID and current query to Rust", async () => {
+test("Save to file sends the response ID, query and scope identifiers, never response bytes or variable values", async () => {
   const h = harness(true, () => true);
   h.state.response = { id: 7, environment: "Dev" };
   h.element("query").value = "{ id title }";
   await h.context.saveResponse();
   assert.equal(h.calls.length, 1);
   assert.equal(h.calls[0].command, "save_response");
-  assert.deepEqual(Object.keys(h.calls[0].args).sort(), ["id", "query"]);
+  assert.deepEqual(Object.keys(h.calls[0].args).sort(), ["context", "id", "query"]);
   assert.equal(h.calls[0].args.id, 7);
   assert.equal(h.calls[0].args.query, "{ id title }");
   assert.equal(h.element("response-save-note").textContent, "Response saved.");

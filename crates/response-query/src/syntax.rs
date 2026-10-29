@@ -16,6 +16,8 @@
 //! Commas are optional separators, `#` starts a comment.
 
 use crate::diag::{Diag, Span};
+use crate::literal::ScalarLiteral;
+use crate::scan::{Scanner, MAX_DEPTH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
@@ -31,14 +33,26 @@ pub struct Field {
     pub recursive: bool,
     /// `children** { id }` — repeat the selection while retaining nested edges.
     pub tree_recursive: bool,
+    /// Optional descendant edge: `items...children` starts at items, then walks children.
+    pub recursive_edge: Option<String>,
     /// `!name` omits this key; `!name...` also omits it throughout this subtree.
     pub excluded: bool,
-    /// Brackets in source order. At most one slice and one collect.
+    /// Brackets in source order; a collect must come last.
     pub steps: Vec<Step>,
     /// `field!` — fail the projection if the response omits it.
     pub required: bool,
+    /// Compare the original field value before emitting or projecting it.
+    pub condition: Option<Condition>,
     pub selection: Option<Selection>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Condition {
+    Equal(ScalarLiteral),
+    NotEqual(ScalarLiteral),
+    In(Vec<ScalarLiteral>),
+    NotIn(Vec<ScalarLiteral>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +64,8 @@ pub struct Slice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     Slice(Slice),
+    /// `[? name == "Mike"]` or `[? profile { name == "Mike" }]`.
+    Filter(Field),
     /// `[id]` or `[{ id name }]` — project each element and flatten the
     /// results into a single array.
     Collect(Selection),
@@ -87,6 +103,7 @@ impl Selection {
             || field.tree_recursive
             || field.excluded
             || field.required
+            || field.condition.is_some()
             || !field.steps.is_empty()
             || field.selection.is_some()
         {
@@ -97,6 +114,10 @@ impl Selection {
 }
 
 impl Field {
+    pub fn edge(&self) -> &str {
+        self.recursive_edge.as_deref().unwrap_or(&self.name)
+    }
+
     pub fn is_wildcard(&self) -> bool {
         self.name == "*"
     }
@@ -104,14 +125,14 @@ impl Field {
     pub fn collect(&self) -> Option<&Selection> {
         self.steps.iter().find_map(|step| match step {
             Step::Collect(sel) => Some(sel),
-            Step::Slice(_) => None,
+            Step::Slice(_) | Step::Filter(_) => None,
         })
     }
 
     pub fn slice(&self) -> Option<Slice> {
         self.steps.iter().find_map(|step| match step {
             Step::Slice(slice) => Some(*slice),
-            Step::Collect(_) => None,
+            Step::Collect(_) | Step::Filter(_) => None,
         })
     }
 }
@@ -144,7 +165,11 @@ fn is_trivia(b: u8) -> bool {
 }
 
 fn is_delimiter(b: u8) -> bool {
-    is_trivia(b) || matches!(b, b'{' | b'}' | b':' | b'[' | b']' | b'!' | b'*' | b'#')
+    is_trivia(b)
+        || matches!(
+            b,
+            b'{' | b'}' | b':' | b'[' | b']' | b'!' | b'*' | b'#' | b'='
+        )
 }
 
 impl<'a> Parser<'a> {
@@ -170,8 +195,18 @@ impl<'a> Parser<'a> {
 
     fn skip_trivia(&mut self) {
         loop {
+            self.skip_space_and_comments();
+            if self.peek() != Some(b',') {
+                break;
+            }
+            self.pos += 1;
+        }
+    }
+
+    fn skip_space_and_comments(&mut self) {
+        loop {
             match self.peek() {
-                Some(b) if is_trivia(b) => self.pos += 1,
+                Some(b' ' | b'\t' | b'\r' | b'\n') => self.pos += 1,
                 Some(b'#') => {
                     while let Some(c) = self.peek() {
                         if c == b'\n' {
@@ -280,11 +315,29 @@ impl<'a> Parser<'a> {
 
         let mut recursive = false;
         let mut tree_recursive = false;
+        let mut recursive_edge = None;
         let mut required = false;
+        let mut condition = None;
         let mut steps: Vec<Step> = Vec::new();
 
         loop {
             self.skip_trivia();
+            if let Some(next) = self.condition()? {
+                if condition.is_some() {
+                    return Err(Diag::new(
+                        "only one comparison is allowed per field",
+                        self.span_from(start),
+                    ));
+                }
+                condition = Some(next);
+                continue;
+            }
+            if self.peek() == Some(b'=') {
+                return Err(Diag::new(
+                    "use `==` for equality or `!=` for inequality",
+                    Span::point(self.pos),
+                ));
+            }
             let flat = self.b[self.pos..].starts_with(b"...");
             let tree = self.b[self.pos..].starts_with(b"**");
             if flat || tree {
@@ -303,6 +356,9 @@ impl<'a> Parser<'a> {
                 recursive = flat;
                 tree_recursive = tree;
                 self.pos += if flat { 3 } else { 2 };
+                if self.peek().is_some_and(|byte| !is_delimiter(byte)) {
+                    recursive_edge = Some(self.ident()?.0);
+                }
                 continue;
             }
             match self.peek() {
@@ -327,13 +383,13 @@ impl<'a> Parser<'a> {
         for step in &steps {
             match step {
                 Step::Collect(_) => seen_collect = true,
-                Step::Slice(_) if seen_collect => {
+                Step::Slice(_) | Step::Filter(_) if seen_collect => {
                     return Err(Diag::new(
-                        "a slice must come before a collect: `items[0:5][id]`",
+                        "slices and filters must come before a collect: `items[? id == 1][0:5][id]`",
                         self.span_from(start),
                     ));
                 }
-                Step::Slice(_) => {}
+                Step::Slice(_) | Step::Filter(_) => {}
             }
         }
         if steps
@@ -355,11 +411,18 @@ impl<'a> Parser<'a> {
             None
         };
 
+        if condition.is_some()
+            && (name == "*" || excluded || recursive || tree_recursive || !steps.is_empty())
+        {
+            return Err(Diag::new("a comparison needs a named field, without exclusion, recursion or bracket suffixes; compare fields inside the selection instead", self.span_from(start)));
+        }
+
         if excluded
             && (name == "*"
                 || alias.is_some()
                 || required
                 || tree_recursive
+                || recursive_edge.is_some()
                 || !steps.is_empty()
                 || selection.is_some())
         {
@@ -368,11 +431,26 @@ impl<'a> Parser<'a> {
                 self.span_from(start),
             ));
         }
-        if tree_recursive && (selection.is_none() || !steps.is_empty()) {
+        if tree_recursive
+            && (selection.is_none() || steps.iter().any(|step| !matches!(step, Step::Filter(_))))
+        {
             return Err(Diag::new(
-                format!("`{name}**` needs a selection set, without slices or collects: `{name}** {{ field }}`"),
+                format!("`{name}**` needs a selection set, with only optional filters, not slices or collects: `{name}** {{ field }}`"),
                 self.span_from(start),
             ));
+        }
+        if recursive {
+            let mut sliced = false;
+            for step in &steps {
+                match step {
+                    Step::Slice(_) => sliced = true,
+                    Step::Filter(_) if sliced => return Err(Diag::new(
+                        "recursive filters must come before slices; the slice bounds the flattened matches",
+                        self.span_from(start),
+                    )),
+                    _ => {}
+                }
+            }
         }
         if recursive && !excluded && selection.is_none() && !seen_collect {
             return Err(Diag::new(
@@ -395,16 +473,121 @@ impl<'a> Parser<'a> {
             alias,
             recursive,
             tree_recursive,
+            recursive_edge,
             excluded,
             steps,
             required,
+            condition,
             selection,
             span: self.span_from(start),
         })
     }
 
+    fn keyword(&mut self, word: &[u8]) -> bool {
+        if self.b[self.pos..].starts_with(word)
+            && self
+                .b
+                .get(self.pos + word.len())
+                .is_none_or(|byte| is_delimiter(*byte))
+        {
+            self.pos += word.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn condition(&mut self) -> Result<Option<Condition>, Diag> {
+        for (operator, negate) in [(b"==", false), (b"!=", true)] {
+            if self.b[self.pos..].starts_with(operator) {
+                self.pos += 2;
+                let value = self.literal()?;
+                return Ok(Some(if negate {
+                    Condition::NotEqual(value)
+                } else {
+                    Condition::Equal(value)
+                }));
+            }
+        }
+        let start = self.pos;
+        let negate = if self.keyword(b"not") {
+            self.skip_trivia();
+            if !self.keyword(b"in") {
+                self.pos = start;
+                return Ok(None);
+            }
+            true
+        } else if self.keyword(b"in") {
+            // A standalone field named `in` is still legal. The operator needs
+            // its list, unlike ==/!= which cannot be field names.
+            let after = self.pos;
+            self.skip_trivia();
+            if self.peek() != Some(b'[') {
+                self.pos = start;
+                return Ok(None);
+            }
+            self.pos = after;
+            false
+        } else {
+            return Ok(None);
+        };
+        self.expect(b'[')?;
+        let mut values = Vec::new();
+        self.skip_space_and_comments();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+        } else {
+            loop {
+                values.push(self.literal()?);
+                self.skip_space_and_comments();
+                if self.peek() == Some(b']') {
+                    self.pos += 1;
+                    break;
+                }
+                if self.peek() != Some(b',') {
+                    return Err(Diag::new(
+                        "expected `,` or `]` in membership list",
+                        Span::point(self.pos),
+                    ));
+                }
+                self.pos += 1;
+            }
+        }
+        Ok(Some(if negate {
+            Condition::NotIn(values)
+        } else {
+            Condition::In(values)
+        }))
+    }
+
+    fn literal(&mut self) -> Result<ScalarLiteral, Diag> {
+        self.skip_space_and_comments();
+        let start = self.pos;
+        if self.peek() == Some(b'"') {
+            let mut scanner = Scanner::at(self.b, self.pos);
+            scanner.scan_string_raw()?;
+            self.pos = scanner.pos();
+        } else {
+            while self.peek().is_some_and(|byte| !is_delimiter(byte)) {
+                self.pos += 1;
+            }
+        }
+        ScalarLiteral::parse(&self.b[start..self.pos])
+            .map_err(|message| Diag::new(message, self.span_from(start)))
+    }
+
     fn bracket(&mut self) -> Result<Step, Diag> {
         let open = self.pos;
+        self.expect(b'[')?;
+        self.skip_trivia();
+        if self.peek() == Some(b'?') {
+            self.pos += 1;
+            let predicate = self.field()?;
+            self.check_predicate(&predicate)?;
+            self.expect(b']')?;
+            return Ok(Step::Filter(predicate));
+        }
+        self.pos = open;
         if self.slice_ahead() {
             self.expect(b'[')?;
             let start = self.opt_int()?;
@@ -440,6 +623,36 @@ impl<'a> Parser<'a> {
         Ok(Step::Collect(sel))
     }
 
+    fn check_predicate(&self, predicate: &Field) -> Result<(), Diag> {
+        let mut field = predicate;
+        for _ in 0..=MAX_DEPTH {
+            let invalid = || {
+                Diag::new(
+                "a filter needs one named field path ending in a condition, without aliases, required markers, exclusions, recursion, or brackets; for example `[? definition { item_id { value == \"2762467\" } }]`",
+                field.span,
+            )
+            };
+            if field.is_wildcard()
+                || field.alias.is_some()
+                || field.required
+                || field.excluded
+                || field.recursive
+                || field.tree_recursive
+                || !field.steps.is_empty()
+            {
+                return Err(invalid());
+            }
+            match (&field.condition, &field.selection) {
+                (Some(_), None) => return Ok(()),
+                (None, Some(selection)) if selection.fields.len() == 1 => {
+                    field = &selection.fields[0];
+                }
+                _ => return Err(invalid()),
+            }
+        }
+        Err(Diag::new("filter path nesting is too deep", predicate.span))
+    }
+
     /// Distinguishes `[a:b]` from `[id]` without backtracking: a colon at
     /// bracket depth zero means a slice.
     fn slice_ahead(&self) -> bool {
@@ -447,6 +660,20 @@ impl<'a> Parser<'a> {
         let mut i = self.pos + 1;
         while i < self.b.len() {
             match self.b[i] {
+                b'"' => {
+                    let mut scanner = Scanner::at(self.b, i);
+                    if scanner.scan_string_raw().is_err() {
+                        return false;
+                    }
+                    i = scanner.pos();
+                    continue;
+                }
+                b'#' => {
+                    while i < self.b.len() && self.b[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
                 b'{' | b'[' => depth += 1,
                 b']' if depth == 0 => return false,
                 b'}' | b']' => depth -= 1,

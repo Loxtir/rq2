@@ -1,0 +1,6 @@
+name: production
+platforms:
+  - name: prod-a
+    url_template: 'https://{{serviceName}}.prod-a.example.test/{{tenant}}/{{slot}}'
+  - name: prod-b
+    url_template: 'https://{{tenant}}-{{serviceName}}.prod-b.example.test/{{slot}}'

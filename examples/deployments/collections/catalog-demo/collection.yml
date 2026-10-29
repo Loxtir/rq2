@@ -1,0 +1,5 @@
+name: Catalog Demo
+service_name: shopsvc
+base_path: '/{{tenant == "north" ? serviceName : "legacysvc"}}-{{slot}}'
+description: Only the path's service name changes for non-north tenants. The hostname keeps shopsvc.
+auth: none

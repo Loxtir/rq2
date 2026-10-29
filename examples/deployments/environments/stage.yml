@@ -1,0 +1,8 @@
+name: stage
+platforms:
+  - name: stage-a
+    url_template: 'https://{{serviceName}}-{{slot}}.stage-a.example.test/{{tenant}}'
+  - name: stage-b
+    url_template: 'https://{{tenant}}.stage-b.example.test/{{serviceName}}/{{slot}}'
+  - name: stage-c
+    url_template: 'https://{{serviceName}}.{{tenant}}.{{platform}}.example.test{{basePath}}'
