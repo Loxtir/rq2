@@ -18,8 +18,38 @@ fn is_false(flag: &bool) -> bool {
     !*flag
 }
 
+/// A short random id, not in `taken`.
+pub fn fresh_id(taken: &std::collections::BTreeSet<String>) -> String {
+    use std::hash::{BuildHasher, Hasher};
+    loop {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        );
+        let id = format!("{:08x}", hasher.finish() as u32);
+        if !taken.contains(&id) {
+            return id;
+        }
+    }
+}
+
+/// Clears the ids of an item and everything in it, so a copy gets new ones.
+pub fn clear_ids(item: &mut Item) {
+    item.id.clear();
+    for child in &mut item.items {
+        clear_ids(child);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Collection {
+    /// Stable identity for per-user state (current values, history); never
+    /// changes with renames or reordering. Empty until first assigned.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
@@ -45,6 +75,9 @@ pub struct Collection {
 /// fights `serde(flatten)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Item {
+    /// Stable identity within the collection; see [`Collection::id`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     pub name: String,
     /// Only meaningful for folders: the auth requests underneath inherit.
     /// A request's own auth lives in its [`RequestDef`].
@@ -101,14 +134,46 @@ pub struct RequestDef {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Scripts {
-    /// Shared scripts from `scripts/<name>.yml`, run in this order before this
-    /// layer's own scripts and with this layer's scope.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub include: Vec<String>,
+    /// Shared scripts from `scripts/*.js`, by their `// @id`, run in this
+    /// order before this layer's own script of the same phase and with this
+    /// layer's scope.
+    #[serde(default, skip_serializing_if = "Includes::is_empty")]
+    pub include: Includes,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pre_request: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub post_response: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Includes {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pre_request: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_response: Vec<String>,
+}
+
+impl Includes {
+    pub fn is_empty(&self) -> bool {
+        self.pre_request.is_empty() && self.post_response.is_empty()
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.pre_request
+            .iter()
+            .chain(&self.post_response)
+            .any(|include| include == id)
+    }
+}
+
+/// `scripts/<name>.js`: one piece of code with a stable `// @id` on its first
+/// line. Layers include it by id, so renaming the file changes nothing else.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SharedScript {
+    pub id: String,
+    /// The file stem, for people; never used as a reference.
+    pub name: String,
+    pub code: String,
 }
 
 impl Scripts {
@@ -318,6 +383,58 @@ pub struct ResolvedRequest<'a> {
 }
 
 impl Collection {
+    /// The tree position of the folder or request with this id.
+    pub fn path_of(&self, id: &str) -> Option<Vec<usize>> {
+        fn walk(items: &[Item], id: &str, trail: &mut Vec<usize>) -> bool {
+            for (index, item) in items.iter().enumerate() {
+                trail.push(index);
+                if item.id == id || walk(&item.items, id, trail) {
+                    return true;
+                }
+                trail.pop();
+            }
+            false
+        }
+        let mut trail = Vec::new();
+        (!id.is_empty() && walk(&self.items, id, &mut trail)).then_some(trail)
+    }
+
+    /// The id of the folder or request at `path`, if it has one.
+    pub fn id_at(&self, path: &[usize]) -> Option<&str> {
+        let (last, parents) = path.split_last()?;
+        let mut items = &self.items;
+        for index in parents {
+            items = &items.get(*index)?.items;
+        }
+        Some(items.get(*last)?.id.as_str()).filter(|id| !id.is_empty())
+    }
+
+    /// Gives the collection and every folder and request without an id (or
+    /// with one already used earlier in the tree) a fresh one. Returns whether
+    /// anything changed.
+    pub fn assign_ids(&mut self) -> bool {
+        fn walk(items: &mut [Item], seen: &mut std::collections::BTreeSet<String>) -> bool {
+            let mut changed = false;
+            for item in items {
+                if item.id.is_empty() || !seen.insert(item.id.clone()) {
+                    item.id = fresh_id(seen);
+                    seen.insert(item.id.clone());
+                    changed = true;
+                }
+                changed |= walk(&mut item.items, seen);
+            }
+            changed
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut changed = false;
+        if self.id.is_empty() {
+            self.id = fresh_id(&seen);
+            changed = true;
+        }
+        seen.insert(self.id.clone());
+        walk(&mut self.items, &mut seen) || changed
+    }
+
     /// Depth-first walk over every request, with the folder trail and the
     /// effective auth. Used for reporting and, later, for the request list.
     pub fn requests(&self) -> Vec<ResolvedRequest<'_>> {
@@ -481,23 +598,20 @@ impl Collection {
         out
     }
 
-    /// Whether the collection, a folder or a request includes shared script
-    /// `name`.
-    pub fn includes(&self, name: &str) -> bool {
-        fn walk(items: &[Item], name: &str) -> bool {
+    /// Whether the collection, a folder or a request includes the shared
+    /// script with this id, in either phase.
+    pub fn includes(&self, id: &str) -> bool {
+        fn walk(items: &[Item], id: &str) -> bool {
             items.iter().any(|item| {
-                item.scripts.include.iter().any(|include| include == name)
-                    || item.request.as_ref().is_some_and(|request| {
-                        request
-                            .scripts
-                            .include
-                            .iter()
-                            .any(|include| include == name)
-                    })
-                    || walk(&item.items, name)
+                item.scripts.include.contains(id)
+                    || item
+                        .request
+                        .as_ref()
+                        .is_some_and(|request| request.scripts.include.contains(id))
+                    || walk(&item.items, id)
             })
         }
-        self.scripts.include.iter().any(|include| include == name) || walk(&self.items, name)
+        self.scripts.include.contains(id) || walk(&self.items, id)
     }
 
     /// The collection's scripts, then every folder's and request's.

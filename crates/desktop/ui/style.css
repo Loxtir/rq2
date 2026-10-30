@@ -457,6 +457,38 @@ select.select option {
   min-width: 0;
 }
 
+.collection-caret {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 20px;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: 4px;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+
+.collection-caret::before {
+  content: "";
+  border-left: 4px solid currentColor;
+  border-top: 3.5px solid transparent;
+  border-bottom: 3.5px solid transparent;
+  transition: transform 0.12s ease;
+}
+
+.collection-caret[aria-expanded="true"]::before {
+  transform: rotate(90deg);
+}
+
+.collection-caret:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+}
+
 .tree-add {
   margin-left: auto;
   padding: 0 6px;
@@ -2087,9 +2119,57 @@ body.right-closed .request-tabs {
 }
 
 .cell-check {
-  accent-color: var(--accent);
   justify-self: center;
   cursor: pointer;
+}
+
+input[type="checkbox"] {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-sunken);
+  display: inline-grid;
+  place-content: center;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+
+input[type="checkbox"]:hover {
+  border-color: var(--text-faint);
+}
+
+input[type="checkbox"]:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+input[type="checkbox"]::before {
+  content: "";
+  width: 4px;
+  height: 8px;
+  margin-top: -2px;
+  border: solid var(--bg);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg) scale(0);
+  transition: transform 0.1s;
+}
+
+input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+input[type="checkbox"]:checked::before {
+  transform: rotate(45deg) scale(1);
+}
+
+input[type="checkbox"]:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .add-row {
@@ -2222,6 +2302,46 @@ body.right-closed .request-tabs {
 .command-details > summary {
   display: list-item;
   cursor: pointer;
+}
+
+.console-details[open] {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.console-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+  font-size: 11px;
+}
+
+.console-output {
+  flex: 1 1 auto;
+  min-height: 60px;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  font-size: 11.5px;
+}
+
+.console-output .console-time {
+  color: var(--text-faint);
+}
+
+.console-output .console-warn {
+  color: var(--warn);
+}
+
+.console-output .console-error {
+  color: var(--error);
 }
 
 .summary {

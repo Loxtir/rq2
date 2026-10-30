@@ -27,9 +27,10 @@ pub(crate) fn write(root: &Path, edits: Vec<Entry>, reset: bool) -> Result<(), S
 }
 
 pub(crate) fn load(root: &Path) -> Result<store::Workspace, String> {
-    let mut workspace = store::load(root)?;
-    collection::live::apply(&mut workspace, &entries(root)?);
-    Ok(workspace)
+    match CONFIG.get() {
+        Some(values) => values.load(root),
+        None => store::load(root),
+    }
 }
 #[cfg(test)]
 mod tests {

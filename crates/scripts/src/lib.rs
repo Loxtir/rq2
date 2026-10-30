@@ -11,9 +11,10 @@ use boa_engine::value::JsValue;
 use boa_engine::{Context as JsContext, Source};
 use collection::context::RequestContext;
 use collection::live::{self, Entry, Scope};
-use collection::model::{Body, KeyValue, RequestDef, Scripts, Variable};
+use collection::model::{Body, KeyValue, RequestDef, Scripts, SharedScript, Variable};
 use collection::store::{self, Workspace};
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// Variable writes in the order scripts made them; a later one for the same
@@ -43,6 +44,10 @@ impl Layer {
             None => error,
         }
     }
+
+    fn label(&self) -> &str {
+        self.shared.as_deref().unwrap_or(&self.key)
+    }
 }
 
 pub struct Plan {
@@ -55,6 +60,9 @@ pub struct Plan {
     scopes: Vec<(String, Scope)>,
     insecure: bool,
     read_only: &'static [&'static str],
+    /// `console.*` output since the last [`Plan::take_logs`], kept even when a
+    /// script fails.
+    logs: Mutex<Vec<String>>,
 }
 
 impl Plan {
@@ -65,7 +73,7 @@ impl Plan {
         context: &RequestContext,
         path: &[usize],
         request: &RequestDef,
-        shared: &BTreeMap<String, Scripts>,
+        shared: &BTreeMap<String, SharedScript>,
     ) -> Result<Self, String> {
         let collection = context.collection;
         let slug = store::slugify(&collection.name);
@@ -116,15 +124,32 @@ impl Plan {
 
         let mut expanded = Vec::new();
         for (key, scripts) in layers {
-            for name in &scripts.include {
-                let included = shared.get(name).ok_or_else(|| {
-                    format!("`{key}` includes shared script `{name}`, but scripts/{name}.yml does not exist")
-                })?;
-                expanded.push(Layer {
-                    key: key.clone(),
-                    shared: Some(name.clone()),
-                    scripts: included.clone(),
-                });
+            let phases = [
+                (&scripts.include.pre_request, true),
+                (&scripts.include.post_response, false),
+            ];
+            for (ids, pre) in phases {
+                for id in ids {
+                    let included = shared.get(id).ok_or_else(|| {
+                        format!("`{key}` includes shared script `{id}`, but no scripts/*.js has `// @id {id}`")
+                    })?;
+                    let code = included.code.clone();
+                    expanded.push(Layer {
+                        key: key.clone(),
+                        shared: Some(included.name.clone()),
+                        scripts: if pre {
+                            Scripts {
+                                pre_request: code,
+                                ..Default::default()
+                            }
+                        } else {
+                            Scripts {
+                                post_response: code,
+                                ..Default::default()
+                            }
+                        },
+                    });
+                }
             }
             expanded.push(Layer {
                 key,
@@ -143,7 +168,26 @@ impl Plan {
             } else {
                 &[]
             },
+            logs: Mutex::default(),
         })
+    }
+
+    /// Script console lines, each prefixed with its phase and source.
+    pub fn take_logs(&self) -> Vec<String> {
+        self.logs
+            .lock()
+            .map(|mut logs| std::mem::take(&mut *logs))
+            .unwrap_or_default()
+    }
+
+    fn log(&self, phase: &str, layer: &Layer, lines: Vec<String>) {
+        if let Ok(mut logs) = self.logs.lock() {
+            logs.extend(
+                lines
+                    .into_iter()
+                    .map(|line| format!("[{phase} · {}] {line}", layer.label())),
+            );
+        }
     }
 
     pub fn has_post_response(&self) -> bool {
@@ -160,6 +204,7 @@ impl Plan {
     ) -> Result<Writes, String> {
         let mut writes = Vec::new();
         for layer in &self.layers {
+            let mut logs = Vec::new();
             let raw = run(
                 &layer.scripts.pre_request,
                 request,
@@ -167,8 +212,10 @@ impl Plan {
                 &layer.key,
                 self,
                 None,
-            )
-            .map_err(|error| layer.blame(error))?;
+                &mut logs,
+            );
+            self.log("pre-request", layer, logs);
+            let raw = raw.map_err(|error| layer.blame(error))?;
             writes.extend(self.typed(raw).map_err(|error| layer.blame(error))?);
         }
         Ok(writes)
@@ -185,16 +232,18 @@ impl Plan {
         let mut writes = Vec::new();
         let mut errors = Vec::new();
         for layer in &self.layers {
-            match run(
+            let mut logs = Vec::new();
+            let raw = run(
                 &layer.scripts.post_response,
                 request,
                 variables,
                 &layer.key,
                 self,
                 Some(response),
-            )
-            .and_then(|raw| self.typed(raw))
-            {
+                &mut logs,
+            );
+            self.log("post-response", layer, logs);
+            match raw.and_then(|raw| self.typed(raw)) {
                 Ok(typed) => writes.extend(typed),
                 Err(error) => errors.push(format!("{}: {}", layer.key, layer.blame(error))),
             }
@@ -270,6 +319,7 @@ fn run(
     scope: &str,
     plan: &Plan,
     response: Option<&Response>,
+    logs: &mut Vec<String>,
 ) -> Result<BTreeMap<String, BTreeMap<String, String>>, String> {
     if script.trim().is_empty() {
         return Ok(BTreeMap::new());
@@ -281,7 +331,7 @@ fn run(
             .name("rq-script".into())
             .stack_size(16 * 1024 * 1024)
             .spawn_scoped(threads, || {
-                run_here(script, request, variables, scope, plan, response)
+                run_here(script, request, variables, scope, plan, response, logs)
             })
             .map_err(|error| format!("starting the script engine: {error}"))?
             .join()
@@ -296,6 +346,7 @@ fn run_here(
     scope: &str,
     plan: &Plan,
     response: Option<&Response>,
+    logs: &mut Vec<String>,
 ) -> Result<BTreeMap<String, BTreeMap<String, String>>, String> {
     let mut initial = serde_json::json!({
         "request": request,
@@ -316,6 +367,46 @@ fn run_here(
     let initial_literal = serde_json::to_string(&initial_text).map_err(|e| e.to_string())?;
     let js = format!(
         r#"
+      globalThis.__rqLogs = [];
+      globalThis.console = (() => {{
+        const show = (v) => {{
+          if (typeof v === 'string') return v;
+          if (v instanceof Error) return String(v);
+          try {{ const s = JSON.stringify(v); return s === undefined ? String(v) : s; }} catch (_) {{ return String(v); }}
+        }};
+        const write = (level) => (...args) => globalThis.__rqLogs.push((level ? level + ': ' : '') + args.map(show).join(' '));
+        return {{ log: write(''), info: write(''), debug: write(''), warn: write('warn'), error: write('error') }};
+      }})();
+      if (typeof globalThis.btoa !== 'function') {{
+        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+        globalThis.btoa = (input) => {{
+          const s = String(input);
+          let out = '';
+          for (let i = 0; i < s.length; i += 3) {{
+            const a = s.charCodeAt(i), b = s.charCodeAt(i + 1), c = s.charCodeAt(i + 2);
+            if (a > 255 || b > 255 || c > 255) throw new Error('btoa: string contains characters outside Latin-1');
+            const n = (a << 16) | ((b || 0) << 8) | (c || 0);
+            out += chars[n >> 18 & 63] + chars[n >> 12 & 63]
+              + (i + 1 < s.length ? chars[n >> 6 & 63] : '=')
+              + (i + 2 < s.length ? chars[n & 63] : '=');
+          }}
+          return out;
+        }};
+        globalThis.atob = (input) => {{
+          const s = String(input).replace(/[\s=]/g, '');
+          if (/[^A-Za-z0-9+/]/.test(s) || s.length % 4 === 1) throw new Error('atob: invalid base64');
+          let out = '';
+          for (let i = 0; i < s.length; i += 4) {{
+            const n = (chars.indexOf(s[i]) << 18) | (chars.indexOf(s[i + 1]) << 12)
+              | ((i + 2 < s.length ? chars.indexOf(s[i + 2]) : 0) << 6)
+              | (i + 3 < s.length ? chars.indexOf(s[i + 3]) : 0);
+            out += String.fromCharCode(n >> 16 & 255);
+            if (i + 2 < s.length) out += String.fromCharCode(n >> 8 & 255);
+            if (i + 3 < s.length) out += String.fromCharCode(n & 255);
+          }}
+          return out;
+        }};
+      }}
       globalThis.__rqExecution = (async function() {{
         const __rq = JSON.parse({initial_literal});
         const stringify = (v) => typeof v === 'string' ? v : JSON.stringify(v);
@@ -393,7 +484,7 @@ fn run_here(
     context.run_jobs().map_err(|error| error.to_string())?;
     let value = context
         .eval(Source::from_bytes(
-            b"JSON.stringify({result:globalThis.__rqResult,error:globalThis.__rqError})",
+            b"JSON.stringify({result:globalThis.__rqResult,error:globalThis.__rqError,logs:globalThis.__rqLogs})",
         ))
         .map_err(|e| e.to_string())?;
     let output = value
@@ -402,6 +493,13 @@ fn run_here(
         .to_std_string_escaped();
     let output: serde_json::Value =
         serde_json::from_str(&output).map_err(|e| format!("script result: {e}"))?;
+    if let Some(lines) = output["logs"].as_array() {
+        logs.extend(
+            lines
+                .iter()
+                .filter_map(|line| line.as_str().map(String::from)),
+        );
+    }
     if let Some(error) = output["error"].as_str() {
         return Err(error.to_string());
     }
@@ -416,45 +514,7 @@ fn run_here(
 fn send_script_request(payload: &str) -> Result<serde_json::Value, String> {
     let payload: serde_json::Value =
         serde_json::from_str(payload).map_err(|error| error.to_string())?;
-    let spec = &payload["request"];
-    let url = spec
-        .as_str()
-        .or_else(|| spec["url"].as_str())
-        .or_else(|| spec["url"]["raw"].as_str())
-        .unwrap_or_default();
-    let mut request = RequestDef {
-        method: spec["method"].as_str().unwrap_or("GET").to_uppercase(),
-        url: url.to_string(),
-        ..Default::default()
-    };
-    if let Some(headers) = spec["header"]
-        .as_array()
-        .or_else(|| spec["headers"].as_array())
-    {
-        request.headers = headers
-            .iter()
-            .map(|header| KeyValue {
-                name: header["key"]
-                    .as_str()
-                    .or_else(|| header["name"].as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                value: header["value"].as_str().unwrap_or_default().to_string(),
-                disabled: header["disabled"].as_bool().unwrap_or(false),
-            })
-            .collect();
-    }
-    if let Some(body) = spec.get("body") {
-        let text = body["raw"].as_str().or_else(|| body["text"].as_str());
-        if let Some(text) = text {
-            request.body = Some(Body {
-                mode: "raw".into(),
-                language: Some("json".into()),
-                text: Some(text.into()),
-            });
-        }
-    }
-    request.normalize_query();
+    let request = script_request(&payload["request"]);
     let variables: BTreeMap<String, String> =
         serde_json::from_value(payload["variables"].clone()).unwrap_or_default();
     let vars = collection::send::Variables::from(variables);
@@ -478,9 +538,77 @@ fn send_script_request(payload: &str) -> Result<serde_json::Value, String> {
     }))
 }
 
+/// The request a `pm.sendRequest` spec describes.
+fn script_request(spec: &serde_json::Value) -> RequestDef {
+    let url = spec
+        .as_str()
+        .or_else(|| spec["url"].as_str())
+        .or_else(|| spec["url"]["raw"].as_str())
+        .unwrap_or_default();
+    let mut request = RequestDef {
+        method: spec["method"].as_str().unwrap_or("GET").to_uppercase(),
+        url: url.to_string(),
+        ..Default::default()
+    };
+    let header_spec = spec.get("header").or_else(|| spec.get("headers"));
+    if let Some(headers) = header_spec.and_then(|headers| headers.as_array()) {
+        request.headers = headers
+            .iter()
+            .map(|header| KeyValue {
+                name: header["key"]
+                    .as_str()
+                    .or_else(|| header["name"].as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                value: header["value"].as_str().unwrap_or_default().to_string(),
+                disabled: header["disabled"].as_bool().unwrap_or(false),
+            })
+            .collect();
+    } else if let Some(headers) = header_spec.and_then(|headers| headers.as_object()) {
+        // Postman also accepts `{ "Name": "value" }`.
+        request.headers = headers
+            .iter()
+            .map(|(name, value)| KeyValue {
+                name: name.clone(),
+                value: value
+                    .as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| value.to_string()),
+                disabled: false,
+            })
+            .collect();
+    }
+    if let Some(body) = spec.get("body") {
+        let text = body["raw"].as_str().or_else(|| body["text"].as_str());
+        if let Some(text) = text {
+            request.body = Some(Body {
+                mode: "raw".into(),
+                language: Some("json".into()),
+                text: Some(text.into()),
+            });
+        }
+    }
+    request.normalize_query();
+    request
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_request_accepts_header_arrays_and_objects() {
+        let array = script_request(&serde_json::json!({
+            "url": "https://x.test/a", "header": [{"key": "Authorization", "value": "Basic abc"}]
+        }));
+        let object = script_request(&serde_json::json!({
+            "url": "https://x.test/a", "method": "post", "header": {"Authorization": "Basic abc"}
+        }));
+        assert_eq!(array.headers, object.headers);
+        assert_eq!(object.headers[0].name, "Authorization");
+        assert_eq!(object.headers[0].value, "Basic abc");
+        assert_eq!(object.method, "POST");
+    }
 
     #[test]
     fn scripts_cannot_assign_generated_target_inputs() {
@@ -503,6 +631,7 @@ mod tests {
                 )],
                 insecure: false,
                 read_only: &collection::deployment::RESERVED,
+                logs: Mutex::default(),
             };
             let mut variables = BTreeMap::new();
             let error = plan

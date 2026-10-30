@@ -36,10 +36,124 @@ pub struct Entry {
     pub variable: Variable,
 }
 
+/// A [`Scope`] as `variables.json` stores it: by id, so a value follows its
+/// collection, folder or request through renames and reordering. Entries
+/// written before ids existed carry the slug and tree path instead; they are
+/// read by position and rewritten by id on the next write.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum StoredScope {
+    Globals,
+    Environment {
+        environment: String,
+    },
+    Collection {
+        /// The slug when written, for people reading the file and as the
+        /// fallback for entries from before ids.
+        #[serde(default)]
+        collection: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        collection_id: String,
+    },
+    Item {
+        #[serde(default)]
+        collection: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        collection_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        path: Vec<usize>,
+    },
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredEntry {
+    scope: StoredScope,
+    variable: Variable,
+}
+
+impl StoredScope {
+    fn from_scope(scope: &Scope, workspace: &Workspace) -> Self {
+        match scope {
+            Scope::Globals => Self::Globals,
+            Scope::Environment { environment } => Self::Environment {
+                environment: environment.clone(),
+            },
+            Scope::Collection { collection } => Self::Collection {
+                collection_id: workspace
+                    .collection(collection)
+                    .map(|found| found.id.clone())
+                    .unwrap_or_default(),
+                collection: collection.clone(),
+            },
+            Scope::Item { collection, path } => {
+                let found = workspace.collection(collection);
+                let id = found
+                    .and_then(|found| found.id_at(path))
+                    .unwrap_or_default()
+                    .to_string();
+                Self::Item {
+                    collection_id: found.map(|found| found.id.clone()).unwrap_or_default(),
+                    collection: collection.clone(),
+                    // Without an id (not assigned yet), fall back to position.
+                    path: if id.is_empty() {
+                        path.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    id,
+                }
+            }
+        }
+    }
+
+    /// The scope this entry means in the workspace as it is now, or `None`
+    /// if its collection or item is gone.
+    fn resolve(&self, workspace: &Workspace) -> Option<Scope> {
+        let collection = |id: &str, slug: &str| {
+            workspace
+                .collections
+                .iter()
+                .find(|found| !id.is_empty() && found.id == id)
+                .or_else(|| workspace.collection(slug).filter(|_| !slug.is_empty()))
+        };
+        match self {
+            Self::Globals => Some(Scope::Globals),
+            Self::Environment { environment } => Some(Scope::Environment {
+                environment: environment.clone(),
+            }),
+            Self::Collection {
+                collection: slug,
+                collection_id,
+            } => Some(Scope::Collection {
+                collection: store::slugify(&collection(collection_id, slug)?.name),
+            }),
+            Self::Item {
+                collection: slug,
+                collection_id,
+                id,
+                path,
+            } => {
+                let found = collection(collection_id, slug)?;
+                let path = if id.is_empty() {
+                    path.clone()
+                } else {
+                    found.path_of(id)?
+                };
+                Some(Scope::Item {
+                    collection: store::slugify(&found.name),
+                    path,
+                })
+            }
+        }
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Values {
     #[serde(default)]
-    workspaces: BTreeMap<String, Vec<Entry>>,
+    workspaces: BTreeMap<String, Vec<StoredEntry>>,
 }
 
 /// The per-user values file, usually `<config dir>/variables.json`.
@@ -69,20 +183,49 @@ impl LiveValues {
         Some(config.join("rq").join("variables.json"))
     }
 
+    /// This user's current values for the workspace at `root`, by where they
+    /// sit in the tree now.
     pub fn entries(&self, root: &Path) -> Result<Vec<Entry>, String> {
+        self.entries_in(root, &store::load(root)?)
+    }
+
+    fn entries_in(&self, root: &Path, workspace: &Workspace) -> Result<Vec<Entry>, String> {
         Ok(read(&self.path)?
             .workspaces
             .remove(&workspace_key(root))
-            .unwrap_or_default())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|stored| {
+                Some(Entry {
+                    scope: stored.scope.resolve(workspace)?,
+                    variable: stored.variable,
+                })
+            })
+            .collect())
     }
 
     /// Replaces each edit's `(scope, name)` entry, or removes it when `reset`.
+    /// Older position-based entries are rewritten by id on the way.
     pub fn write(&self, root: &Path, edits: Vec<Entry>, reset: bool) -> Result<(), String> {
+        let workspace = store::load(root)?;
         let _guard = WRITER
             .lock()
             .map_err(|_| "local variable config lock poisoned")?;
         let mut values = read(&self.path)?;
-        let entries = values.workspaces.entry(workspace_key(root)).or_default();
+        let stored = values.workspaces.entry(workspace_key(root)).or_default();
+        // Entries whose collection or item is gone are kept as they are: the
+        // file may be back after a branch switch.
+        let mut entries = Vec::new();
+        let mut orphans = Vec::new();
+        for entry in stored.drain(..) {
+            match entry.scope.resolve(&workspace) {
+                Some(scope) => entries.push(Entry {
+                    scope,
+                    variable: entry.variable,
+                }),
+                None => orphans.push(entry),
+            }
+        }
         for edit in edits {
             entries.retain(|entry| {
                 entry.scope != edit.scope || entry.variable.name != edit.variable.name
@@ -91,6 +234,11 @@ impl LiveValues {
                 entries.push(edit);
             }
         }
+        stored.extend(entries.into_iter().map(|entry| StoredEntry {
+            scope: StoredScope::from_scope(&entry.scope, &workspace),
+            variable: entry.variable,
+        }));
+        stored.extend(orphans);
         let parent = self
             .path
             .parent()
@@ -113,7 +261,8 @@ impl LiveValues {
     /// The workspace on disk with this user's current values laid over it.
     pub fn load(&self, root: &Path) -> Result<Workspace, String> {
         let mut workspace = store::load(root)?;
-        apply(&mut workspace, &self.entries(root)?);
+        let entries = self.entries_in(root, &workspace)?;
+        apply(&mut workspace, &entries);
         Ok(workspace)
     }
 }

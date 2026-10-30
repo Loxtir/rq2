@@ -1,3 +1,4 @@
+id: 32a2c8f7
 name: Catalog Demo
 service_name: shopsvc
 base_path: '/{{tenant == "north" ? serviceName : "legacysvc"}}-{{slot}}'

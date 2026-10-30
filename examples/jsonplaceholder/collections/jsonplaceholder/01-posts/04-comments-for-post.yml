@@ -1,3 +1,4 @@
+id: bbe3bbd2
 name: Comments for post
 method: GET
 url: '{{baseUrl}}/posts/:postId/comments'

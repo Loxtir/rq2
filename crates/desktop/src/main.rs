@@ -132,9 +132,11 @@ struct WorkspaceDto {
 
 #[derive(Serialize)]
 struct SharedScriptDto {
+    /// What includes refer to; never changes.
+    id: String,
+    /// The file stem.
     name: String,
-    pre_request: String,
-    post_response: String,
+    code: String,
     /// Names of the collections that include it anywhere in their tree.
     used_by: Vec<String>,
 }
@@ -338,8 +340,10 @@ struct ResponseContext {
     deployment: Option<collection::deployment::Target>,
 }
 
-/// The parts of a history entry every send knows, sent or failed.
+/// The parts of a history entry every send knows, sent or failed. Ids let the
+/// entry find its request again after renames and moves.
 fn history_entry(
+    root: &std::path::Path,
     name: &str,
     method: &str,
     collection: &str,
@@ -347,11 +351,20 @@ fn history_entry(
     url: &str,
     context: &ResponseContext,
 ) -> history::Entry {
+    let workspace = store::load(root).ok();
+    let found = workspace
+        .as_ref()
+        .and_then(|workspace| workspace.collection(collection));
     history::Entry {
         environment: Some(context.environment.clone()),
         deployment: context.deployment.clone(),
         name: name.to_string(),
         collection: collection.to_string(),
+        collection_id: found.map(|found| found.id.clone()).unwrap_or_default(),
+        request_id: found
+            .and_then(|found| found.id_at(path))
+            .unwrap_or_default()
+            .to_string(),
         path: path.to_vec(),
         method: method.to_string(),
         url: url.to_string(),
@@ -364,15 +377,43 @@ fn list_history(
     app: tauri::AppHandle,
     collection: Option<String>,
     path: Option<Vec<usize>>,
+    state: tauri::State<'_, AppState>,
 ) -> Result<history::Listing, String> {
-    Ok(history(&app)?.list(collection.as_deref(), path.as_deref()))
+    let locate = history_locator(&state);
+    Ok(history(&app)?.list(collection.as_deref(), path.as_deref(), locate))
+}
+
+/// Points history entries at where their request is in the open workspace now.
+/// Entries without ids, or whose request is gone, keep what they recorded.
+fn history_locator(state: &tauri::State<'_, AppState>) -> impl Fn(&mut history::Entry) {
+    let workspace = workspace_path(state)
+        .ok()
+        .and_then(|root| store::load(&root).ok());
+    move |entry: &mut history::Entry| {
+        let Some(workspace) = &workspace else { return };
+        let Some(found) = workspace
+            .collections
+            .iter()
+            .find(|found| !entry.collection_id.is_empty() && found.id == entry.collection_id)
+        else {
+            return;
+        };
+        if let Some(path) = found.path_of(&entry.request_id) {
+            entry.collection = store::slugify(&found.name);
+            entry.path = path;
+        }
+    }
 }
 
 #[tauri::command]
-fn set_history_limit(app: tauri::AppHandle, limit: u64) -> Result<history::Listing, String> {
+fn set_history_limit(
+    app: tauri::AppHandle,
+    limit: u64,
+    state: tauri::State<'_, AppState>,
+) -> Result<history::Listing, String> {
     let history = history(&app)?;
     history.set_limit(limit)?;
-    Ok(history.list(None, None))
+    Ok(history.list(None, None, history_locator(&state)))
 }
 
 #[tauri::command]
@@ -479,15 +520,15 @@ fn workspace_dto(root: &std::path::Path) -> Result<WorkspaceDto, String> {
         live_variables,
         scripts: loaded
             .scripts
-            .iter()
-            .map(|(name, scripts)| SharedScriptDto {
-                name: name.clone(),
-                pre_request: scripts.pre_request.clone(),
-                post_response: scripts.post_response.clone(),
+            .values()
+            .map(|script| SharedScriptDto {
+                id: script.id.clone(),
+                name: script.name.clone(),
+                code: script.code.clone(),
                 used_by: loaded
                     .collections
                     .iter()
-                    .filter(|collection| collection.includes(name))
+                    .filter(|collection| collection.includes(&script.id))
                     .map(|collection| collection.name.clone())
                     .collect(),
             })
@@ -519,6 +560,7 @@ fn open_workspace(
     // Store and report an absolute path: a remembered relative path would
     // resolve against whatever directory the next launch happens to use.
     let root = std::path::absolute(&path).unwrap_or_else(|_| PathBuf::from(&path));
+    store::ensure_ids(&root)?;
     let dto = workspace_dto(&root)?;
 
     *state.workspace.lock().map_err(|_| "state poisoned")? = Some(root.clone());
@@ -530,6 +572,8 @@ fn open_workspace(
 #[tauri::command]
 fn refresh_workspace(state: tauri::State<'_, AppState>) -> Result<WorkspaceDto, String> {
     let root = workspace_path(&state)?;
+    // Files pulled or copied in by hand may lack ids, or share one.
+    store::ensure_ids(&root)?;
     workspace_dto(&root)
 }
 
@@ -628,7 +672,7 @@ struct Located {
     /// `globals.yml`, the widest variable layer.
     globals: Vec<Variable>,
     /// `scripts/`, for includes.
-    scripts: BTreeMap<String, Scripts>,
+    scripts: BTreeMap<String, collection::model::SharedScript>,
 }
 
 impl Located {
@@ -723,6 +767,16 @@ impl Drop for CancelHandle<'_> {
     }
 }
 
+/// Script `console.*` lines go to the window's console panel as they happen,
+/// so output from a script that then fails is still visible.
+fn emit_logs(app: &tauri::AppHandle, plan: &rq_scripts::Plan) {
+    use tauri::Emitter;
+    let lines = plan.take_logs();
+    if !lines.is_empty() {
+        let _ = app.emit("script-console", lines);
+    }
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn send(
@@ -749,7 +803,9 @@ async fn send(
         request_id,
     };
 
+    let prepared_app = app.clone();
     let prepared = tauri::async_runtime::spawn_blocking(move || {
+        let console_app = prepared_app;
         let located = locate(&root, &collection, environment.as_deref())?;
         let context = located.context(deployment.as_ref())?;
         let resolved = context
@@ -766,7 +822,9 @@ async fn send(
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let writes = plan.pre_request(&mut request, &mut variables)?;
+        let writes = plan.pre_request(&mut request, &mut variables);
+        emit_logs(&console_app, &plan);
+        let writes = writes?;
         persist_script_writes(&root, &collection, writes)?;
         // Script writes are current values now; read them back through the
         // same scope chain so a narrower saved value still wins.
@@ -820,6 +878,7 @@ async fn send(
                 Ok(sent) => {
                     let post_root = response_root.clone();
                     let post_collection = collection_slug.clone();
+                    let post_app = app.clone();
                     let post = tauri::async_runtime::spawn_blocking(move || {
                         if !plan.has_post_response() {
                             return (sent, Vec::new());
@@ -836,6 +895,7 @@ async fn send(
                                 body: &body,
                             },
                         );
+                        emit_logs(&post_app, &plan);
                         if let Err(error) =
                             persist_script_writes(&post_root, &post_collection, writes)
                         {
@@ -879,6 +939,7 @@ async fn send(
             if let SendError::Failed(message) = &error {
                 if let Ok(history) = history(&app) {
                     let mut entry = history_entry(
+                        &response_root,
                         &name,
                         &method,
                         &collection_slug,
@@ -902,6 +963,7 @@ async fn send(
             insecure: sent.insecure,
             missing: sent.missing.clone(),
             ..history_entry(
+                &response_root,
                 &name,
                 &method,
                 &collection_slug,
@@ -1089,43 +1151,34 @@ fn edit_tree(
 #[derive(Serialize)]
 struct SharedScriptSaved {
     workspace: WorkspaceDto,
-    name: String,
+    id: String,
 }
 
-/// Creates or updates `scripts/<name>.yml`. `previous` is the name being
-/// edited; renaming updates every include of it.
+/// Creates or updates `scripts/<name>.js`. `id` is the script being edited,
+/// absent for a new one; includes refer to the id, so renaming changes only
+/// the file name.
 #[tauri::command]
 fn save_shared_script(
-    previous: Option<String>,
+    id: Option<String>,
     name: String,
-    pre_request: String,
-    post_response: String,
+    code: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<SharedScriptSaved, String> {
     let root = workspace_path(&state)?;
-    let name = store::save_shared_script(
-        &root,
-        previous.as_deref(),
-        &name,
-        Scripts {
-            pre_request,
-            post_response,
-            ..Default::default()
-        },
-    )?;
+    let id = store::save_shared_script(&root, id.as_deref(), &name, &code)?;
     Ok(SharedScriptSaved {
         workspace: workspace_dto(&root)?,
-        name,
+        id,
     })
 }
 
 #[tauri::command]
 fn delete_shared_script(
-    name: String,
+    id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<WorkspaceDto, String> {
     let root = workspace_path(&state)?;
-    store::delete_shared_script(&root, &name)?;
+    store::delete_shared_script(&root, &id)?;
     workspace_dto(&root)
 }
 

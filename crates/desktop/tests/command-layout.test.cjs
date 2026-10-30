@@ -57,7 +57,8 @@ async function checkCommandLayout() {
               }
               if (large) {
                 check(curl.scrollHeight > curl.clientHeight && getComputedStyle(curl).overflowY === "auto", `${label}: oversized cURL cannot scroll`);
-                check(Math.abs(detailBounds.bottom - (bounds.bottom - 18)) <= 2, `${label}: cURL leaves unused space below Details`);
+                const last = document.getElementById("console-details").getBoundingClientRect();
+                check(Math.abs(last.bottom - (bounds.bottom - 18)) <= 2, `${label}: cURL leaves unused space below Details and Console`);
                 if (height === 1000) check(commandBounds.height > 500, `${label}: cURL still has a fixed height cap`);
                 curl.scrollTop = 100;
                 check(curl.scrollTop > 0 && body.scrollTop === 0, `${label}: cURL does not scroll independently`);

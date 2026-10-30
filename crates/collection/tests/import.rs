@@ -86,6 +86,15 @@ const ENVIRONMENT: &str = r#"{
 
 const TOKEN: &str = "tok_live_9f8e7d6c5b4a";
 
+/// Ids are random per parse; compare everything else.
+fn without_ids(mut collection: Collection) -> Collection {
+    collection.id.clear();
+    for item in &mut collection.items {
+        collection::model::clear_ids(item);
+    }
+    collection
+}
+
 fn parsed() -> Collection {
     parse_collection(POSTMAN.as_bytes(), &[])
         .expect("collection should parse")
@@ -367,6 +376,7 @@ fn auth_is_written_only_where_it_is_set() {
 fn two_requests_with_the_same_name_get_different_files() {
     let mut collection = parsed();
     collection.items.push(Item {
+        id: String::new(),
         scripts: Default::default(),
         name: "List orders".to_string(),
         auth: AuthSetting::Inherit,
@@ -393,6 +403,7 @@ fn two_requests_with_the_same_name_get_different_files() {
 #[test]
 fn a_name_with_no_usable_characters_still_gets_a_directory() {
     let collection = Collection {
+        id: String::new(),
         service_name: None,
         base_path: None,
         deployments: Vec::new(),
@@ -485,6 +496,7 @@ fn writing_refuses_when_a_secret_would_leak() {
     // A secret value that also appears in a committed file is exactly the bug
     // the guard exists for.
     let collection = Collection {
+        id: String::new(),
         service_name: None,
         base_path: None,
         deployments: Vec::new(),
@@ -498,6 +510,7 @@ fn writing_refuses_when_a_secret_would_leak() {
             secret: true,
         }],
         items: vec![Item {
+            id: String::new(),
             name: "r".to_string(),
             scripts: Default::default(),
             auth: AuthSetting::Inherit,
@@ -737,7 +750,10 @@ fn desktop_import_creates_yaml_and_preserves_other_workspace_files() {
     .unwrap();
 
     let workspace = load(&dir).unwrap();
-    assert_eq!(workspace.collections[0], parsed());
+    assert_eq!(
+        without_ids(workspace.collections[0].clone()),
+        without_ids(parsed())
+    );
     assert_eq!(workspace.environments[0], parsed_environment());
     assert_eq!(
         workspace.globals[1].value.as_deref(),
@@ -833,7 +849,10 @@ fn desktop_import_refuses_shared_secret_file_collisions() {
             .contains(".secrets/acme-api.env")
     );
     assert!(!dir.join("environments").exists());
-    assert_eq!(load(&dir).unwrap().collections[0], parsed());
+    assert_eq!(
+        without_ids(load(&dir).unwrap().collections[0].clone()),
+        without_ids(parsed())
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 

@@ -20,6 +20,11 @@ pub(crate) struct Entry {
     pub name: String,
     #[serde(default)]
     pub collection: String,
+    /// Stable ids of the collection and request; empty in older history.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub collection_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub request_id: String,
     #[serde(default)]
     pub path: Vec<usize>,
     pub method: String,
@@ -68,10 +73,20 @@ impl History {
     }
 
     /// Newest first, optionally narrowed to one collection or request.
-    pub fn list(&self, collection: Option<&str>, path: Option<&[usize]>) -> Listing {
+    /// `locate` updates an entry's slug and path to where its request is now.
+    pub fn list(
+        &self,
+        collection: Option<&str>,
+        path: Option<&[usize]>,
+        locate: impl Fn(&mut Entry),
+    ) -> Listing {
         let entries: Vec<Entry> = self
             .entries()
             .into_iter()
+            .map(|mut entry| {
+                locate(&mut entry);
+                entry
+            })
             .filter(|entry| collection.is_none_or(|slug| entry.collection == slug))
             .filter(|entry| path.is_none_or(|path| entry.path == path))
             .collect();
@@ -243,11 +258,11 @@ mod tests {
     fn a_recorded_response_lists_and_opens() {
         let history = history("open");
         let id = history.record(entry("Get", "demo"), b"{}").unwrap();
-        let listing = history.list(Some("demo"), Some(&[0]));
+        let listing = history.list(Some("demo"), Some(&[0]), |_| {});
         assert_eq!(listing.entries.len(), 1);
         assert!(listing.entries[0].response_available);
         assert_eq!(listing.bytes, 2);
-        assert!(history.list(Some("other"), None).entries.is_empty());
+        assert!(history.list(Some("other"), None, |_| {}).entries.is_empty());
         assert_eq!(history.open(&id).unwrap().1, b"{}");
         std::fs::remove_dir_all(&history.dir).unwrap();
     }
@@ -258,7 +273,7 @@ mod tests {
         let mut failed = entry("Get", "demo");
         failed.error = Some("connection refused".into());
         let id = history.record(failed, &[]).unwrap();
-        assert!(!history.list(None, None).entries[0].response_available);
+        assert!(!history.list(None, None, |_| {}).entries[0].response_available);
         let (opened, body) = history.open(&id).unwrap();
         assert_eq!(opened.error.as_deref(), Some("connection refused"));
         assert!(body.is_empty());
@@ -274,10 +289,10 @@ mod tests {
         assert_eq!(history.limit(), 15);
         assert!(history.open(&old).unwrap_err().contains("retention"));
         assert_eq!(history.open(&new).unwrap().1, [b'b'; 10]);
-        assert_eq!(history.list(None, None).entries.len(), 2);
+        assert_eq!(history.list(None, None, |_| {}).entries.len(), 2);
 
         history.clear().unwrap();
-        assert!(history.list(None, None).entries.is_empty());
+        assert!(history.list(None, None, |_| {}).entries.is_empty());
         assert_eq!(history.limit(), 15, "clearing keeps the setting");
         std::fs::remove_dir_all(&history.dir).unwrap();
     }

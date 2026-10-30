@@ -427,6 +427,11 @@ function treeMenu(event, collection, path, node, label) {
   items.push({ label: "Rename", action: () => startRename(label, collection, path, node.name) });
   if (path.length) items.push({ label: "Duplicate", action: () => duplicateNode(collection, path) });
   items.push({ label: "Delete", danger: true, action: () => deleteNode(collection, path, node) });
+  if (node.kind === "collection") {
+    const all = state.workspace.collections.map((item) => item.slug);
+    items.push({ label: "Collapse all collections", action: () => setCollapsedCollections(all) });
+    items.push({ label: "Expand all collections", action: () => setCollapsedCollections([]) });
+  }
   showContextMenu(event, items);
 }
 
@@ -517,88 +522,101 @@ function makeDropTarget(element, collection, path, kind, length = 0) {
 /* ---------- shared scripts ---------- */
 
 const sharedScripts = () => state.workspace?.scripts || [];
+const sharedScript = (id) => sharedScripts().find((script) => script.id === id) || null;
+const INCLUDE_PHASES = [
+  ["pre_request", "node-includes-pre"],
+  ["post_response", "node-includes-post"],
+];
 
-// Every shared script as a tick box, ticked ones first in run order. A name
-// the draft includes but scripts/ lacks stays visible, marked, so it can be
-// unticked.
+// Every shared script as a tick box per phase, ticked ones first in run order.
+// An id the draft includes but scripts/ lacks stays visible, marked, so it can
+// be unticked.
 function renderNodeIncludes() {
-  const host = $("node-includes");
-  host.replaceChildren();
-  const included = state.draft?.scripts?.include || [];
-  const known = sharedScripts().map((script) => script.name);
-  for (const name of [...included, ...known.filter((item) => !included.includes(item))]) {
-    const chip = document.createElement("span");
-    chip.className = "include-chip";
-    const label = document.createElement("label");
-    const box = document.createElement("input");
-    box.type = "checkbox";
-    box.checked = included.includes(name);
-    box.addEventListener("change", () => toggleInclude(name, box.checked));
-    const text = document.createElement("span");
-    const position = included.indexOf(name);
-    text.textContent = position >= 0 && included.length > 1 ? `${position + 1}. ${name}` : name;
-    label.append(box, text);
-    chip.append(label);
-    if (known.includes(name)) {
-      const edit = document.createElement("button");
-      edit.type = "button";
-      edit.className = "icon-btn";
-      edit.title = `Edit shared script ${name}`;
-      edit.textContent = "✎";
-      edit.addEventListener("click", () => openSharedScripts(name));
-      chip.append(edit);
-    } else {
-      chip.classList.add("include-missing");
-      chip.title = `scripts/${name}.yml does not exist. Sending fails until it is unticked or created.`;
+  for (const [phase, hostId] of INCLUDE_PHASES) {
+    const host = $(hostId);
+    host.replaceChildren();
+    const included = state.draft?.scripts?.include?.[phase] || [];
+    const known = sharedScripts().map((script) => script.id);
+    for (const id of [...included, ...known.filter((item) => !included.includes(item))]) {
+      const script = sharedScript(id);
+      const name = script?.name || id;
+      const chip = document.createElement("span");
+      chip.className = "include-chip";
+      const label = document.createElement("label");
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = included.includes(id);
+      box.addEventListener("change", () => toggleInclude(phase, id, box.checked));
+      const text = document.createElement("span");
+      const position = included.indexOf(id);
+      text.textContent = position >= 0 && included.length > 1 ? `${position + 1}. ${name}` : name;
+      label.append(box, text);
+      chip.append(label);
+      if (script) {
+        chip.title = `scripts/${script.name}.js · id ${id}`;
+        const edit = document.createElement("button");
+        edit.type = "button";
+        edit.className = "icon-btn";
+        edit.title = `Edit shared script ${name}`;
+        edit.textContent = "✎";
+        edit.addEventListener("click", () => openSharedScripts(id));
+        chip.append(edit);
+      } else {
+        chip.classList.add("include-missing");
+        chip.title = `No scripts/*.js has // @id ${id}. Sending fails until it is unticked or created.`;
+      }
+      host.append(chip);
     }
-    host.append(chip);
+    if (phase === "post_response") {
+      const add = document.createElement("button");
+      add.type = "button";
+      add.className = "btn btn-ghost include-new";
+      add.textContent = "+ New shared script";
+      add.addEventListener("click", () => openSharedScripts(null));
+      host.append(add);
+    }
   }
-  const add = document.createElement("button");
-  add.type = "button";
-  add.className = "btn btn-ghost include-new";
-  add.textContent = "+ New shared script";
-  add.addEventListener("click", () => openSharedScripts(null));
-  host.append(add);
 }
 
-function toggleInclude(name, on) {
+function toggleInclude(phase, id, on) {
   if (!state.draft) return;
   const scripts = (state.draft.scripts ||= { pre_request: "", post_response: "" });
-  const next = (scripts.include || []).filter((item) => item !== name);
-  if (on) next.push(name);
+  const include = { ...(scripts.include || {}) };
+  const next = (include[phase] || []).filter((item) => item !== id);
+  if (on) next.push(id);
   // Absent rather than empty, so ticking and unticking leaves the draft clean.
-  if (next.length) scripts.include = next;
+  if (next.length) include[phase] = next;
+  else delete include[phase];
+  if (Object.keys(include).length) scripts.include = include;
   else delete scripts.include;
   renderNodeIncludes();
   updateDirty();
 }
 
-// Name of the script the dialog is editing; null for a new one.
+// Id of the script the dialog is editing; null for a new one.
 let sharedEditing = null;
 
 function sharedScriptFields() {
   return {
     name: $("shared-script-name").value.trim(),
-    pre_request: $("shared-script-pre").value,
-    post_response: $("shared-script-post").value,
+    code: $("shared-script-code").value,
   };
 }
 
 function sharedScriptChanged() {
   const fields = sharedScriptFields();
-  const script = sharedScripts().find((item) => item.name === sharedEditing);
-  const base = script || { name: "", pre_request: "", post_response: "" };
-  return fields.name !== base.name || fields.pre_request !== base.pre_request || fields.post_response !== base.post_response;
+  const base = sharedScript(sharedEditing) || { name: "", code: "" };
+  return fields.name !== base.name || fields.code !== base.code;
 }
 
-function loadSharedScript(name) {
-  const script = sharedScripts().find((item) => item.name === name) || null;
-  sharedEditing = script?.name ?? null;
+function loadSharedScript(id) {
+  const script = sharedScript(id);
+  sharedEditing = script?.id ?? null;
   const pick = $("shared-script-pick");
   pick.replaceChildren();
   for (const item of sharedScripts()) {
     const option = document.createElement("option");
-    option.value = item.name;
+    option.value = item.id;
     option.textContent = item.name;
     pick.append(option);
   }
@@ -608,40 +626,21 @@ function loadSharedScript(name) {
   pick.append(fresh);
   pick.value = sharedEditing ?? "";
   $("shared-script-name").value = script?.name || "";
-  $("shared-script-pre").value = script?.pre_request || "";
-  $("shared-script-post").value = script?.post_response || "";
-  paintVariables($("shared-script-pre"));
-  paintVariables($("shared-script-post"));
+  $("shared-script-code").value = script?.code || "";
+  paintVariables($("shared-script-code"));
   $("shared-script-used").textContent = !script
     ? ""
-    : script.used_by.length
-      ? `Used by ${script.used_by.join(", ")}.`
-      : "Not included anywhere yet.";
+    : `scripts/${script.name}.js · id ${script.id} · ` + (script.used_by.length
+      ? `used by ${script.used_by.join(", ")}.`
+      : "not included anywhere yet.");
   $("shared-script-delete").hidden = !script;
 }
 
-function openSharedScripts(name = null) {
-  loadSharedScript(name);
+function openSharedScripts(id = null) {
+  loadSharedScript(id);
   $("shared-script-note").textContent = "";
   if (!$("shared-script-dialog").open) $("shared-script-dialog").showModal();
-  (name ? $("shared-script-pre") : $("shared-script-name")).focus();
-}
-
-// A rename rewrote includes on disk; open drafts get the same change, in both
-// the draft and its saved copy, so they stay clean.
-function renameIncludes(from, to) {
-  const fix = (scripts) => {
-    if (scripts?.include) scripts.include = scripts.include.map((name) => (name === from ? to : name));
-  };
-  for (const entry of drafts.values()) {
-    fix(entry.draft?.scripts);
-    try {
-      const saved = JSON.parse(entry.saved);
-      fix(saved?.scripts);
-      entry.saved = JSON.stringify(saved);
-    } catch { /* Not a node draft. */ }
-    if (entry.draft === state.draft) state.saved = entry.saved;
-  }
+  (id ? $("shared-script-code") : $("shared-script-name")).focus();
 }
 
 function afterSharedScriptChange(workspace) {
@@ -654,32 +653,26 @@ async function saveSharedScript(event) {
   event?.preventDefault();
   const fields = sharedScriptFields();
   try {
-    const result = await invoke("save_shared_script", {
-      previous: sharedEditing,
-      name: fields.name,
-      preRequest: fields.pre_request,
-      postResponse: fields.post_response,
-    });
-    if (sharedEditing && sharedEditing !== result.name) renameIncludes(sharedEditing, result.name);
+    const result = await invoke("save_shared_script", { id: sharedEditing, name: fields.name, code: fields.code });
     afterSharedScriptChange(result.workspace);
-    loadSharedScript(result.name);
-    $("shared-script-note").textContent = `Saved scripts/${result.name}.yml.`;
+    loadSharedScript(result.id);
+    $("shared-script-note").textContent = `Saved scripts/${sharedScript(result.id)?.name}.js.`;
   } catch (error) {
     $("shared-script-note").textContent = error?.message ?? String(error);
   }
 }
 
 async function deleteSharedScript() {
-  const script = sharedScripts().find((item) => item.name === sharedEditing);
+  const script = sharedScript(sharedEditing);
   if (!script) return;
   const used = script.used_by.length
     ? `\n\nStill included by ${script.used_by.join(", ")}; sending there fails until the include is removed.`
     : "";
   if (!window.confirm(`Delete shared script “${script.name}”?${used}`)) return;
   try {
-    afterSharedScriptChange(await invoke("delete_shared_script", { name: script.name }));
-    loadSharedScript(sharedScripts()[0]?.name ?? null);
-    $("shared-script-note").textContent = `Deleted scripts/${script.name}.yml.`;
+    afterSharedScriptChange(await invoke("delete_shared_script", { id: script.id }));
+    loadSharedScript(sharedScripts()[0]?.id ?? null);
+    $("shared-script-note").textContent = `Deleted scripts/${script.name}.js.`;
   } catch (error) {
     $("shared-script-note").textContent = error?.message ?? String(error);
   }
@@ -1614,6 +1607,29 @@ function addButton(title, collection, path) {
   return button;
 }
 
+// Collapsed collections, by slug, remembered per workspace.
+const collapsedCollectionsKey = () => `rq.collapsedCollections:${state.workspace?.path || ""}`;
+
+function collapsedCollections() {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(collapsedCollectionsKey()) || "[]"));
+  } catch {
+    return new Set();
+  }
+}
+
+function setCollapsedCollections(slugs) {
+  localStorage.setItem(collapsedCollectionsKey(), JSON.stringify([...slugs]));
+  renderTree();
+}
+
+function toggleCollectionCollapsed(slug) {
+  const slugs = collapsedCollections();
+  if (slugs.has(slug)) slugs.delete(slug);
+  else slugs.add(slug);
+  setCollapsedCollections(slugs);
+}
+
 function renderTree() {
   const tree = $("tree");
   tree.replaceChildren();
@@ -1641,12 +1657,24 @@ function renderTree() {
 
     const children = buildNodes(collection.items, collection, [], query);
     if (query && children.count === 0) continue;
+    // Searching shows every match, even in collapsed collections.
+    const collapsed = !query && collapsedCollections().has(collection.slug);
+    const caret = document.createElement("button");
+    caret.type = "button";
+    caret.className = "collection-caret";
+    caret.setAttribute("aria-expanded", String(!collapsed));
+    caret.title = collapsed ? "Expand collection" : "Collapse collection";
+    caret.addEventListener("click", () => toggleCollectionCollapsed(collection.slug));
+    const items = document.createElement("div");
+    items.className = "collection-items";
+    items.hidden = collapsed;
+    items.append(children.fragment);
     const head = document.createElement("div");
     head.className = "collection-head";
-    head.append(name, addButton("Add a request or folder to this collection", collection, []));
+    head.append(caret, name, addButton("Add a request or folder to this collection", collection, []));
     head.addEventListener("contextmenu", (event) => treeMenu(event, collection, [], { ...collection, kind: "collection" }, name));
     makeDropTarget(head, collection, [], "collection", collection.items.length);
-    group.append(head, children.fragment);
+    group.append(head, items);
     tree.append(group);
   }
 
@@ -2075,6 +2103,8 @@ function openRequest(node, collection, path, keepResponse = false, existingTabKe
   renderBody();
   renderRequestAuth();
   updateAuthTag();
+  // Each tab remembers the section the user last chose.
+  showTab(tab.configTab || defaultConfigTab(state.draft));
   updateDirty();
   markSelected();
   renderRequestTabs();
@@ -2530,10 +2560,12 @@ function renderVariables() {
       variable.secret = secret.checked;
       if (!secret.checked && variable.value === null) variable.value = "";
       updateDirty();
+      renderVariables();
     });
 
     row.append(name, value, secret, remove);
     rows.append(row);
+    secretOrVariables(value, variable.secret);
   });
 }
 
@@ -3966,7 +3998,16 @@ function renderEnvironmentVariables() {
     });
     row.append(name, value, secret, remove);
     rows.append(row);
+    secretOrVariables(value, variable.secret);
   });
+}
+
+// A secret value is typed masked; anything else gets {{name}} highlighting
+// and hover. The highlight layer would show a secret in clear text.
+function secretOrVariables(input, secret) {
+  input.autocomplete = "off";
+  if (secret) input.type = "password";
+  else withVariables(input);
 }
 
 function openEnvironmentEditor(environment = null, globals = false) {
@@ -4295,6 +4336,59 @@ function showTab(name) {
   for (const panel of document.querySelectorAll(".tab-panel")) {
     panel.hidden = panel.id !== `tab-${name}`;
   }
+  const open = state.requestTabs.find((tab) => tab.key === state.activeRequestTab);
+  if (open) open.configTab = name;
+}
+
+// A newly opened request starts on Body when it has a body but no
+// parameters; otherwise on Params.
+function defaultConfigTab(draft) {
+  const hasParams = (draft.params || []).length > 0 || Object.keys(draft.path_params || {}).length > 0;
+  const hasBody = Boolean(draft.body?.text?.trim());
+  return hasBody && !hasParams ? "body" : "params";
+}
+
+const CONSOLE_MAX_LINES = 2000;
+let consoleLines = 0;
+
+// Script console.* output arrives as "script-console" events, including from
+// a pre-request script that then fails.
+function setupConsole() {
+  const output = $("console-output");
+  const update = () => {
+    $("console-count").textContent = consoleLines ? String(consoleLines) : "";
+    $("console-show").hidden = !consoleLines;
+    $("console-show").textContent = consoleLines ? `Console (${consoleLines})` : "Console";
+  };
+  $("console-clear").addEventListener("click", () => {
+    output.textContent = "";
+    consoleLines = 0;
+    update();
+  });
+  $("console-show").addEventListener("click", () => {
+    toggleRight(true);
+    $("console-details").open = true;
+    output.scrollTop = output.scrollHeight;
+  });
+  window.__TAURI__.event?.listen("script-console", ({ payload }) => {
+    const time = new Date().toLocaleTimeString();
+    const atBottom = output.scrollTop + output.clientHeight >= output.scrollHeight - 4;
+    for (const line of payload) {
+      const row = document.createElement("div");
+      const level = /^\[[^\]]*\] (warn|error): /.exec(line)?.[1];
+      if (level) row.className = `console-${level}`;
+      const stamp = document.createElement("span");
+      stamp.className = "console-time";
+      stamp.textContent = `${time} `;
+      row.append(stamp, line);
+      output.append(row);
+      consoleLines += 1;
+    }
+    while (output.childElementCount > CONSOLE_MAX_LINES) output.firstElementChild.remove();
+    consoleLines = Math.min(consoleLines, CONSOLE_MAX_LINES);
+    if (atBottom) output.scrollTop = output.scrollHeight;
+    update();
+  });
 }
 
 async function boot() {
@@ -4302,6 +4396,7 @@ async function boot() {
   setupSplitter($("split-left"), "left");
   setupSplitter($("split-right"), "right");
   setupRowSplitters();
+  setupConsole();
 
   $("collapse-left").addEventListener("click", () => toggleLeft(false));
   $("collapse-right").addEventListener("click", () => toggleRight(false));
@@ -4374,7 +4469,7 @@ async function boot() {
       items.push(
         { label: "Import from Postman…", action: openImportDialog },
         { label: "Edit globals…", action: () => openEnvironmentEditor(null, true) },
-        { label: "Shared scripts…", action: () => openSharedScripts(sharedScripts()[0]?.name ?? null) },
+        { label: "Shared scripts…", action: () => openSharedScripts(sharedScripts()[0]?.id ?? null) },
       );
     }
     showContextMenu({ preventDefault() {}, stopPropagation: () => event.stopPropagation(), clientX: bounds.left, clientY: bounds.bottom + 4 }, items);

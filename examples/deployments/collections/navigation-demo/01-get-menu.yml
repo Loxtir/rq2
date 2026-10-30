@@ -1,3 +1,4 @@
+id: 2605158f
 name: Get menu
 description: Preview-only request. The fictional .example.test destination has no server.
 method: GET

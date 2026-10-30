@@ -464,6 +464,15 @@ files, which git records as renames rather than rewrites. `store::load` reads th
 tree back, including re-attaching secret values from `.secrets/`; a round-trip
 test asserts the loaded collection equals the imported one.
 
+Identity is separate from order and name. Every `collection.yml`, `folder.yml`
+and request file starts with an `id:` (eight hex characters, unique within its
+collection). Per-user state outside the workspace, local current values and
+request history, refers to collections, folders and requests by these ids, so
+it follows them through renames, moves and reordering. The app and `rq send`
+add missing ids when they open a workspace, editing only that one line in each
+file; a copied file that repeats an id gets a new one, and duplicating in the
+app always assigns fresh ids. Nothing else should depend on an id's value.
+
 ### Variables
 
 Variables resolve from widest to narrowest scope: `globals.yml`, the selected
@@ -508,7 +517,10 @@ definition still wins over a wider local value. Requests, cURL previews/copy,
 deployment URL resolution, and new query evaluations use these current values.
 Existing response views and their exports retain their applied bindings instead.
 Current values survive refreshes and app restarts, and other workspaces
-and environments have independent values. Generated deployment inputs stay
+and environments have independent values. They are stored by collection,
+folder and request id, so they stay with their request when it is renamed or
+moved; values saved by older versions (by tree position) are read as before and
+rewritten by id on the next change. Generated deployment inputs stay
 read-only.
 
 **Use saved value** removes the winning local override, restoring the saved
@@ -798,24 +810,40 @@ folders from outermost to innermost, then request. Scripts are saved in YAML as
 
 #### Shared scripts
 
-A script used by several collections lives once in `scripts/<name>.yml`, with
-the same `pre_request` / `post_response` keys:
+A script used by several collections lives once in `scripts/<name>.js`, a
+plain JavaScript file whose first line is its id:
+
+```js
+// scripts/milestones.js
+// @id 3f9a12c0
+const user = pm.globals.get('user');
+// ...
+```
+
+Layers include it by id, separately for each phase, so the same file can run
+before the request in one place and after the response in another:
 
 ```yaml
 # collections/acme-orders/collection.yml
 scripts:
-  include: [milestones]
+  include:
+    pre_request: [3f9a12c0]
+    post_response: [b71e04aa]
   pre_request: |
-    // runs after milestones
+    // runs after milestones.js
 ```
 
-Each name in `include` runs just before the including layer's own script, in
-list order, and with that layer's scope, so `pm.collectionVariables.set` in a
-shared script writes to the including collection. Folders and requests can
-include too. Shared scripts cannot include others. An include whose file is
-missing fails the send with an error naming it. In the app, tick shared scripts
-on a collection's or folder's **Scripts** section and edit them from the ✎
-next to each, or **⋯ → Shared scripts…**; renaming one updates every include.
+Each id runs just before the including layer's own script of the same phase,
+in list order, and with that layer's scope, so `pm.collectionVariables.set` in
+a shared script writes to the including collection. Folders and requests can
+include too. Shared scripts cannot include others. The file name is only for
+people: renaming or moving a file between names changes no reference. Ids may
+use letters, digits, `-` and `_`, and must be unique; the app generates them.
+An include whose id no file declares fails the send with an error naming it.
+In the app, tick shared scripts in a collection's or folder's **Scripts**
+section and edit them from the ✎ next to each, or **⋯ → Shared scripts…**.
+`console.log` / `info` / `warn` / `error` output appears in the **Console**
+section of the right-hand panel (and on stderr for `rq send`).
 This is a Postman-style subset, not a complete Postman sandbox or test runner:
 `pm.test` is a no-op and full assertion APIs are not implemented. Postman import
 does not import event scripts. CLI `rq send` runs the same pre-request and

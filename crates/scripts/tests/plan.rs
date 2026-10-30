@@ -1,6 +1,6 @@
 use collection::context::RequestContext;
 use collection::live::Scope;
-use collection::model::{Collection, Environment, RequestDef, Scripts};
+use collection::model::{Collection, Environment, RequestDef, SharedScript};
 use collection::store::Workspace;
 use std::collections::BTreeMap;
 
@@ -29,6 +29,42 @@ fn pre_request(
     request.scripts.pre_request = script.into();
     let plan = rq_scripts::Plan::new(&context, &[0, 0], &request, &BTreeMap::new())?;
     plan.pre_request(&mut request, &mut BTreeMap::new())
+}
+
+#[test]
+fn console_output_is_kept_even_when_the_script_fails() {
+    let collection = collection();
+    let context = RequestContext::new(&collection, None, &[], None).unwrap();
+    let mut request = RequestDef::default();
+    request.scripts.pre_request =
+        "console.log('id:', 42, {a: 1}); console.warn('careful'); throw new Error('boom');".into();
+    let plan = rq_scripts::Plan::new(&context, &[0, 0], &request, &BTreeMap::new()).unwrap();
+    assert!(plan
+        .pre_request(&mut request, &mut BTreeMap::new())
+        .is_err());
+    let logs = plan.take_logs();
+    assert_eq!(logs.len(), 2, "{logs:?}");
+    assert!(logs[0].starts_with("[pre-request · "), "{}", logs[0]);
+    assert!(logs[0].ends_with("] id: 42 {\"a\":1}"), "{}", logs[0]);
+    assert!(logs[1].ends_with("] warn: careful"), "{}", logs[1]);
+    assert!(plan.take_logs().is_empty());
+}
+
+#[test]
+fn btoa_and_atob_match_browsers() {
+    let collection = collection();
+    let context = RequestContext::new(&collection, None, &[], None).unwrap();
+    let mut request = RequestDef::default();
+    request.scripts.pre_request = "console.log(btoa('user:pass'), btoa('a'), btoa('ab'), btoa(''), atob('dXNlcjpwYXNz'), atob('YQ=='), atob('YWI='));".into();
+    let plan = rq_scripts::Plan::new(&context, &[0, 0], &request, &BTreeMap::new()).unwrap();
+    plan.pre_request(&mut request, &mut BTreeMap::new())
+        .unwrap();
+    let logs = plan.take_logs();
+    assert!(
+        logs[0].ends_with("] dXNlcjpwYXNz YQ== YWI=  user:pass a ab"),
+        "{}",
+        logs[0]
+    );
 }
 
 #[test]
@@ -108,23 +144,31 @@ fn without_a_deployment_reserved_names_are_ordinary_variables() {
     assert_eq!(variables["baseUrl"], "https://ordinary.test");
 }
 
+fn shared(id: &str, name: &str, code: &str) -> BTreeMap<String, SharedScript> {
+    BTreeMap::from([(
+        id.to_string(),
+        SharedScript {
+            id: id.into(),
+            name: name.into(),
+            code: code.into(),
+        },
+    )])
+}
+
 #[test]
 fn shared_scripts_run_before_the_layer_that_includes_them_and_write_to_its_scope() {
     let mut collection = collection();
-    collection.scripts.include = vec!["milestones".into()];
+    collection.scripts.include.pre_request = vec!["m1".into()];
     collection.scripts.pre_request =
         "pm.variables.set('order', pm.variables.get('order') + ',own');".into();
-    let shared = BTreeMap::from([(
-        "milestones".to_string(),
-        Scripts {
-            pre_request:
-                "pm.variables.set('order', 'shared'); pm.collectionVariables.set('m', '7');".into(),
-            ..Default::default()
-        },
-    )]);
+    let scripts = shared(
+        "m1",
+        "milestones",
+        "pm.variables.set('order', 'shared'); pm.collectionVariables.set('m', '7');",
+    );
     let context = RequestContext::new(&collection, None, &[], None).unwrap();
     let mut request = RequestDef::default();
-    let plan = rq_scripts::Plan::new(&context, &[0, 0], &request, &shared).unwrap();
+    let plan = rq_scripts::Plan::new(&context, &[0, 0], &request, &scripts).unwrap();
     let mut variables = BTreeMap::new();
     let writes = plan.pre_request(&mut request, &mut variables).unwrap();
     assert_eq!(variables["order"], "shared,own");
@@ -137,18 +181,41 @@ fn shared_scripts_run_before_the_layer_that_includes_them_and_write_to_its_scope
     let error = rq_scripts::Plan::new(&context, &[0, 0], &request, &BTreeMap::new())
         .err()
         .unwrap();
-    assert!(error.contains("scripts/milestones.yml"), "{error}");
+    assert!(error.contains("@id m1"), "{error}");
 
-    let broken = BTreeMap::from([(
-        "milestones".to_string(),
-        Scripts {
-            pre_request: "throw new Error('boom')".into(),
-            ..Default::default()
-        },
-    )]);
+    let broken = shared("m1", "milestones", "throw new Error('boom')");
     let plan = rq_scripts::Plan::new(&context, &[0, 0], &request, &broken).unwrap();
     let error = plan
         .pre_request(&mut request, &mut BTreeMap::new())
         .unwrap_err();
     assert!(error.contains("shared script `milestones`"), "{error}");
+}
+
+#[test]
+fn one_shared_script_can_run_in_either_phase() {
+    let mut collection = collection();
+    collection.scripts.include.post_response = vec!["s".into()];
+    let scripts = shared("s", "seen", "pm.variables.set('seen', 'yes');");
+    let context = RequestContext::new(&collection, None, &[], None).unwrap();
+    let mut request = RequestDef::default();
+    let plan = rq_scripts::Plan::new(&context, &[0, 0], &request, &scripts).unwrap();
+    let mut variables = BTreeMap::new();
+    plan.pre_request(&mut request, &mut variables).unwrap();
+    assert!(
+        !variables.contains_key("seen"),
+        "included only after the response"
+    );
+    assert!(plan.has_post_response());
+    let (_, errors) = plan.post_response(
+        &mut request,
+        &mut variables,
+        &rq_scripts::Response {
+            status: 200,
+            elapsed_ms: 1,
+            size: 0,
+            body: "",
+        },
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(variables["seen"], "yes");
 }

@@ -26,7 +26,7 @@
 
 use crate::model::{
     AuthSetting, Body, Collection, Deployment, Environment, Item, KeyValue, RequestDef, Scripts,
-    Variable,
+    SharedScript, Variable,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -67,6 +67,8 @@ pub type SecretValues = Vec<(String, Option<String>)>;
 
 #[derive(Serialize, Deserialize)]
 struct CollectionFile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    id: String,
     name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     service_name: Option<String>,
@@ -90,6 +92,8 @@ struct DeploymentsFile {
 
 #[derive(Serialize, Deserialize)]
 struct FolderFile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    id: String,
     name: String,
     #[serde(default, skip_serializing_if = "AuthSetting::is_inherit")]
     auth: AuthSetting,
@@ -102,6 +106,8 @@ struct FolderFile {
 
 #[derive(Serialize, Deserialize)]
 struct RequestFile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    id: String,
     name: String,
     #[serde(flatten)]
     request: RequestDef,
@@ -168,6 +174,7 @@ fn collection_files(collection: &Collection) -> (Files, SecretValues) {
     let mut committed = collection.clone();
     strip_secrets(committed.all_variables_mut());
     let meta = CollectionFile {
+        id: committed.id,
         name: committed.name,
         service_name: committed.service_name,
         base_path: committed.base_path,
@@ -292,6 +299,7 @@ fn render_items(items: &[Item], base: &str, files: &mut BTreeMap<String, String>
         match &item.request {
             Some(request) => {
                 let file = RequestFile {
+                    id: item.id.clone(),
                     name: item.name.clone(),
                     request: request.clone(),
                 };
@@ -300,6 +308,7 @@ fn render_items(items: &[Item], base: &str, files: &mut BTreeMap<String, String>
             None => {
                 let dir = format!("{base}/{prefix}-{stem}");
                 let folder = FolderFile {
+                    id: item.id.clone(),
                     name: item.name.clone(),
                     auth: item.auth.clone(),
                     variables: item.variables.clone(),
@@ -599,6 +608,7 @@ pub fn save(root: &Path, collection_slug: &str, edit: &Edit) -> Result<SaveOutco
             }
         }
     }
+    workspace.collections[index].assign_ids();
 
     let after = delta_source(&render(
         &workspace.collections[index],
@@ -719,6 +729,7 @@ pub fn create_collection(root: &Path, name: &str) -> Result<String, String> {
         return Err(format!("a collection called `{name}` already exists"));
     }
     let collection = Collection {
+        id: String::new(),
         name,
         service_name: None,
         base_path: None,
@@ -729,6 +740,8 @@ pub fn create_collection(root: &Path, name: &str) -> Result<String, String> {
         scripts: Scripts::default(),
         items: Vec::new(),
     };
+    let mut collection = collection;
+    collection.assign_ids();
     let rendered = render(&collection, &workspace.environments);
     refuse_leaks("save", &rendered.report.leaks)?;
     ensure_gitignore(root).map_err(|error| error.to_string())?;
@@ -757,6 +770,7 @@ fn edit_collection<T>(
         &workspace.environments,
     ));
     let result = change(&mut workspace.collections[index])?;
+    workspace.collections[index].assign_ids();
     let slug = slug_or(&workspace.collections[index].name, "collection");
     if slug != collection_slug
         && workspace
@@ -852,6 +866,7 @@ pub fn add_item(
         });
         let siblings = children_mut(collection, parent)?;
         siblings.push(Item {
+            id: String::new(),
             name,
             auth: AuthSetting::Inherit,
             variables: Vec::new(),
@@ -923,6 +938,7 @@ pub fn duplicate_item(
             .get(index)
             .cloned()
             .ok_or_else(|| "that item is no longer in the tree".to_string())?;
+        crate::model::clear_ids(&mut copy);
         let taken: BTreeSet<String> = siblings.iter().map(|item| item.name.clone()).collect();
         let base = format!("{} copy", copy.name);
         copy.name = base.clone();
@@ -1153,9 +1169,9 @@ pub struct Workspace {
     pub environments: Vec<Environment>,
     /// `globals.yml`: the widest variable layer, shared by every collection.
     pub globals: Vec<Variable>,
-    /// `scripts/<name>.yml`, by file stem: scripts a collection, folder or
-    /// request runs through [`Scripts::include`].
-    pub scripts: BTreeMap<String, Scripts>,
+    /// `scripts/*.js`, by `// @id`: what a collection, folder or request runs
+    /// through [`Scripts::include`].
+    pub scripts: BTreeMap<String, SharedScript>,
 }
 
 impl Workspace {
@@ -1237,12 +1253,27 @@ pub fn load(root: &Path) -> Result<Workspace, String> {
     attach_secrets(globals.iter_mut(), &values);
 
     let mut scripts = BTreeMap::new();
-    for path in sorted_yaml_files(&root.join("scripts"))? {
-        let mut shared: Scripts = serde_norway::from_str(&read(&path)?)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        // One level only: a shared script cannot pull in others.
-        shared.include.clear();
-        scripts.insert(file_stem(&path), shared);
+    let scripts_dir = root.join("scripts");
+    if let Some(old) = sorted_yaml_files(&scripts_dir)?.first() {
+        return Err(format!(
+            "{}: shared scripts are now `scripts/<name>.js` files starting with `// @id <id>`; convert this file",
+            old.display()
+        ));
+    }
+    for path in sorted_entries(&scripts_dir)?
+        .into_iter()
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "js"))
+    {
+        let script = parse_shared_script(&file_stem(&path), &read(&path)?)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        if let Some(other) = scripts.insert(script.id.clone(), script) {
+            return Err(format!(
+                "{}: `// @id {}` is also used by scripts/{}.js; ids must be unique",
+                path.display(),
+                other.id,
+                other.name
+            ));
+        }
     }
 
     crate::deployment::validate(&collections, &environments)?;
@@ -1254,70 +1285,162 @@ pub fn load(root: &Path) -> Result<Workspace, String> {
     })
 }
 
-/// Writes `scripts/<slug>.yml` and returns the slug, which is the name
-/// collections include it by. `previous` is the slug being edited, so a
-/// rename moves the file; includes that used the old name are updated.
+/// The text of `scripts/<name>.js`.
+pub fn render_shared_script(script: &SharedScript) -> String {
+    format!("// @id {}\n{}", script.id, script.code)
+}
+
+/// Reads a shared script file: its first line must be `// @id <id>`.
+pub fn parse_shared_script(name: &str, text: &str) -> Result<SharedScript, String> {
+    let (first, code) = text.split_once('\n').unwrap_or((text, ""));
+    let id = first
+        .trim()
+        .strip_prefix("//")
+        .map(str::trim)
+        .and_then(|rest| rest.strip_prefix("@id"))
+        .map(str::trim)
+        .filter(|id| valid_script_id(id))
+        .ok_or("the first line must be `// @id <id>` (letters, digits, `-` or `_`)")?;
+    Ok(SharedScript {
+        id: id.to_string(),
+        name: name.to_string(),
+        code: code.to_string(),
+    })
+}
+
+fn valid_script_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// A short id no script in `taken` uses.
+fn new_script_id(taken: &BTreeMap<String, SharedScript>) -> String {
+    crate::model::fresh_id(&taken.keys().cloned().collect())
+}
+
+/// Writes `scripts/<name>.js` and returns its id. `id` is the script being
+/// edited, or `None` for a new one. Renaming moves the file; includes refer to
+/// the id, so nothing else changes.
 pub fn save_shared_script(
     root: &Path,
-    previous: Option<&str>,
+    id: Option<&str>,
     name: &str,
-    mut scripts: Scripts,
+    code: &str,
 ) -> Result<String, String> {
-    let mut workspace = load(root)?;
+    let workspace = load(root)?;
     let slug = slugify(&required_name(name)?);
     if slug.is_empty() {
         return Err("a name needs at least one letter or digit".to_string());
     }
-    if previous != Some(slug.as_str()) && workspace.scripts.contains_key(&slug) {
-        return Err(format!("a shared script called `{slug}` already exists"));
+    if let Some(other) = workspace
+        .scripts
+        .values()
+        .find(|script| script.name == slug && Some(script.id.as_str()) != id)
+    {
+        return Err(format!(
+            "a shared script called `{}` already exists",
+            other.name
+        ));
     }
-    scripts.include.clear();
-
-    let file = |slug: &str, scripts: &Scripts| (format!("scripts/{slug}.yml"), yaml(scripts));
+    let file = |script: &SharedScript| {
+        (
+            format!("scripts/{}.js", script.name),
+            render_shared_script(script),
+        )
+    };
     let mut before = BTreeMap::new();
-    if let Some(previous) = previous {
-        let old = workspace
-            .scripts
-            .get(previous)
-            .ok_or_else(|| format!("no shared script called `{previous}`"))?;
-        before.extend([file(previous, old)]);
-    }
-    let mut after = BTreeMap::from([file(&slug, &scripts)]);
-    refuse_leaks("save", &find_leaks(&after, &workspace_secrets(&workspace)))?;
-
-    if let Some(previous) = previous.filter(|previous| *previous != slug) {
-        for collection in &mut workspace.collections {
-            let old = delta_source(&render(collection, &workspace.environments)).files;
-            let mut changed = false;
-            for scripts in collection.all_scripts_mut() {
-                for include in scripts
-                    .include
-                    .iter_mut()
-                    .filter(|include| *include == previous)
-                {
-                    *include = slug.clone();
-                    changed = true;
-                }
-            }
-            if changed {
-                before.extend(old);
-                after.extend(delta_source(&render(collection, &workspace.environments)).files);
-            }
+    let id = match id {
+        Some(id) => {
+            let old = workspace
+                .scripts
+                .get(id)
+                .ok_or_else(|| format!("no shared script with id `{id}`"))?;
+            before.extend([file(old)]);
+            id.to_string()
         }
-    }
+        None => new_script_id(&workspace.scripts),
+    };
+    let after = BTreeMap::from([file(&SharedScript {
+        id: id.clone(),
+        name: slug,
+        code: code.to_string(),
+    })]);
+    refuse_leaks("save", &find_leaks(&after, &workspace_secrets(&workspace)))?;
     apply_delta(root, &before, &after)?;
-    Ok(slug)
+    Ok(id)
 }
 
-/// Removes `scripts/<slug>.yml`. Anything still including it fails to send
+/// Writes an id into every collection, folder and request file that lacks one
+/// (or shares one with an earlier item, as a hand-copied file does). Per-user
+/// state is keyed by these ids, so callers run this when opening a workspace.
+/// Files are edited in place, only by their `id:` line: nothing is renamed or
+/// re-rendered. Returns how many files changed.
+pub fn ensure_ids(root: &Path) -> Result<usize, String> {
+    fn top_level_id(text: &str) -> Option<String> {
+        let value: serde_norway::Value = serde_norway::from_str(text).ok()?;
+        Some(value.get("id")?.as_str()?.to_string()).filter(|id| !id.is_empty())
+    }
+    fn fix(path: &Path, seen: &mut BTreeSet<String>, changed: &mut usize) -> Result<(), String> {
+        let text = read(path)?;
+        if let Some(id) = top_level_id(&text) {
+            if seen.insert(id) {
+                return Ok(());
+            }
+        }
+        let id = crate::model::fresh_id(seen);
+        seen.insert(id.clone());
+        let rest: String = text
+            .split_inclusive('\n')
+            .filter(|line| !line.starts_with("id:"))
+            .collect();
+        fs::write(path, format!("id: {id}\n{rest}"))
+            .map_err(|error| format!("writing {}: {error}", path.display()))?;
+        *changed += 1;
+        Ok(())
+    }
+    fn walk(dir: &Path, seen: &mut BTreeSet<String>, changed: &mut usize) -> Result<(), String> {
+        for entry in sorted_entries(dir)? {
+            if entry.is_dir() {
+                let folder = entry.join("folder.yml");
+                if folder.is_file() {
+                    fix(&folder, seen, changed)?;
+                    walk(&entry, seen, changed)?;
+                }
+            } else if is_numbered(&entry) {
+                fix(&entry, seen, changed)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut changed = 0;
+    for dir in sorted_dirs(&root.join("collections"))? {
+        let meta = dir.join("collection.yml");
+        if !meta.is_file() {
+            continue;
+        }
+        // Ids are unique within a collection, which includes its own.
+        let mut seen = BTreeSet::new();
+        fix(&meta, &mut seen, &mut changed)?;
+        walk(&dir, &mut seen, &mut changed)?;
+    }
+    Ok(changed)
+}
+
+/// Removes a shared script's file. Anything still including it fails to send
 /// with a clear error until the include is removed.
-pub fn delete_shared_script(root: &Path, slug: &str) -> Result<(), String> {
+pub fn delete_shared_script(root: &Path, id: &str) -> Result<(), String> {
     let workspace = load(root)?;
-    let scripts = workspace
+    let script = workspace
         .scripts
-        .get(slug)
-        .ok_or_else(|| format!("no shared script called `{slug}`"))?;
-    let before = BTreeMap::from([(format!("scripts/{slug}.yml"), yaml(scripts))]);
+        .get(id)
+        .ok_or_else(|| format!("no shared script with id `{id}`"))?;
+    let before = BTreeMap::from([(
+        format!("scripts/{}.js", script.name),
+        render_shared_script(script),
+    )]);
     apply_delta(root, &before, &BTreeMap::new())?;
     Ok(())
 }
@@ -1353,6 +1476,7 @@ fn load_collection(dir: &Path) -> Result<Collection, String> {
         serde_norway::from_str(&text).map_err(|e| format!("{}: {e}", meta_path.display()))?;
 
     Ok(Collection {
+        id: meta.id,
         name: meta.name,
         service_name: meta.service_name,
         base_path: meta.base_path,
@@ -1385,6 +1509,7 @@ fn load_items(dir: &Path) -> Result<Vec<Item>, String> {
             let folder: FolderFile = serde_norway::from_str(&text)
                 .map_err(|e| format!("{}: {e}", folder_path.display()))?;
             items.push(Item {
+                id: folder.id,
                 name: folder.name,
                 auth: folder.auth,
                 variables: folder.variables,
@@ -1397,6 +1522,7 @@ fn load_items(dir: &Path) -> Result<Vec<Item>, String> {
             let file: RequestFile =
                 serde_norway::from_str(&text).map_err(|e| format!("{}: {e}", entry.display()))?;
             items.push(Item {
+                id: file.id,
                 name: file.name,
                 auth: AuthSetting::Inherit,
                 variables: Vec::new(),

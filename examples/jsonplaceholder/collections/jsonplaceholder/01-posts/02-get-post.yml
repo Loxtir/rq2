@@ -1,3 +1,4 @@
+id: c8baa3d2
 name: Get post
 method: GET
 url: '{{baseUrl}}/posts/:postId'

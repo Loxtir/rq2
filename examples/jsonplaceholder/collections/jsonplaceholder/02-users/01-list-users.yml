@@ -1,3 +1,4 @@
+id: dc8349c1
 name: List users
 method: GET
 url: '{{baseUrl}}/users'

@@ -19,6 +19,7 @@ fn variable(name: &str, value: &str, secret: bool) -> Variable {
 
 fn collection(auth: AuthSetting, variables: Vec<Variable>) -> Collection {
     Collection {
+        id: String::new(),
         service_name: None,
         base_path: None,
         deployments: Vec::new(),

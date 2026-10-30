@@ -437,6 +437,8 @@ fn cmd_send(
 
     let live_values =
         collection::live::LiveValues::default_path().map(collection::live::LiveValues::new);
+    // Current values and script writes are keyed by these ids.
+    collection::store::ensure_ids(&workspace).map_err(anyhow::Error::msg)?;
     let loaded = match &live_values {
         Some(values) => values.load(&workspace),
         None => collection::store::load(&workspace),
@@ -492,9 +494,11 @@ fn cmd_send(
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    let writes = plan
-        .pre_request(&mut request, &mut variables)
-        .map_err(|error| anyhow!("pre-request script: {error}"))?;
+    let writes = plan.pre_request(&mut request, &mut variables);
+    for line in plan.take_logs() {
+        eprintln!("{line}");
+    }
+    let writes = writes.map_err(|error| anyhow!("pre-request script: {error}"))?;
 
     // Script writes become current values; resolve again through the scope
     // chain so a narrower saved value still wins, as in the app.
@@ -542,6 +546,9 @@ fn cmd_send(
                 body: &body,
             },
         );
+        for line in plan.take_logs() {
+            eprintln!("{line}");
+        }
         for error in errors {
             eprintln!("warning: post-response script {error}");
         }

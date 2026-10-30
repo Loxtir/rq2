@@ -54,6 +54,31 @@ function harness(invoke) {
 
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
+test("a request opens on Body only when it has a body and no parameters", () => {
+  const { context } = harness(() => null);
+  const body = { mode: "raw", text: "{\"a\":1}" };
+  assert.equal(context.defaultConfigTab({ params: [{ name: "q", value: "1" }], body: null }), "params");
+  assert.equal(context.defaultConfigTab({ params: [], path_params: {}, body }), "body");
+  assert.equal(context.defaultConfigTab({ params: [], path_params: { id: "1" }, body }), "params");
+  assert.equal(context.defaultConfigTab({ params: [], body: { mode: "raw", text: "  " } }), "params");
+});
+
+test("collections collapse and expand, remembered per workspace", () => {
+  const { context, state } = harness(() => null);
+  const stored = new Map();
+  context.localStorage.getItem = (key) => stored.get(key) ?? null;
+  context.localStorage.setItem = (key, value) => stored.set(key, value);
+  state.workspace = { path: "C:/ws", collections: [{ slug: "a", name: "A", items: [] }, { slug: "b", name: "B", items: [] }] };
+  context.toggleCollectionCollapsed("a");
+  assert.deepEqual([...context.collapsedCollections()], ["a"]);
+  context.toggleCollectionCollapsed("a");
+  assert.deepEqual([...context.collapsedCollections()], []);
+  context.setCollapsedCollections(["a", "b"]);
+  assert.deepEqual([...context.collapsedCollections()], ["a", "b"]);
+  state.workspace = { ...state.workspace, path: "C:/other" };
+  assert.deepEqual([...context.collapsedCollections()], []);
+});
+
 test("paths shift the way the tree does when items are removed, inserted or moved", () => {
   const { context } = harness(() => null);
   const remove = context.removalMap([1]);
@@ -100,27 +125,30 @@ test("deleting an item closes its tab and keeps the others on their own drafts",
 });
 
 
-test("ticking shared scripts keeps run order and unticking all leaves the draft clean", () => {
+test("ticking shared scripts keeps run order per phase and unticking all leaves the draft clean", () => {
   const h = harness(() => null);
-  h.state.workspace = { scripts: [{ name: "milestones", used_by: [] }, { name: "auth", used_by: [] }] };
+  h.state.workspace = { scripts: [{ id: "m1", name: "milestones", code: "", used_by: [] }, { id: "a1", name: "auth", code: "", used_by: [] }] };
   h.state.draft = { scripts: { pre_request: "", post_response: "" } };
   const before = JSON.stringify(h.state.draft);
-  h.context.toggleInclude("auth", true);
-  h.context.toggleInclude("milestones", true);
-  assert.deepEqual(plain(h.state.draft.scripts.include), ["auth", "milestones"]);
-  h.context.toggleInclude("auth", false);
-  h.context.toggleInclude("milestones", false);
+  h.context.toggleInclude("pre_request", "a1", true);
+  h.context.toggleInclude("pre_request", "m1", true);
+  h.context.toggleInclude("post_response", "m1", true);
+  assert.deepEqual(plain(h.state.draft.scripts.include), { pre_request: ["a1", "m1"], post_response: ["m1"] });
+  h.context.toggleInclude("pre_request", "a1", false);
+  h.context.toggleInclude("pre_request", "m1", false);
+  h.context.toggleInclude("post_response", "m1", false);
   assert.equal(JSON.stringify(h.state.draft), before);
 });
 
-test("renaming a shared script renames it in open drafts without making them dirty", () => {
-  const h = harness(() => null);
-  const draft = { scripts: { include: ["old", "other"] } };
-  h.drafts.set("collection:api:", { draft, saved: JSON.stringify(draft) });
-  h.state.draft = draft;
-  h.context.renameIncludes("old", "new");
-  const entry = h.drafts.get("collection:api:");
-  assert.deepEqual(plain(entry.draft.scripts.include), ["new", "other"]);
-  assert.equal(entry.saved, JSON.stringify(entry.draft));
-  assert.equal(h.state.saved, entry.saved);
+test("saving a shared script sends its id, name and code", async () => {
+  const h = harness((command) => command === "save_shared_script"
+    ? { id: "m1", workspace: { scripts: [{ id: "m1", name: "sprints", code: "// v2", used_by: [] }], collections: [] } }
+    : null);
+  h.state.workspace = { scripts: [{ id: "m1", name: "milestones", code: "// v1", used_by: [] }], collections: [] };
+  h.context.loadSharedScript("m1");
+  h.context.document.getElementById("shared-script-name").value = "sprints";
+  h.context.document.getElementById("shared-script-code").value = "// v2";
+  await h.context.saveSharedScript();
+  const call = h.calls.find((item) => item.command === "save_shared_script");
+  assert.deepEqual(plain(call.args), { id: "m1", name: "sprints", code: "// v2" });
 });

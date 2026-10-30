@@ -71,18 +71,21 @@ pub fn parse_collection(bytes: &[u8], extra_secrets: &[String]) -> Result<Parsed
     let variables = parse_variables(doc.get("variable"), extra_secrets, &mut warnings);
     let items = parse_items(doc.get("item"), extra_secrets, &mut warnings);
 
+    let mut collection = Collection {
+        id: String::new(),
+        name,
+        service_name: None,
+        base_path: None,
+        deployments: Vec::new(),
+        description: text_of(info.and_then(|i| i.get("description"))),
+        auth: parse_auth(doc.get("auth"), &mut warnings),
+        variables,
+        scripts: Default::default(),
+        items,
+    };
+    collection.assign_ids();
     Ok(Parsed {
-        collection: Collection {
-            name,
-            service_name: None,
-            base_path: None,
-            deployments: Vec::new(),
-            description: text_of(info.and_then(|i| i.get("description"))),
-            auth: parse_auth(doc.get("auth"), &mut warnings),
-            variables,
-            scripts: Default::default(),
-            items,
-        },
+        collection,
         warnings,
     })
 }
@@ -165,6 +168,7 @@ fn parse_items(
             };
             definition.variables = variables;
             out.push(Item {
+                id: String::new(),
                 name,
                 auth: AuthSetting::Inherit,
                 variables: Vec::new(),
@@ -174,6 +178,7 @@ fn parse_items(
             });
         } else if entry.get("item").is_some() {
             out.push(Item {
+                id: String::new(),
                 name,
                 auth,
                 variables,

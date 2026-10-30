@@ -1,3 +1,4 @@
+id: 678f019d
 name: Create post
 method: POST
 url: '{{baseUrl}}/posts'

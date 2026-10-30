@@ -1,3 +1,4 @@
+id: dda12efd
 name: List categories
 description: Preview-only request demonstrating a tenant-dependent base path and a stable hostname.
 method: GET

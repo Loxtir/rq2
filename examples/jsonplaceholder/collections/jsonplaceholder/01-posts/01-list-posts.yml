@@ -1,3 +1,4 @@
+id: 646d595a
 name: List posts
 method: GET
 url: '{{baseUrl}}/posts'

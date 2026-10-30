@@ -158,43 +158,142 @@ fn a_duplicated_secret_keeps_its_value_and_a_deleted_collection_takes_its_secret
     std::fs::remove_dir_all(root).unwrap();
 }
 
+fn ids(root: &Path) -> Vec<(String, String)> {
+    fn walk(items: &[collection::model::Item], out: &mut Vec<(String, String)>) {
+        for item in items {
+            out.push((item.name.clone(), item.id.clone()));
+            walk(&item.items, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&store::load(root).unwrap().collections[0].items, &mut out);
+    out
+}
+
 #[test]
-fn shared_scripts_save_rename_with_their_includes_and_delete() {
-    let root = sample("shared");
-    let script = |text: &str| collection::model::Scripts {
-        pre_request: text.into(),
-        ..Default::default()
-    };
+fn ids_are_written_kept_through_edits_and_fresh_for_copies() {
+    let root = sample("ids");
+    let before = ids(&root);
+    assert!(before.iter().all(|(_, id)| id.len() == 8), "{before:?}");
+    let collection_id = store::load(&root).unwrap().collections[0].id.clone();
+    assert!(!collection_id.is_empty());
+
+    // Rename, move and reorder: same ids.
+    store::rename_item(&root, "demo", &[0], "a renamed").unwrap();
+    store::move_item(&root, "demo", &[2], &[], 0).unwrap();
+    store::rename_collection(&root, "demo", "Demo Two").unwrap();
+    let workspace = store::load(&root).unwrap();
+    assert_eq!(workspace.collections[0].id, collection_id);
+    let id_of = |name: &str| before.iter().find(|(n, _)| n == name).unwrap().1.clone();
+    let collection = workspace.collection("demo-two").unwrap();
+    assert_eq!(collection.path_of(&id_of("b")), Some(vec![2]));
+    assert_eq!(collection.path_of(&id_of("c")), Some(vec![0, 0]));
+    assert_eq!(collection.id_at(&[1]), Some(id_of("a").as_str()));
+
+    // A copy gets new ids all the way down.
+    let copy = store::duplicate_item(&root, "demo-two", &[0]).unwrap();
+    let workspace = store::load(&root).unwrap();
+    let collection = workspace.collection("demo-two").unwrap();
+    let all = ids(&root);
+    let unique: std::collections::BTreeSet<_> = all.iter().map(|(_, id)| id).collect();
+    assert_eq!(unique.len(), all.len(), "{all:?}");
+    assert!(collection.id_at(&copy).is_some());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ensure_ids_fills_missing_and_duplicate_ids_on_disk() {
+    let root = sample("ensure");
+    let dir = root.join("collections/demo");
+    let a = std::fs::read_to_string(dir.join("01-a.yml")).unwrap();
+    // A file from before ids, and a hand-made copy sharing a's id.
+    let without: String = a
+        .lines()
+        .filter(|line| !line.starts_with("id:"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    std::fs::write(dir.join("01-a.yml"), &without).unwrap();
+    std::fs::write(dir.join("02-b.yml"), a.replace("name: a", "name: b")).unwrap();
+    std::fs::write(dir.join("09-z.yml"), a.replace("name: a", "name: z")).unwrap();
+
+    // a lost its id; b copies a's (b keeps it, being first now); z too.
+    assert_eq!(store::ensure_ids(&root).unwrap(), 2);
+    let all = ids(&root);
+    let unique: std::collections::BTreeSet<_> = all.iter().map(|(_, id)| id.clone()).collect();
+    assert!(all.iter().all(|(_, id)| !id.is_empty()), "{all:?}");
+    assert_eq!(unique.len(), all.len(), "{all:?}");
     assert_eq!(
-        store::save_shared_script(
-            &root,
-            None,
-            "Milestones",
-            script("pm.variables.set('m', '1');")
-        )
-        .unwrap(),
-        "milestones"
+        names(&root),
+        ["a", "b", "F", "F/c", "z"],
+        "no file is renamed or duplicated"
+    );
+    assert!(dir.join("09-z.yml").is_file());
+    assert_eq!(store::ensure_ids(&root).unwrap(), 0, "stable once written");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn shared_scripts_are_js_files_referenced_by_id() {
+    let root = sample("shared");
+    let id = store::save_shared_script(&root, None, "Milestones", "pm.variables.set('m', '1');\n")
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("scripts/milestones.js")).unwrap(),
+        format!("// @id {id}\npm.variables.set('m', '1');\n")
     );
     assert!(
-        store::save_shared_script(&root, None, "milestones", script("")).is_err(),
+        store::save_shared_script(&root, None, "milestones", "").is_err(),
         "taken"
     );
 
     let meta = root.join("collections/demo/collection.yml");
     let text = std::fs::read_to_string(&meta).unwrap();
-    std::fs::write(&meta, format!("{text}scripts:\n  include: [milestones]\n")).unwrap();
+    std::fs::write(
+        &meta,
+        format!("{text}scripts:\n  include:\n    pre_request: [{id}]\n"),
+    )
+    .unwrap();
+    let before = std::fs::read_to_string(&meta).unwrap();
 
-    store::save_shared_script(&root, Some("milestones"), "Sprints", script("// v2")).unwrap();
-    let workspace = store::load(&root).unwrap();
-    assert_eq!(workspace.scripts.keys().collect::<Vec<_>>(), ["sprints"]);
-    assert_eq!(workspace.scripts["sprints"].pre_request, "// v2");
+    // Renaming moves the file and leaves every reference alone.
     assert_eq!(
-        workspace.collection("demo").unwrap().scripts.include,
-        ["sprints"]
+        store::save_shared_script(&root, Some(&id), "Sprints", "// v2\n").unwrap(),
+        id
     );
-    assert!(!root.join("scripts/milestones.yml").exists());
+    let workspace = store::load(&root).unwrap();
+    assert_eq!(workspace.scripts[&id].name, "sprints");
+    assert_eq!(workspace.scripts[&id].code, "// v2\n");
+    assert_eq!(
+        workspace
+            .collection("demo")
+            .unwrap()
+            .scripts
+            .include
+            .pre_request,
+        std::slice::from_ref(&id)
+    );
+    assert!(workspace.collection("demo").unwrap().includes(&id));
+    assert_eq!(std::fs::read_to_string(&meta).unwrap(), before);
+    assert!(!root.join("scripts/milestones.js").exists());
 
-    store::delete_shared_script(&root, "sprints").unwrap();
+    // Hand-written files work as long as they carry an id.
+    std::fs::write(
+        root.join("scripts/by-hand.js"),
+        "// @id hand_1\r\nconsole.log(1);\r\n",
+    )
+    .unwrap();
+    assert_eq!(
+        store::load(&root).unwrap().scripts["hand_1"].name,
+        "by-hand"
+    );
+    std::fs::write(root.join("scripts/no-id.js"), "console.log(1);\n").unwrap();
+    assert!(store::load(&root).err().unwrap().contains("@id"));
+    std::fs::write(root.join("scripts/no-id.js"), "// @id hand_1\n").unwrap();
+    assert!(store::load(&root).err().unwrap().contains("unique"));
+    std::fs::remove_file(root.join("scripts/no-id.js")).unwrap();
+    std::fs::remove_file(root.join("scripts/by-hand.js")).unwrap();
+
+    store::delete_shared_script(&root, &id).unwrap();
     assert!(store::load(&root).unwrap().scripts.is_empty());
     std::fs::remove_dir_all(root).unwrap();
 }

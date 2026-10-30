@@ -42,6 +42,7 @@ fn bearer() -> AuthSetting {
 
 fn collection(variables: Vec<Variable>) -> Collection {
     Collection {
+        id: String::new(),
         service_name: None,
         base_path: None,
         deployments: Vec::new(),
@@ -52,12 +53,14 @@ fn collection(variables: Vec<Variable>) -> Collection {
         variables,
         items: vec![
             Item {
+                id: String::new(),
                 name: "Orders".to_string(),
                 auth: Default::default(),
                 variables: Vec::new(),
                 scripts: Default::default(),
                 request: None,
                 items: vec![Item {
+                    id: String::new(),
                     name: "List orders".to_string(),
                     auth: Default::default(),
                     variables: Vec::new(),
@@ -79,6 +82,7 @@ fn collection(variables: Vec<Variable>) -> Collection {
                 }],
             },
             Item {
+                id: String::new(),
                 name: "Create order".to_string(),
                 auth: Default::default(),
                 variables: Vec::new(),

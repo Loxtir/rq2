@@ -18,6 +18,7 @@ fn var(name: &str, value: Option<&str>) -> Variable {
 
 fn collection(variables: Vec<Variable>) -> Collection {
     Collection {
+        id: String::new(),
         service_name: None,
         base_path: None,
         deployments: Vec::new(),
@@ -27,6 +28,7 @@ fn collection(variables: Vec<Variable>) -> Collection {
         auth: Default::default(),
         variables,
         items: vec![Item {
+            id: String::new(),
             name: "Request".to_string(),
             auth: Default::default(),
             variables: Vec::new(),
@@ -146,12 +148,14 @@ fn a_collection_value_can_compose_a_global() {
 fn composition_follows_the_scope_chain() {
     let mut collection = collection(vec![var("host", Some("https://collection.test"))]);
     collection.items = vec![Item {
+        id: String::new(),
         name: "Folder".to_string(),
         auth: Default::default(),
         variables: vec![var("host", Some("https://{{region}}.test"))],
         scripts: Default::default(),
         request: None,
         items: vec![Item {
+            id: String::new(),
             name: "Request".to_string(),
             auth: Default::default(),
             variables: Vec::new(),
@@ -179,12 +183,14 @@ fn the_narrowest_layer_wins_at_every_step() {
     let globals = vec![var("who", Some("globals"))];
     let mut collection = collection(vec![var("who", Some("collection"))]);
     collection.items = vec![Item {
+        id: String::new(),
         name: "Folder".to_string(),
         auth: Default::default(),
         variables: vec![var("who", Some("folder"))],
         scripts: Default::default(),
         request: None,
         items: vec![Item {
+            id: String::new(),
             name: "Request".to_string(),
             auth: Default::default(),
             variables: Vec::new(),

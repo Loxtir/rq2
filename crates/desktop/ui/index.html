@@ -147,10 +147,10 @@
           <button class="tab" data-tab="params">
             Params <span id="param-count" class="count"></span>
           </button>
+          <button class="tab" data-tab="body">Body</button>
           <button class="tab" data-tab="headers">
             Headers <span id="header-count" class="count"></span>
           </button>
-          <button class="tab" data-tab="body">Body</button>
           <button class="tab" data-tab="auth">Auth</button>
           <button class="tab" data-tab="scripts">Scripts</button>
         </div>
@@ -211,6 +211,7 @@
             <span id="timing" class="muted"></span>
             <span id="response-environment" class="tag" hidden></span>
             <span id="script-errors" class="status status-error" hidden></span>
+            <button id="console-show" class="btn btn-ghost" type="button" title="Show script console output" hidden>Console</button>
             <span id="tls" class="tag tag-warn" hidden>TLS not verified</span>
             <span class="spacer"></span>
             <span id="resolved" class="resolved" hidden></span>
@@ -295,10 +296,14 @@
           <span class="muted">shared scripts run first, in the order ticked, then this one</span>
         </div>
         <div class="field">
-          <span class="field-label">Shared scripts</span>
-          <div id="node-includes" class="include-list"></div>
+          <span class="field-label">Shared scripts before the request</span>
+          <div id="node-includes-pre" class="include-list"></div>
         </div>
         <label class="field"><span class="field-label">Pre-request</span><textarea id="node-pre-script" class="body-text script-editor" spellcheck="false"></textarea></label>
+        <div class="field">
+          <span class="field-label">Shared scripts after the response</span>
+          <div id="node-includes-post" class="include-list"></div>
+        </div>
         <label class="field"><span class="field-label">Post-response</span><textarea id="node-post-script" class="body-text script-editor" spellcheck="false"></textarea></label>
       </section>
     </main>
@@ -332,6 +337,16 @@
         <details id="command-details" class="command-details" open>
           <summary class="section-title">Details</summary>
           <dl id="summary" class="summary"></dl>
+        </details>
+
+        <details id="console-details" class="command-details console-details">
+          <summary class="section-title">Console <span id="console-count" class="count"></span></summary>
+          <div class="console-actions">
+            <span class="muted">console.log output from scripts</span>
+            <span class="spacer"></span>
+            <button id="console-clear" class="btn btn-ghost" type="button">Clear</button>
+          </div>
+          <pre id="console-output" class="code console-output"></pre>
         </details>
       </div>
     </aside>
@@ -400,17 +415,16 @@
           <strong>Shared scripts</strong>
           <button type="button" id="shared-script-close" class="icon-btn" title="Close">×</button>
         </div>
-        <p class="hint">Saved in scripts/ and run by every collection or folder that ticks it, with that collection's or folder's variables. Editing one here changes it everywhere.</p>
+        <p class="hint">Each is a file, scripts/&lt;name&gt;.js, starting with a <code>// @id</code> line. Collections and folders include it by id, before the request or after the response, and run it with their own variables. Renaming only renames the file. Editing one here changes it everywhere.</p>
         <label class="field">
           <span class="field-label">Script</span>
           <select id="shared-script-pick" class="select"></select>
         </label>
         <label class="field">
-          <span class="field-label">Name</span>
+          <span class="field-label">Name (file name)</span>
           <input id="shared-script-name" class="cell" autocomplete="off" spellcheck="false" placeholder="milestones" />
         </label>
-        <label class="field"><span class="field-label">Pre-request</span><textarea id="shared-script-pre" class="body-text script-editor" spellcheck="false"></textarea></label>
-        <label class="field"><span class="field-label">Post-response</span><textarea id="shared-script-post" class="body-text script-editor" spellcheck="false"></textarea></label>
+        <label class="field"><span class="field-label">Code</span><textarea id="shared-script-code" class="body-text script-editor" spellcheck="false"></textarea></label>
         <p id="shared-script-used" class="hint"></p>
         <div id="shared-script-note" class="muted dialog-note" role="status" aria-live="polite"></div>
         <div class="dialog-actions">
