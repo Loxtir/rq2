@@ -77,17 +77,7 @@ pub fn render(
         .flatten()
         .unwrap_or_default();
 
-    if !parts.query.is_empty() {
-        url.push(if url.contains('?') { '&' } else { '?' });
-        url.push_str(
-            &parts
-                .query
-                .iter()
-                .map(|(name, value)| format!("{name}={value}"))
-                .collect::<Vec<_>>()
-                .join("&"),
-        );
-    }
+    send::append_auth_query(&mut url, &parts.query);
 
     let mut args: Vec<String> = Vec::new();
     let method = request.method.trim().to_uppercase();

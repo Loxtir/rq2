@@ -11,20 +11,27 @@
       <header class="pane-head brand">
         <span class="logo">rq</span>
         <span id="workspace-name" class="workspace-name">no workspace</span>
+        <button id="workspace-menu" class="icon-btn" title="Workspace: open, import, globals" aria-haspopup="menu">&#8943;</button>
         <button id="collapse-left" class="icon-btn" title="Collapse the tree (Ctrl+B)">&#171;</button>
       </header>
 
       <div class="sidebar-tools">
-        <select id="environment" class="select" title="Environment">
-          <option value="">no environment</option>
-        </select>
-        <button id="environment-add" class="btn btn-ghost" title="Add an environment">+</button>
-        <button id="environment-edit" class="btn btn-ghost" title="Edit selected environment">Edit</button>
-        <button id="globals-edit" class="btn btn-ghost" title="Edit workspace globals">Globals</button>
-        <button id="open-workspace" class="btn btn-ghost" title="Open a workspace folder">
-          Open
-        </button>
-        <button id="import-postman" class="btn btn-ghost" title="Import Postman JSON into this workspace" disabled>Import</button>
+        <div class="tool-row">
+          <label class="picker" title="Environment">
+            <span class="picker-label">Env</span>
+            <select id="environment" class="select" aria-label="Environment">
+              <option value="">none</option>
+            </select>
+          </label>
+          <button id="environment-edit" class="icon-btn tool-btn" title="Edit selected environment" aria-label="Edit selected environment">&#9998;</button>
+          <button id="environment-add" class="icon-btn tool-btn" title="New environment" aria-label="New environment">+</button>
+        </div>
+        <div id="tenant-row" class="tool-row" hidden>
+          <label class="picker" title="Tenant, for every collection with deployments">
+            <span class="picker-label">Tenant</span>
+            <select id="deployment-tenant" class="select" aria-label="Tenant"></select>
+          </label>
+        </div>
       </div>
 
       <details id="collections-section" class="sidebar-section" open>
@@ -33,6 +40,7 @@
           <div class="tree-search">
             <input id="tree-search" class="tree-search-input" type="search" placeholder="Search requests by name or URL" autocomplete="off" spellcheck="false" aria-label="Search requests by name or URL" />
             <button id="tree-search-clear" class="icon-btn" type="button" title="Clear search" hidden>×</button>
+            <button id="collection-add" class="icon-btn" type="button" title="New collection" disabled>+</button>
           </div>
           <nav id="tree" class="tree">
             <p class="hint">Open a workspace to begin.</p>
@@ -85,8 +93,10 @@
 
       <section id="request-view" class="view" hidden>
         <div id="deployment-bar" class="deployment-bar" hidden>
-          <label>Tenant <select id="deployment-tenant" class="select" aria-label="Tenant"></select></label>
-          <label>Deployment <select id="deployment-target" class="select" aria-label="Platform and slot"></select></label>
+          <label class="picker" title="Platform and slot for this collection">
+            <span class="picker-label">Deployment</span>
+            <select id="deployment-target" class="select" aria-label="Platform and slot"></select>
+          </label>
           <span id="deployment-destination" class="deployment-destination"></span>
         </div>
         <div class="url-bar">
@@ -187,9 +197,12 @@
           </div>
           <div id="tab-scripts" class="tab-panel" hidden>
             <label class="field"><span class="field-label">Pre-request</span><textarea id="request-pre-script" class="body-text script-editor" spellcheck="false"></textarea></label>
+            <div id="split-script" class="splitter splitter-row" role="separator" aria-orientation="horizontal" title="Drag to resize · double-click to reset"></div>
             <label class="field"><span class="field-label">Post-response</span><textarea id="request-post-script" class="body-text script-editor" spellcheck="false"></textarea></label>
           </div>
         </div>
+
+        <div id="split-request" class="splitter splitter-row" role="separator" aria-orientation="horizontal" title="Drag to resize · double-click to reset"></div>
 
         <div class="response">
           <div class="response-bar">
@@ -202,7 +215,7 @@
             <span class="spacer"></span>
             <span id="resolved" class="resolved" hidden></span>
             <span id="sizes" class="muted"></span>
-            <button id="save-response" class="btn btn-ghost" disabled title="Save the current query result, or the full original body if the query is empty. Responses may contain sensitive data.">Save to file</button>
+            <button id="save-response" class="btn btn-ghost" disabled title="Save the last applied response view using its frozen variable bindings. Unapplied query edits are not exported. Responses may contain sensitive data.">Save to file</button>
           </div>
           <div id="response-save-note" class="muted query-note" role="status" hidden></div>
 
@@ -217,11 +230,12 @@
               autocomplete="off"
               placeholder="{ id title }"
             ></textarea>
-            <button id="apply-query" class="btn btn-ghost">Apply</button>
+            <button id="apply-query" class="btn btn-ghost" title="Evaluate against this response using current variables. Changing variables or switching tabs does not change the last applied view.">Apply</button>
             <button id="suggest" class="btn btn-ghost" title="Infer a query from this response">
               Suggest
             </button>
           </div>
+          <div id="split-query" class="splitter splitter-row splitter-inset" role="separator" aria-orientation="horizontal" title="Drag to resize the query · double-click to fit its content"></div>
 
           <div id="saved-query-bar" class="query-bar saved-query-bar">
             <select id="saved-query" class="select" aria-label="Saved queries" disabled>
@@ -276,7 +290,14 @@
           <span class="muted">applies to every request that inherits it</span>
         </div>
         <div id="node-auth" class="auth-host"></div>
-        <div class="section-title">Scripts</div>
+        <div class="section-title">
+          Scripts
+          <span class="muted">shared scripts run first, in the order ticked, then this one</span>
+        </div>
+        <div class="field">
+          <span class="field-label">Shared scripts</span>
+          <div id="node-includes" class="include-list"></div>
+        </div>
         <label class="field"><span class="field-label">Pre-request</span><textarea id="node-pre-script" class="body-text script-editor" spellcheck="false"></textarea></label>
         <label class="field"><span class="field-label">Post-response</span><textarea id="node-post-script" class="body-text script-editor" spellcheck="false"></textarea></label>
       </section>
@@ -340,6 +361,66 @@
         <button id="var-cancel" class="btn btn-ghost">Close</button>
       </div>
     </div>
+
+    <dialog id="create-dialog" class="editor-dialog">
+      <form method="dialog" id="create-form">
+        <div class="dialog-head">
+          <strong id="create-title">New request</strong>
+          <button type="button" id="create-close" class="icon-btn" title="Close">×</button>
+        </div>
+        <p id="create-where" class="hint"></p>
+        <label id="create-kind-field" class="field">
+          <span class="field-label">Type</span>
+          <select id="create-kind" class="select">
+            <option value="request">Request</option>
+            <option value="folder">Folder</option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="field-label">Name</span>
+          <input id="create-name" class="cell" autocomplete="off" spellcheck="false" />
+        </label>
+        <label id="create-curl-field" class="field">
+          <span class="field-label">cURL command (optional)</span>
+          <textarea id="create-curl" class="cell create-curl" rows="8" spellcheck="false" placeholder="curl 'https://api.example.com/items?page=1' -H 'Authorization: Bearer …'"></textarea>
+        </label>
+        <p id="create-curl-hint" class="hint">Method, URL, query parameters, headers and body are filled in from the command. Bearer and basic credentials become request auth, with the value kept as a secret in .secrets/.</p>
+        <div id="create-note" class="muted dialog-note" role="status" aria-live="polite"></div>
+        <div class="dialog-actions">
+          <span class="spacer"></span>
+          <button type="button" id="create-cancel" class="btn btn-ghost">Cancel</button>
+          <button type="submit" id="create-submit" class="btn btn-primary">Create</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="shared-script-dialog" class="editor-dialog">
+      <form method="dialog" id="shared-script-form">
+        <div class="dialog-head">
+          <strong>Shared scripts</strong>
+          <button type="button" id="shared-script-close" class="icon-btn" title="Close">×</button>
+        </div>
+        <p class="hint">Saved in scripts/ and run by every collection or folder that ticks it, with that collection's or folder's variables. Editing one here changes it everywhere.</p>
+        <label class="field">
+          <span class="field-label">Script</span>
+          <select id="shared-script-pick" class="select"></select>
+        </label>
+        <label class="field">
+          <span class="field-label">Name</span>
+          <input id="shared-script-name" class="cell" autocomplete="off" spellcheck="false" placeholder="milestones" />
+        </label>
+        <label class="field"><span class="field-label">Pre-request</span><textarea id="shared-script-pre" class="body-text script-editor" spellcheck="false"></textarea></label>
+        <label class="field"><span class="field-label">Post-response</span><textarea id="shared-script-post" class="body-text script-editor" spellcheck="false"></textarea></label>
+        <p id="shared-script-used" class="hint"></p>
+        <div id="shared-script-note" class="muted dialog-note" role="status" aria-live="polite"></div>
+        <div class="dialog-actions">
+          <button type="button" id="shared-script-delete" class="btn btn-danger">Delete</button>
+          <span class="spacer"></span>
+          <button type="button" id="shared-script-cancel" class="btn btn-ghost">Close</button>
+          <button type="submit" id="shared-script-save" class="btn btn-primary">Save</button>
+        </div>
+      </form>
+    </dialog>
 
     <dialog id="import-dialog" class="editor-dialog">
       <form method="dialog">
@@ -407,6 +488,7 @@
       <div id="request-history-list" class="request-history-list"></div>
     </dialog>
 
+    <div id="context-menu" class="context-menu" role="menu" hidden></div>
     <script src="syntax.js"></script>
     <script src="app.js"></script>
   </body>

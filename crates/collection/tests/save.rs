@@ -381,6 +381,7 @@ fn an_environment_variable_can_be_saved_on_its_own() {
     // Environment files are not the collection's; write one through the same
     // machinery by rendering it with the collection, then edit just its value.
     let environment = collection::model::Environment {
+        main_slot: None,
         platforms: Vec::new(),
         name: "dev".to_string(),
         insecure: false,

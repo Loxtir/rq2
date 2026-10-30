@@ -127,6 +127,7 @@ fn a_collection_value_wins_over_the_environment() {
         vec![variable("baseUrl", "https://prod.test", false)],
     );
     let environment = Environment {
+        main_slot: None,
         platforms: Vec::new(),
         name: "Dev".to_string(),
         insecure: false,
@@ -200,6 +201,38 @@ fn an_api_key_in_the_query_is_appended_to_the_url() {
         preview
             .text
             .contains("'https://acme.test/orders?limit=1&api_key=***'"),
+        "{}",
+        preview.text
+    );
+}
+
+#[test]
+fn an_api_key_in_the_query_is_percent_encoded() {
+    let collection = collection(
+        AuthSetting::Method(Auth {
+            kind: "apikey".to_string(),
+            fields: [
+                ("key".to_string(), "api key".to_string()),
+                ("value".to_string(), "{{apiKey}}".to_string()),
+                ("in".to_string(), "query".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        }),
+        vec![variable("apiKey", "a&b=c#d", false)],
+    );
+    let variables = masked_variables(&collection, None, &[], &[]);
+
+    let preview = render(
+        &request("GET", "https://acme.test/orders"),
+        collection.auth.method(),
+        &variables,
+    );
+
+    assert!(
+        preview
+            .text
+            .contains("'https://acme.test/orders?api%20key=a%26b%3Dc%23d'"),
         "{}",
         preview.text
     );

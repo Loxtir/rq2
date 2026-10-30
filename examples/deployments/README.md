@@ -4,7 +4,7 @@ Open this directory as a workspace in rq, then select **Get menu** under
 **Navigation Demo**.
 
 1. Select the **stage** environment in the sidebar.
-2. Select tenant **acme** above the request URL.
+2. Select tenant **acme** in the sidebar, under the environment.
 3. Choose **stage-a / stable** or **stage-a / candidate**.
 4. Inspect the resolved destination and cURL preview. Hover `{{baseUrl}}` or
    `{{tenant}}` to see the read-only generated value.
@@ -24,6 +24,27 @@ https://navigation-demo-candidate.stage-a.example.test/acme/navigation/menu
 
 The environment files own platform URL templates, `collection.yml` identifies
 the service, and `deployments.yml` contains only tenant/platform/slot placement.
+
+## Main slots without a URL suffix
+
+To designate a named slot such as `default` as the primary slot for every service,
+set `main_slot: default` in each relevant environment YAML. Then use
+`{{slotSuffix}}` in platform URL templates (or collection base paths) in place of
+`-{{slot}}`. For example:
+
+```yaml
+name: stage
+main_slot: default
+platforms:
+  - name: stage-a
+    url_template: 'https://{{serviceName}}{{slotSuffix}}.stage-a.example.test/{{tenant}}{{slotSuffix}}'
+```
+
+A `default` deployment has no suffix at either position; a `worker` deployment
+gets `-worker` at both positions. The deployment still has `slot: default` or
+`slot: worker`; only URL formatting changes. This is environment-wide, not a
+per-service convention. The demo's existing `stable`, `candidate`, and `stage`
+placements remain unchanged.
 
 ## Conditional base path
 

@@ -112,6 +112,7 @@ pub fn parse_environment(
     Ok(ParsedEnvironment {
         environment: Environment {
             name: name.to_string(),
+            main_slot: None,
             platforms: Vec::new(),
             // Nothing in a Postman export records this; it was an app-level
             // setting there, so it defaults to verifying.

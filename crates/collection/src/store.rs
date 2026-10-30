@@ -393,13 +393,7 @@ pub fn import_postman(
         _ => return Err("choose collection, environment, or globals".to_string()),
     };
 
-    let leaks = find_leaks(&files, &secrets);
-    if !leaks.is_empty() {
-        return Err(format!(
-            "refusing to import: secret value found in a committed file ({})",
-            leaks.join("; ")
-        ));
-    }
+    refuse_leaks("import", &find_leaks(&files, &secrets))?;
     for path in files.keys() {
         // Globals were explicitly merged above, including their stored secrets.
         if root.join(path).exists() && (kind != "globals" || !before.contains_key(path)) {
@@ -413,15 +407,8 @@ pub fn import_postman(
 }
 
 pub fn write(out: &Path, rendered: &Rendered) -> io::Result<()> {
-    if !rendered.report.leaks.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "refusing to write: secret value found in a committed file ({})",
-                rendered.report.leaks.join("; ")
-            ),
-        ));
-    }
+    refuse_leaks("write", &rendered.report.leaks)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
 
     for (relative, contents) in &rendered.files {
         let path = out.join(relative);
@@ -618,12 +605,7 @@ pub fn save(root: &Path, collection_slug: &str, edit: &Edit) -> Result<SaveOutco
         &workspace.environments,
     ));
 
-    if !after.report.leaks.is_empty() {
-        return Err(format!(
-            "refusing to save: secret value found in a committed file ({})",
-            after.report.leaks.join("; ")
-        ));
-    }
+    refuse_leaks("save", &after.report.leaks)?;
 
     let (written, removed) = apply_delta(root, &before.files, &after.files)?;
 
@@ -689,13 +671,7 @@ pub fn update_environment(
     environment.variables = keep_secret_values(&environment.variables, &variables);
     let (after, secrets) = environment_files(environment);
 
-    let leaks = find_leaks(&after, &secrets);
-    if !leaks.is_empty() {
-        return Err(format!(
-            "refusing to save: secret value found in a committed file ({})",
-            leaks.join("; ")
-        ));
-    }
+    refuse_leaks("save", &find_leaks(&after, &secrets))?;
 
     apply_delta(root, &before, &after)?;
     Ok(())
@@ -719,19 +695,288 @@ pub fn create_environment(
     }
     let environment = Environment {
         name,
+        main_slot: None,
         platforms: Vec::new(),
         insecure,
         variables,
     };
     let (after, secrets) = environment_files(&environment);
-    let leaks = find_leaks(&after, &secrets);
-    if !leaks.is_empty() {
+    refuse_leaks("save", &find_leaks(&after, &secrets))?;
+    apply_delta(root, &BTreeMap::new(), &after)?;
+    Ok(())
+}
+
+/// Creates an empty collection and returns its slug.
+pub fn create_collection(root: &Path, name: &str) -> Result<String, String> {
+    let workspace = load(root)?;
+    let name = required_name(name)?;
+    let slug = slug_or(&name, "collection");
+    if workspace
+        .collections
+        .iter()
+        .any(|collection| slug_or(&collection.name, "collection") == slug)
+    {
+        return Err(format!("a collection called `{name}` already exists"));
+    }
+    let collection = Collection {
+        name,
+        service_name: None,
+        base_path: None,
+        deployments: Vec::new(),
+        description: None,
+        auth: AuthSetting::Inherit,
+        variables: Vec::new(),
+        scripts: Scripts::default(),
+        items: Vec::new(),
+    };
+    let rendered = render(&collection, &workspace.environments);
+    refuse_leaks("save", &rendered.report.leaks)?;
+    ensure_gitignore(root).map_err(|error| error.to_string())?;
+    ensure_gitattributes(root).map_err(|error| error.to_string())?;
+    apply_delta(root, &BTreeMap::new(), &delta_source(&rendered).files)?;
+    Ok(slug)
+}
+
+/// Applies `change` to one collection and writes only what it changed. Every
+/// tree edit goes through here, so each one is a render + delta with the leak
+/// scan, like [`save`]. Returns `change`'s result and the collection's slug
+/// afterwards (a rename changes it).
+fn edit_collection<T>(
+    root: &Path,
+    collection_slug: &str,
+    change: impl FnOnce(&mut Collection) -> Result<T, String>,
+) -> Result<(T, String), String> {
+    let mut workspace = load(root)?;
+    let index = workspace
+        .collections
+        .iter()
+        .position(|collection| slug_or(&collection.name, "collection") == collection_slug)
+        .ok_or_else(|| format!("no collection called `{collection_slug}`"))?;
+    let before = delta_source(&render(
+        &workspace.collections[index],
+        &workspace.environments,
+    ));
+    let result = change(&mut workspace.collections[index])?;
+    let slug = slug_or(&workspace.collections[index].name, "collection");
+    if slug != collection_slug
+        && workspace
+            .collections
+            .iter()
+            .enumerate()
+            .any(|(other, collection)| {
+                other != index && slug_or(&collection.name, "collection") == slug
+            })
+    {
         return Err(format!(
-            "refusing to save: secret value found in a committed file ({})",
-            leaks.join("; ")
+            "a collection called `{}` already exists",
+            workspace.collections[index].name
         ));
     }
-    apply_delta(root, &BTreeMap::new(), &after)?;
+    let after = delta_source(&render(
+        &workspace.collections[index],
+        &workspace.environments,
+    ));
+    refuse_leaks("save", &after.report.leaks)?;
+    apply_delta(root, &before.files, &after.files)?;
+    Ok((result, slug))
+}
+
+/// The list that holds the children of `parent`: the collection's own items
+/// for an empty path, otherwise a folder's.
+fn children_mut<'a>(
+    collection: &'a mut Collection,
+    parent: &[usize],
+) -> Result<&'a mut Vec<Item>, String> {
+    if parent.is_empty() {
+        return Ok(&mut collection.items);
+    }
+    let folder = item_at_mut(&mut collection.items, parent)
+        .ok_or_else(|| "that folder is no longer in the tree".to_string())?;
+    if folder.request.is_some() {
+        return Err("items can only be placed in a collection or a folder".to_string());
+    }
+    Ok(&mut folder.items)
+}
+
+fn split_path(path: &[usize]) -> Result<(&[usize], usize), String> {
+    path.split_last()
+        .map(|(last, parent)| (parent, *last))
+        .ok_or_else(|| "that item is no longer in the tree".to_string())
+}
+
+/// Appends a folder (`request: None`) or a request under the folder at
+/// `parent` (empty for the collection root) and returns its path.
+///
+/// Secret variables are kept per collection by name, so a new request's
+/// secret that would collide with a different stored value is renamed, along
+/// with its `{{name}}` uses in the request's auth.
+pub fn add_item(
+    root: &Path,
+    collection_slug: &str,
+    parent: &[usize],
+    name: &str,
+    request: Option<RequestDef>,
+) -> Result<Vec<usize>, String> {
+    let name = required_name(name)?;
+    edit_collection(root, collection_slug, |collection| {
+        let request = request.map(|mut request| {
+            let taken: BTreeMap<String, Option<String>> = collection
+                .secrets()
+                .into_iter()
+                .map(|variable| (variable.name.clone(), variable.value.clone()))
+                .collect();
+            for variable in request.variables.iter_mut().filter(|v| v.secret) {
+                let original = variable.name.clone();
+                let mut candidate = original.clone();
+                let mut suffix = 2;
+                while taken
+                    .get(&candidate)
+                    .is_some_and(|value| *value != variable.value)
+                {
+                    candidate = format!("{original}{suffix}");
+                    suffix += 1;
+                }
+                if candidate != original {
+                    if let AuthSetting::Method(auth) = &mut request.auth {
+                        for field in auth.fields.values_mut() {
+                            *field = field.replace(
+                                &format!("{{{{{original}}}}}"),
+                                &format!("{{{{{candidate}}}}}"),
+                            );
+                        }
+                    }
+                    variable.name = candidate;
+                }
+            }
+            request
+        });
+        let siblings = children_mut(collection, parent)?;
+        siblings.push(Item {
+            name,
+            auth: AuthSetting::Inherit,
+            variables: Vec::new(),
+            scripts: Scripts::default(),
+            request,
+            items: Vec::new(),
+        });
+        let mut path = parent.to_vec();
+        path.push(siblings.len() - 1);
+        Ok(path)
+    })
+    .map(|(path, _)| path)
+}
+
+/// Renames a folder or request. Its file (or directory) moves with the name.
+pub fn rename_item(
+    root: &Path,
+    collection_slug: &str,
+    path: &[usize],
+    name: &str,
+) -> Result<(), String> {
+    let name = required_name(name)?;
+    edit_collection(root, collection_slug, |collection| {
+        item_at_mut(&mut collection.items, path)
+            .ok_or_else(|| "that item is no longer in the tree".to_string())?
+            .name = name;
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+/// Renames a collection and returns its new slug; its directory and secrets
+/// file move with it.
+pub fn rename_collection(root: &Path, collection_slug: &str, name: &str) -> Result<String, String> {
+    let name = required_name(name)?;
+    edit_collection(root, collection_slug, |collection| {
+        collection.name = name;
+        Ok(())
+    })
+    .map(|(_, slug)| slug)
+}
+
+/// Removes a folder (with everything in it) or a request. Later siblings move
+/// up one place.
+pub fn delete_item(root: &Path, collection_slug: &str, path: &[usize]) -> Result<(), String> {
+    let (parent, index) = split_path(path)?;
+    edit_collection(root, collection_slug, |collection| {
+        let siblings = children_mut(collection, parent)?;
+        if index >= siblings.len() {
+            return Err("that item is no longer in the tree".to_string());
+        }
+        siblings.remove(index);
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+/// Copies a folder or request, secrets included, to just below itself and
+/// returns the copy's path.
+pub fn duplicate_item(
+    root: &Path,
+    collection_slug: &str,
+    path: &[usize],
+) -> Result<Vec<usize>, String> {
+    let (parent, index) = split_path(path)?;
+    edit_collection(root, collection_slug, |collection| {
+        let siblings = children_mut(collection, parent)?;
+        let mut copy = siblings
+            .get(index)
+            .cloned()
+            .ok_or_else(|| "that item is no longer in the tree".to_string())?;
+        let taken: BTreeSet<String> = siblings.iter().map(|item| item.name.clone()).collect();
+        let base = format!("{} copy", copy.name);
+        copy.name = base.clone();
+        let mut suffix = 2;
+        while taken.contains(&copy.name) {
+            copy.name = format!("{base} {suffix}");
+            suffix += 1;
+        }
+        siblings.insert(index + 1, copy);
+        let mut path = parent.to_vec();
+        path.push(index + 1);
+        Ok(path)
+    })
+    .map(|(path, _)| path)
+}
+
+/// Moves an item within its collection. `parent` and `index` describe the
+/// destination in the tree as it is once the item has been taken out, so
+/// `index` may equal the destination's length to append. Returns the new path.
+pub fn move_item(
+    root: &Path,
+    collection_slug: &str,
+    from: &[usize],
+    parent: &[usize],
+    index: usize,
+) -> Result<Vec<usize>, String> {
+    let (from_parent, from_index) = split_path(from)?;
+    if parent.starts_with(from) {
+        return Err("a folder cannot be moved into itself".to_string());
+    }
+    edit_collection(root, collection_slug, |collection| {
+        let siblings = children_mut(collection, from_parent)?;
+        if from_index >= siblings.len() {
+            return Err("that item is no longer in the tree".to_string());
+        }
+        let item = siblings.remove(from_index);
+        let destination = children_mut(collection, parent)?;
+        let index = index.min(destination.len());
+        destination.insert(index, item);
+        let mut path = parent.to_vec();
+        path.push(index);
+        Ok(path)
+    })
+    .map(|(path, _)| path)
+}
+
+/// Removes a collection's files and its stored secrets.
+pub fn delete_collection(root: &Path, collection_slug: &str) -> Result<(), String> {
+    let workspace = load(root)?;
+    let collection = workspace
+        .collection(collection_slug)
+        .ok_or_else(|| format!("no collection called `{collection_slug}`"))?;
+    let before = delta_source(&render(collection, &workspace.environments));
+    apply_delta(root, &before.files, &BTreeMap::new())?;
     Ok(())
 }
 
@@ -759,13 +1004,7 @@ pub fn save_globals(root: &Path, variables: Vec<Variable>) -> Result<(), String>
     let before = globals_files(&workspace.globals).0;
     let (after, secrets) = globals_files(&variables);
 
-    let leaks = find_leaks(&after, &secrets);
-    if !leaks.is_empty() {
-        return Err(format!(
-            "refusing to save: secret value found in a committed file ({})",
-            leaks.join("; ")
-        ));
-    }
+    refuse_leaks("save", &find_leaks(&after, &secrets))?;
 
     apply_delta(root, &before, &after)?;
     Ok(())
@@ -908,12 +1147,58 @@ fn keep_secret_values(existing: &[Variable], edited: &[Variable]) -> Vec<Variabl
         .collect()
 }
 
+#[derive(Clone)]
 pub struct Workspace {
     pub collections: Vec<Collection>,
     pub environments: Vec<Environment>,
     /// `globals.yml`: the widest variable layer, shared by every collection.
     pub globals: Vec<Variable>,
+    /// `scripts/<name>.yml`, by file stem: scripts a collection, folder or
+    /// request runs through [`Scripts::include`].
+    pub scripts: BTreeMap<String, Scripts>,
 }
+
+impl Workspace {
+    /// Finds a collection by its directory slug; `key` may be the slug or the
+    /// display name.
+    pub fn collection(&self, key: &str) -> Option<&Collection> {
+        let slug = slugify(key);
+        self.collections
+            .iter()
+            .find(|collection| slugify(&collection.name) == slug)
+    }
+
+    pub fn collection_mut(&mut self, key: &str) -> Option<&mut Collection> {
+        let slug = slugify(key);
+        self.collections
+            .iter_mut()
+            .find(|collection| slugify(&collection.name) == slug)
+    }
+
+    /// Finds an environment by exact name, falling back to its file slug.
+    pub fn environment(&self, key: &str) -> Option<&Environment> {
+        let index = self.environment_index(key)?;
+        self.environments.get(index)
+    }
+
+    pub fn environment_mut(&mut self, key: &str) -> Option<&mut Environment> {
+        let index = self.environment_index(key)?;
+        self.environments.get_mut(index)
+    }
+
+    fn environment_index(&self, key: &str) -> Option<usize> {
+        self.environments
+            .iter()
+            .position(|environment| environment.name == key)
+            .or_else(|| {
+                let slug = slugify(key);
+                self.environments
+                    .iter()
+                    .position(|environment| slugify(&environment.name) == slug)
+            })
+    }
+}
+
 /// Reads a workspace back, re-attaching secret values from `.secrets/`.
 pub fn load(root: &Path) -> Result<Workspace, String> {
     let mut collections = Vec::new();
@@ -951,12 +1236,114 @@ pub fn load(root: &Path) -> Result<Workspace, String> {
     let values = read_env(&root.join(".secrets").join("globals.env"));
     attach_secrets(globals.iter_mut(), &values);
 
+    let mut scripts = BTreeMap::new();
+    for path in sorted_yaml_files(&root.join("scripts"))? {
+        let mut shared: Scripts = serde_norway::from_str(&read(&path)?)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        // One level only: a shared script cannot pull in others.
+        shared.include.clear();
+        scripts.insert(file_stem(&path), shared);
+    }
+
     crate::deployment::validate(&collections, &environments)?;
     Ok(Workspace {
         collections,
         environments,
         globals,
+        scripts,
     })
+}
+
+/// Writes `scripts/<slug>.yml` and returns the slug, which is the name
+/// collections include it by. `previous` is the slug being edited, so a
+/// rename moves the file; includes that used the old name are updated.
+pub fn save_shared_script(
+    root: &Path,
+    previous: Option<&str>,
+    name: &str,
+    mut scripts: Scripts,
+) -> Result<String, String> {
+    let mut workspace = load(root)?;
+    let slug = slugify(&required_name(name)?);
+    if slug.is_empty() {
+        return Err("a name needs at least one letter or digit".to_string());
+    }
+    if previous != Some(slug.as_str()) && workspace.scripts.contains_key(&slug) {
+        return Err(format!("a shared script called `{slug}` already exists"));
+    }
+    scripts.include.clear();
+
+    let file = |slug: &str, scripts: &Scripts| (format!("scripts/{slug}.yml"), yaml(scripts));
+    let mut before = BTreeMap::new();
+    if let Some(previous) = previous {
+        let old = workspace
+            .scripts
+            .get(previous)
+            .ok_or_else(|| format!("no shared script called `{previous}`"))?;
+        before.extend([file(previous, old)]);
+    }
+    let mut after = BTreeMap::from([file(&slug, &scripts)]);
+    refuse_leaks("save", &find_leaks(&after, &workspace_secrets(&workspace)))?;
+
+    if let Some(previous) = previous.filter(|previous| *previous != slug) {
+        for collection in &mut workspace.collections {
+            let old = delta_source(&render(collection, &workspace.environments)).files;
+            let mut changed = false;
+            for scripts in collection.all_scripts_mut() {
+                for include in scripts
+                    .include
+                    .iter_mut()
+                    .filter(|include| *include == previous)
+                {
+                    *include = slug.clone();
+                    changed = true;
+                }
+            }
+            if changed {
+                before.extend(old);
+                after.extend(delta_source(&render(collection, &workspace.environments)).files);
+            }
+        }
+    }
+    apply_delta(root, &before, &after)?;
+    Ok(slug)
+}
+
+/// Removes `scripts/<slug>.yml`. Anything still including it fails to send
+/// with a clear error until the include is removed.
+pub fn delete_shared_script(root: &Path, slug: &str) -> Result<(), String> {
+    let workspace = load(root)?;
+    let scripts = workspace
+        .scripts
+        .get(slug)
+        .ok_or_else(|| format!("no shared script called `{slug}`"))?;
+    let before = BTreeMap::from([(format!("scripts/{slug}.yml"), yaml(scripts))]);
+    apply_delta(root, &before, &BTreeMap::new())?;
+    Ok(())
+}
+
+/// Every secret value in the workspace, for scanning files that belong to no
+/// single collection.
+fn workspace_secrets(workspace: &Workspace) -> SecretValues {
+    let mut secrets: SecretValues = Vec::new();
+    for collection in &workspace.collections {
+        secrets.extend(
+            collection
+                .secrets()
+                .into_iter()
+                .map(|variable| (variable.name.clone(), variable.value.clone())),
+        );
+    }
+    for variable in workspace
+        .environments
+        .iter()
+        .flat_map(|environment| &environment.variables)
+        .chain(&workspace.globals)
+        .filter(|variable| variable.secret)
+    {
+        secrets.push((variable.name.clone(), variable.value.clone()));
+    }
+    secrets
 }
 
 fn load_collection(dir: &Path) -> Result<Collection, String> {
@@ -1169,6 +1556,17 @@ fn yaml<T: Serialize>(value: &T) -> String {
 
 /// Belt and braces for the one rule that must never break. Values shorter than
 /// six characters are skipped because they collide with ordinary text.
+/// The one refusal every write path gives when the leak scan finds anything.
+fn refuse_leaks(action: &str, leaks: &[String]) -> Result<(), String> {
+    if leaks.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to {action}: secret value found in a committed file ({})",
+        leaks.join("; ")
+    ))
+}
+
 fn find_leaks(files: &Files, secrets: &SecretValues) -> Vec<String> {
     let secrets: Vec<(&str, &str)> = secrets
         .iter()

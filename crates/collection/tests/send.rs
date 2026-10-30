@@ -43,6 +43,7 @@ fn collection(variables: Vec<Variable>) -> Collection {
 
 fn environment(name: &str, insecure: bool, variables: Vec<Variable>) -> Environment {
     Environment {
+        main_slot: None,
         platforms: Vec::new(),
         name: name.to_string(),
         insecure,

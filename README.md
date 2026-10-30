@@ -195,8 +195,8 @@ folder, and request scopes in the same order as requests. Service collections
 also require a valid selected deployment when resolving variables, and generated
 deployment inputs take precedence. Apply the query again after changing a value
 or environment. Local current values take the place of defaults in their own
-scope, without changing scope precedence. Applying a local value also reapplies
-the displayed response query. Variable tokens use the same hover/edit card as request fields;
+scope, without changing scope precedence. Changing a local value does **not**
+reevaluate an existing response view. Variable tokens use the same hover/edit card as request fields;
 undefined names are amber. Named queries retain placeholders when saved.
 
 Only parsed string literals are expanded, including strings in `in` / `not in`
@@ -208,10 +208,41 @@ expanded. These bindings are a desktop workspace feature, not CLI substitution.
 Resolution and secret values stay in Rust. Values containing quotes, newlines,
 backslashes, or braces remain literal data and cannot inject query syntax.
 Undefined or unresolved variables produce an error against the original query,
-without exposing expanded values. Preview and response-file export use the same
-binding rules; neither the stored query nor captured response body is rewritten.
+without exposing expanded values. Each successful query evaluation freezes its
+bound literals in Rust. Response-file export uses that applied view, not current
+variables or unapplied query edits; neither the stored query nor captured
+response body is rewritten.
 History-only tabs have no current request scope and cannot resolve query
 variables; literal queries and empty-query exports remain available there.
+
+#### Comparing the same request in multiple tabs
+
+Click **Duplicate tab** beside **History** to open an independent copy of the
+current request draft and query text. No request is sent and no files are copied.
+Each tab has its own draft, captured response, query text, and last applied view;
+copies are numbered in the tab strip. Saving still updates the same underlying
+request YAML, but does not discard another copy's in-app edits or response.
+New duplicates start without a response, so a copied draft is not mistaken for
+a second completed request.
+
+A response query runs when a new response arrives, when you click **Apply** or
+press **Enter**, when you select a saved query, or when you explicitly **Suggest**
+and apply a starter query. Editing query text, changing variables or environment,
+and switching tabs do not reevaluate an existing view. Explicit Apply uses the
+current live values. In-flight projections complete into their own tab's cache,
+never into another tab's visible response.
+
+For example, send for store A and apply a query filtering its first category.
+Duplicate the tab, change the live store/category variables, then send for store
+B. Both results stay intact when switching between them. Live variables remain
+shared according to their normal scopes; they are not per-tab variable editors.
+
+**Save to file** exports the last successfully applied view with its original
+bindings, even after variables change or the query editor contains unapplied
+edits. Apply an empty query first to export original response bytes. A failed
+query leaves the last successful view available. Views are in-memory only, with
+up to 24 stored response bodies and 96 bound-query snapshots; exporting an
+evicted view reports an error instead of silently rebinding it.
 
 ### Trees
 
@@ -474,8 +505,9 @@ On macOS this directory is `~/Library/Application Support/rq`; on Linux it is
 `$XDG_CONFIG_HOME/rq` (or `~/.config/rq`). Nothing is written inside the workspace.
 A local override replaces only its own scope's default; a narrower saved
 definition still wins over a wider local value. Requests, cURL previews/copy,
-deployment URL resolution, query comparisons, and response export all use these
-current values. They survive refreshes and app restarts, and other workspaces
+deployment URL resolution, and new query evaluations use these current values.
+Existing response views and their exports retain their applied bindings instead.
+Current values survive refreshes and app restarts, and other workspaces
 and environments have independent values. Generated deployment inputs stay
 read-only.
 
@@ -531,12 +563,12 @@ Deployments have no variables or repeated environment names. Their environment
 comes from the platform's membership. Tenant/platform/slot combinations must be
 unique per service. Technical names use ASCII letters, digits, `-`, `_`, or `.`.
 Platform templates accept `{{serviceName}}`, `{{tenant}}`, `{{platform}}`,
-`{{slot}}`, and `{{basePath}}`, and must produce an HTTP(S) base URL without embedded credentials,
+`{{slot}}`, `{{slotSuffix}}`, and `{{basePath}}`, and must produce an HTTP(S) base URL without embedded credentials,
 query parameters or fragments. A trailing slash is removed.
 
 Requests use `{{baseUrl}}/endpoint`. With Acme / stage-a / candidate selected,
 the example resolves to `https://navsvc-candidate.stage-a.example.test/acme/endpoint`.
-For deployment-enabled collections, `serviceName`, `tenant`, `platform`, `slot`, `basePath`
+For deployment-enabled collections, `serviceName`, `tenant`, `platform`, `slot`, `slotSuffix`, `basePath`
 and the generated `baseUrl` are read-only built-ins: they override definitions
 in every variable scope before other variables expand. Scripts cannot assign
 them. Ordinary collections retain their existing variable precedence.
@@ -550,6 +582,40 @@ references prevent sending and cURL export. Response badges and history retain
 the originating service, environment, tenant, platform, slot and resolved base
 URL; switching target leaves the response usable and marks mismatches amber.
 Existing collection/environment saves preserve deployment configuration.
+
+#### Named main slot (no URL suffix)
+
+An environment can name its primary slot once for **all services and platforms**
+in that environment. The name is configurable, not a hard-coded special case:
+
+```yaml
+# environments/stage.yml (set main_slot in production.yml too if applicable)
+name: stage
+main_slot: default
+platforms:
+  - name: stage-a
+    url_template: 'https://grid-{{tenant}}{{slotSuffix}}.stage-a.example.test/{{serviceName}}{{slotSuffix}}'
+```
+
+`{{slotSuffix}}` includes its own hyphen: it is empty for the configured main
+slot, and `-<slot>` for any other slot. Use it wherever the optional suffix
+belongs, including more than once in a URL or inside a collection's `base_path`:
+
+```text
+default → https://grid-brand.stage-a.example.test/catalog
+worker  → https://grid-brand-worker.stage-a.example.test/catalog-worker
+```
+
+Keep `slot: default` in `deployments.yml`: the selector, response provenance,
+scripts, query variables, and conditions still see the real slot name through
+`slot`. Only the URL suffix is omitted; tenant and service identity never change.
+For custom names such as `main_slot: primary`, the same rule applies to `primary`.
+This setting and the URL templates are edited in environment YAML.
+
+Existing `{{slot}}` placeholders remain literal for backwards compatibility.
+Replace `-{{slot}}` with `{{slotSuffix}}` where omission is wanted—do not write
+`-{{slotSuffix}}`, since that would leave an extra hyphen. Without `main_slot`,
+every slot gets a suffix, including `default`; no slot is chosen implicitly.
 
 #### Conditional collection base paths
 
@@ -578,7 +644,7 @@ their endpoint paths.
 Expressions are supported **only inside the collection's `base_path`**, not in
 platform templates, service names or ordinary request variables. They accept:
 
-- The inputs `serviceName`, `tenant`, `platform`, and `slot`.
+- The inputs `serviceName`, `tenant`, `platform`, `slot`, and `slotSuffix`.
 - Single- or double-quoted strings, with escaped quotes and backslashes.
 - String comparisons `==` and `!=`.
 - `condition ? value : fallback`, including nested conditions and parentheses.
@@ -621,8 +687,8 @@ spec-less APIs first-class:
 the last one is remembered. Three panes: the tree, the request, the command.
 
 - Search the collection tree by request name or URL. Open requests, folders,
-  collections, and historical responses in tabs; request tabs keep their own
-  draft, response, and query. The side panes resize and collapse.
+  collections, and historical responses in tabs; **Duplicate tab** opens another
+  independent draft, response, and query view of the same request. The side panes resize and collapse.
 - **Params** has two sections: path variables derived from the `:name` segments
   in the URL (the name is read-only, the value is not), and query parameters with
   an enable box each. Unchecking a parameter keeps the row and its value but
@@ -676,12 +742,12 @@ the last one is remembered. Three panes: the tree, the request, the command.
 - The response viewer pretty-prints JSON with syntax highlighting, collapsible
   objects and arrays, breadcrumb navigation, and key/value search. Response line
   numbers cover JSON and plain text without becoming part of copied text. Large JSON
-  views use virtualized rows. The **Query** bar re-projects locally as you type;
+  views use virtualized rows. The **Query** bar re-projects locally on **Apply** or Enter;
   **Suggest** infers a starter query from the response without an OpenAPI spec.
   Leave the query empty to inspect the full JSON response. Non-JSON text views
   are capped at 512 KiB; the original bytes remain in Rust.
-  **Save to file** opens a native save dialog and exports the current query's
-  result as formatted JSON. With an empty query it saves the full original body,
+  **Save to file** opens a native save dialog and exports the last applied query's
+  result as formatted JSON, retaining its variable bindings. After applying an empty query it saves the full original body,
   preserving its bytes even when the text preview is truncated. Line numbers and
   folded-view markers are not included. Captured responses may contain sensitive
   data; choose the destination accordingly.
@@ -730,9 +796,31 @@ folders from outermost to innermost, then request. Scripts are saved in YAML as
   calls use variable substitution and the environment's TLS setting, but do not
   inherit the main request's authentication.
 
+#### Shared scripts
+
+A script used by several collections lives once in `scripts/<name>.yml`, with
+the same `pre_request` / `post_response` keys:
+
+```yaml
+# collections/acme-orders/collection.yml
+scripts:
+  include: [milestones]
+  pre_request: |
+    // runs after milestones
+```
+
+Each name in `include` runs just before the including layer's own script, in
+list order, and with that layer's scope, so `pm.collectionVariables.set` in a
+shared script writes to the including collection. Folders and requests can
+include too. Shared scripts cannot include others. An include whose file is
+missing fails the send with an error naming it. In the app, tick shared scripts
+on a collection's or folder's **Scripts** section and edit them from the ✎
+next to each, or **⋯ → Shared scripts…**; renaming one updates every include.
 This is a Postman-style subset, not a complete Postman sandbox or test runner:
 `pm.test` is a no-op and full assertion APIs are not implemented. Postman import
-does not import event scripts, and **CLI `rq send` does not execute scripts**.
+does not import event scripts. CLI `rq send` runs the same pre-request and
+post-response scripts as the app, reads the app's current values from
+`<config dir>/rq/variables.json`, and saves script writes back there.
 The cURL preview represents the request draft, not the result of running scripts.
 
 See the [scripts and response queries tutorial](docs/scripts-and-queries.md) for
@@ -774,7 +862,7 @@ cargo run -p rq-cli -- send work --request "List orders" --environment dev --ins
 # start from what you already have: Postman collections and environments
 cargo run -p rq-cli -- import postman "examples/jsonplaceholder.postman_collection.json" --out work
 
-# the app: opens a workspace, sends, and projects locally per keystroke
+# the app: opens a workspace, sends, and applies local response queries
 cargo run -p rq-desktop -- examples/jsonplaceholder
 ```
 
@@ -791,7 +879,7 @@ pre-request and post-response scripts, tabbed requests, searchable/virtualized
 JSON viewing, local response queries, cancellation, and persistent history.
 
 The window is not a mockup: it reads the workspace from disk, sends through the
-same HTTP core the CLI uses, and re-projects on every keystroke against a body
+same HTTP core the CLI uses, and applies queries locally against a body
 held in Rust — so reshaping a response makes no additional network calls.
 Scripts can make additional calls explicitly through `pm.sendRequest`.
 

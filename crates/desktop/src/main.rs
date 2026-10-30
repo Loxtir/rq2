@@ -8,30 +8,32 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use boa_engine::native_function::NativeFunction;
-use boa_engine::string::JsString;
-use boa_engine::value::JsValue;
-use boa_engine::{Context as JsContext, Source};
+use collection::context::RequestContext;
 use collection::model::{
     AuthSetting, Body, Collection, Environment, Item, KeyValue, Scripts, Variable,
 };
 use collection::store::{self, Edit, RequestDraft};
-use response_query::{infer, project, scaffold};
+#[cfg(test)]
+use response_query::project;
+use response_query::{infer, scaffold};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
+mod history;
 mod live;
 mod query;
+mod view;
+
+use history::History;
 
 /// Raw bodies larger than this are still kept, but the raw view is truncated so
 /// a careless click does not push tens of megabytes through IPC.
 const RAW_VIEW_LIMIT: usize = 512 * 1024;
 /// Keep a handful of bodies around: enough to flip between two responses.
 const MAX_KEPT_RESPONSES: usize = 24;
-const DEFAULT_HISTORY_LIMIT: u64 = 250 * 1024 * 1024;
 
 #[derive(Default)]
 struct AppState {
@@ -40,409 +42,39 @@ struct AppState {
     cancellations: Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
 }
 
-fn scripts_for_path(
-    collection: &Collection,
-    collection_slug: &str,
-    path: &[usize],
-) -> Vec<(String, Scripts)> {
-    let mut scopes = vec![(
-        format!("collection::{collection_slug}"),
-        collection.scripts.clone(),
-    )];
-    let mut items = &collection.items;
-    let mut prefix = Vec::new();
-    for (depth, index) in path.iter().enumerate() {
-        let Some(item) = items.get(*index) else { break };
-        prefix.push(index.to_string());
-        if depth + 1 == path.len() {
-            if let Some(request) = &item.request {
-                scopes.push((
-                    format!("request::{collection_slug}::{}", prefix.join(".")),
-                    request.scripts.clone(),
-                ));
-            } else {
-                scopes.push((
-                    format!("folder::{collection_slug}::{}", prefix.join(".")),
-                    item.scripts.clone(),
-                ));
-            }
-        } else {
-            scopes.push((
-                format!("folder::{collection_slug}::{}", prefix.join(".")),
-                item.scripts.clone(),
-            ));
-        }
-        items = &item.items;
-    }
-    scopes
-}
-
-#[allow(clippy::too_many_arguments)]
-fn apply_script(
-    script: &str,
-    request: &mut collection::model::RequestDef,
-    variables: &mut BTreeMap<String, String>,
-    scope: &str,
-    scopes: &[String],
-    insecure: bool,
-    response: Option<(u16, u64, usize, &str)>,
-    read_only: &[&str],
-) -> Result<BTreeMap<String, BTreeMap<String, String>>, String> {
-    if script.trim().is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let mut initial = serde_json::json!({
-        "request": request,
-        "variables": variables,
-        "scope": scope,
-        "scopes": scopes,
-        "insecure": insecure,
-        "writes": {},
-        "readOnly": read_only,
-        "response": response.map(|(code, time, size, body)| serde_json::json!({"code":code,"responseTime":time,"responseSize":size,"body":body})),
-    });
-    let initial_text = serde_json::to_string(&initial).map_err(|e| e.to_string())?;
-    let initial_literal = serde_json::to_string(&initial_text).map_err(|e| e.to_string())?;
-    let js = format!(
-        r#"
-      globalThis.__rqExecution = (async function() {{
-        const __rq = JSON.parse({initial_literal});
-        const stringify = (v) => typeof v === 'string' ? v : JSON.stringify(v);
-        const set = (name, value, target) => {{
-          name = String(name); value = stringify(value);
-          if (__rq.readOnly.includes(name)) throw new Error(name + ' is read-only and comes from the selected deployment');
-          target = target || __rq.scope;
-          if (typeof target === 'object') target = target.scope;
-          if (target === 'globals') target = 'global';
-          if (target === 'environment') target = __rq.scopes.find(s => s.startsWith('environment::')) || 'environment';
-          if (target === 'collection') target = __rq.scopes.find(s => s.startsWith('collection::')) || 'collection';
-          if (target === 'folder') target = [...__rq.scopes].reverse().find(s => s.startsWith('folder::')) || __rq.scope;
-          if (target === 'request') target = __rq.scopes.find(s => s.startsWith('request::')) || __rq.scope;
-          if (target === 'global') target = __rq.scopes.find(s => s === 'global' || s.startsWith('global::')) || 'global';
-          __rq.writes[target] ||= {{}}; __rq.writes[target][name] = value; __rq.variables[name] = value;
-        }};
-        const get = (name) => __rq.variables[String(name)];
-        const headerApi = __rq.request.headers || (__rq.request.headers = []);
-        headerApi.add = (h) => headerApi.push({{name:h.key || h.name, value:String(h.value ?? '')}});
-        headerApi.upsert = (h) => {{ const k=h.key||h.name; const found=headerApi.find(x=>String(x.name).toLowerCase()===String(k).toLowerCase()); if(found) found.value=String(h.value??''); else headerApi.add(h); }};
-        const body = __rq.request.body || (__rq.request.body = {{mode:'raw',language:'json',text:''}});
-        const bodyApi = {{ get raw() {{return body.text || '';}}, set raw(v) {{body.text=String(v); body.mode='raw';}} }};
-        const sendRequest = (spec, callback) => {{
-          let sent;
-          try {{
-            sent = JSON.parse(__rqSendRequest(JSON.stringify({{request:spec,variables:__rq.variables,insecure:__rq.insecure}})));
-            if (sent.__error) throw new Error(sent.__error);
-          }} catch (error) {{
-            if (typeof callback === 'function') {{ callback(String(error),undefined); return Promise.resolve(); }}
-            throw error;
-          }}
-          const response = {{code:sent.code,status:sent.status,responseTime:sent.responseTime,responseSize:sent.responseSize,headers:sent.headers || {{}},text:()=>sent.body,json:()=>JSON.parse(sent.body)}};
-          if (typeof callback === 'function') {{ callback(null,response); return Promise.resolve(); }}
-          return Promise.resolve(response);
-        }};
-        const pm = {{
-          variables: {{ get, set }},
-          globals: {{ get, set:(n,v)=>set(n,v,'global') }},
-          environment: {{ get, set:(n,v)=>set(n,v,'environment') }},
-          collectionVariables: {{ get, set:(n,v)=>set(n,v,'collection') }},
-          sendRequest,
-          request: {{ get method(){{return __rq.request.method}}, set method(v){{__rq.request.method=String(v)}}, get url(){{return __rq.request.url}}, set url(v){{__rq.request.url=String(v)}}, headers:headerApi, body:bodyApi }},
-          response: __rq.response ? {{ code:__rq.response.code, status:{{get:()=>__rq.response.code}}, responseTime:__rq.response.responseTime, responseSize:__rq.response.responseSize, text:()=>__rq.response.body, json:()=>JSON.parse(__rq.response.body) }} : undefined,
-          test:()=>{{}}, expect:(v)=>({{to:{{equal:(x)=>{{if(v!==x) throw new Error('Expected '+v+' to equal '+x)}}}}}}),
-        }};
-        {script}
-        delete __rq.response;
-        return JSON.stringify(__rq);
-      }})();
-      globalThis.__rqExecution.then(v => globalThis.__rqResult = v, e => globalThis.__rqError = String(e));
-    "#
-    );
-    let mut context = JsContext::default();
-    context
-        .register_global_callable(
-            JsString::from("__rqSendRequest"),
-            1,
-            NativeFunction::from_copy_closure(|_, args, context| {
-                let payload = args
-                    .first()
-                    .cloned()
-                    .unwrap_or_default()
-                    .to_string(context)
-                    .map_err(|error| error)?
-                    .to_std_string_escaped();
-                let result = send_script_request(&payload)
-                    .unwrap_or_else(|error| serde_json::json!({"__error":error}));
-                let text = serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
-                Ok(JsValue::from(JsString::from(text)))
-            }),
-        )
-        .map_err(|error| error.to_string())?;
-    context
-        .eval(Source::from_bytes(js.as_bytes()))
-        .map_err(|e| e.to_string())?;
-    context.run_jobs().map_err(|error| error.to_string())?;
-    let value = context
-        .eval(Source::from_bytes(
-            b"JSON.stringify({result:globalThis.__rqResult,error:globalThis.__rqError})",
-        ))
-        .map_err(|e| e.to_string())?;
-    let output = value
-        .to_string(&mut context)
-        .map_err(|e| e.to_string())?
-        .to_std_string_escaped();
-    let output: serde_json::Value =
-        serde_json::from_str(&output).map_err(|e| format!("script result: {e}"))?;
-    if let Some(error) = output["error"].as_str() {
-        return Err(error.to_string());
-    }
-    initial = serde_json::from_str(output["result"].as_str().ok_or("script did not complete")?)
-        .map_err(|e| format!("script result: {e}"))?;
-    *request = serde_json::from_value(initial["request"].clone()).map_err(|e| e.to_string())?;
-    *variables = serde_json::from_value(initial["variables"].clone()).map_err(|e| e.to_string())?;
-    serde_json::from_value(initial["writes"].clone()).map_err(|e| e.to_string())
-}
-
-fn send_script_request(payload: &str) -> Result<serde_json::Value, String> {
-    let payload: serde_json::Value =
-        serde_json::from_str(payload).map_err(|error| error.to_string())?;
-    let spec = &payload["request"];
-    let url = spec
-        .as_str()
-        .or_else(|| spec["url"].as_str())
-        .or_else(|| spec["url"]["raw"].as_str())
-        .unwrap_or_default();
-    let mut request = collection::model::RequestDef {
-        method: spec["method"].as_str().unwrap_or("GET").to_uppercase(),
-        url: url.to_string(),
-        ..Default::default()
-    };
-    if let Some(headers) = spec["header"]
-        .as_array()
-        .or_else(|| spec["headers"].as_array())
-    {
-        request.headers = headers
-            .iter()
-            .map(|header| KeyValue {
-                name: header["key"]
-                    .as_str()
-                    .or_else(|| header["name"].as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                value: header["value"].as_str().unwrap_or_default().to_string(),
-                disabled: header["disabled"].as_bool().unwrap_or(false),
-            })
-            .collect();
-    }
-    if let Some(body) = spec.get("body") {
-        let text = body["raw"].as_str().or_else(|| body["text"].as_str());
-        if let Some(text) = text {
-            request.body = Some(Body {
-                mode: "raw".into(),
-                language: Some("json".into()),
-                text: Some(text.into()),
-            });
-        }
-    }
-    request.normalize_query();
-    let variables: BTreeMap<String, String> =
-        serde_json::from_value(payload["variables"].clone()).unwrap_or_default();
-    let vars = collection::send::Variables::from(variables);
-    let insecure = payload["insecure"].as_bool().unwrap_or(false);
-    let sent = collection::send::send(
-        &request,
-        None,
-        &vars,
-        &collection::send::SendOptions {
-            insecure,
-            timeout: Duration::from_secs(60),
-        },
-    )?;
-    Ok(serde_json::json!({
-        "code": sent.status,
-        "status": sent.status.to_string(),
-        "responseTime": sent.elapsed.as_millis() as u64,
-        "responseSize": sent.body.len(),
-        "body": String::from_utf8_lossy(&sent.body),
-        "headers": {},
-    }))
-}
-
-fn script_variable_edits(
-    variables: &[Variable],
-    scope: live::Scope,
-    writes: BTreeMap<String, String>,
-) -> Vec<live::Entry> {
-    let mut edits = Vec::new();
-    for (name, value) in writes {
-        let secret = variables
-            .iter()
-            .any(|variable| variable.name == name && variable.secret);
-        edits.push(live::Entry {
-            scope: scope.clone(),
-            variable: Variable {
-                name,
-                value: Some(value),
-                secret,
-            },
-        });
-    }
-    edits
-}
-
-fn variables_at_path(collection: &Collection, path: &[usize]) -> Option<Vec<Variable>> {
-    let (last, parents) = path.split_last()?;
-    let mut items = &collection.items;
-    for index in parents {
-        items = &items.get(*index)?.items;
-    }
-    Some(item_variables(items.get(*last)?).to_vec())
+/// Everything `send` works out before the network call.
+struct Prepared {
+    name: String,
+    target: Option<collection::deployment::Target>,
+    collection: String,
+    path: Vec<usize>,
+    auth: Option<collection::model::Auth>,
+    options: collection::send::SendOptions,
+    request: collection::model::RequestDef,
+    plan: rq_scripts::Plan,
+    variables: BTreeMap<String, String>,
 }
 
 /// Script writes update local current values, never shared defaults.
 fn persist_script_writes(
     root: &std::path::Path,
     collection_slug: &str,
-    writes: BTreeMap<String, BTreeMap<String, String>>,
+    writes: rq_scripts::Writes,
 ) -> Result<(), String> {
     if writes.is_empty() {
         return Ok(());
     }
-    let root_key = root.display().to_string();
-    let collection_key = format!("{root_key}::{collection_slug}");
-    let workspace = live::load(root)?;
-    let mut edits = Vec::new();
-
-    if workspace.collections.iter().any(|collection| {
-        store::slugify(&collection.name) == collection_slug
-            && collection::deployment::enabled(collection)
-    }) && writes.values().any(|values| {
-        values
-            .keys()
-            .any(|name| collection::deployment::RESERVED.contains(&name.as_str()))
-    }) {
-        return Err("deployment template inputs and baseUrl are read-only".into());
-    }
-    for (scope, values) in writes {
-        if scope == format!("global::{root_key}") {
-            edits.extend(script_variable_edits(
-                &workspace.globals,
-                live::Scope::Globals,
-                values,
-            ));
-            continue;
-        }
-
-        let environment_prefix = format!("environment::{root_key}::");
-        if let Some(slug) = scope.strip_prefix(&environment_prefix) {
-            let environment = workspace
-                .environments
-                .iter()
-                .find(|environment| store::slugify(&environment.name) == slug)
-                .ok_or_else(|| {
-                    "pm.environment.set requires a selected, saved environment".to_string()
-                })?;
-            edits.extend(script_variable_edits(
-                &environment.variables,
-                live::Scope::Environment {
-                    environment: environment.name.clone(),
-                },
-                values,
-            ));
-            continue;
-        }
-
-        let collection_prefix = format!("collection::{collection_key}");
-        if scope == collection_prefix {
-            let collection = workspace
-                .collections
-                .iter()
-                .find(|collection| store::slugify(&collection.name) == collection_slug)
-                .ok_or_else(|| "script collection scope no longer exists".to_string())?;
-            edits.extend(script_variable_edits(
-                &collection.variables,
-                live::Scope::Collection {
-                    collection: collection_slug.into(),
-                },
-                values,
-            ));
-            continue;
-        }
-
-        let collection = workspace
-            .collections
-            .iter()
-            .find(|collection| store::slugify(&collection.name) == collection_slug)
-            .ok_or_else(|| "script collection scope no longer exists".to_string())?;
-        let mut matched_path = None;
-        for kind in ["folder", "request"] {
-            let prefix = format!("{kind}::{collection_key}::");
-            if let Some(path) = scope.strip_prefix(&prefix) {
-                let path = path
-                    .split('.')
-                    .map(|part| {
-                        part.parse::<usize>()
-                            .map_err(|_| "invalid script variable scope".to_string())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                matched_path = Some(path);
-                break;
-            }
-        }
-        let path =
-            matched_path.ok_or_else(|| format!("unsupported script variable scope: {scope}"))?;
-        let variables = variables_at_path(collection, &path)
-            .ok_or_else(|| "script variable target no longer exists".to_string())?;
-        edits.extend(script_variable_edits(
-            &variables,
-            live::Scope::Item {
-                collection: collection_slug.into(),
-                path,
-            },
-            values,
-        ));
-    }
+    let mut workspace = live::load(root)?;
+    let edits = rq_scripts::edits(&mut workspace, collection_slug, writes)?;
     live::write(root, edits, false)
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct HistoryEntry {
-    id: String,
-    /// Missing in older history; an empty name means no environment.
-    #[serde(default)]
-    environment: Option<String>,
-    #[serde(default)]
-    deployment: Option<collection::deployment::Target>,
-    timestamp: u64,
-    name: String,
-    #[serde(default)]
-    collection: String,
-    #[serde(default)]
-    path: Vec<usize>,
-    method: String,
-    url: String,
-    status: u16,
-    elapsed_ms: u64,
-    bytes: usize,
-    content_type: Option<String>,
-    insecure: bool,
-    missing: Vec<String>,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    response_available: bool,
-}
-
-#[derive(Serialize)]
-struct HistoryDto {
-    entries: Vec<HistoryEntry>,
-    bytes: u64,
-    limit: u64,
 }
 
 #[derive(Default)]
 struct Responses {
     next_id: u64,
     bodies: BTreeMap<u64, Vec<u8>>,
+    next_view_id: u64,
+    views: BTreeMap<u64, (u64, view::FrozenQuery)>,
 }
 
 impl Responses {
@@ -453,8 +85,37 @@ impl Responses {
         while self.bodies.len() > MAX_KEPT_RESPONSES {
             let oldest = *self.bodies.keys().next().expect("non-empty");
             self.bodies.remove(&oldest);
+            self.views.retain(|_, (response, _)| *response != oldest);
         }
         id
+    }
+
+    fn remember_view(&mut self, response_id: u64, query: view::FrozenQuery) -> Result<u64, String> {
+        if !self.bodies.contains_key(&response_id) {
+            return Err("that response is no longer in memory; send it again".into());
+        }
+        self.next_view_id += 1;
+        self.views.insert(self.next_view_id, (response_id, query));
+        // Bound stored query literals as well as response bodies.
+        while self.views.len() > MAX_KEPT_RESPONSES * 4 {
+            self.views.pop_first();
+        }
+        Ok(self.next_view_id)
+    }
+
+    fn export_view(&self, response_id: u64, view_id: u64) -> Result<Vec<u8>, String> {
+        let (id, query) = self
+            .views
+            .get(&view_id)
+            .ok_or("that applied view is no longer in memory; Apply the query again")?;
+        if *id != response_id {
+            return Err("that applied view belongs to a different response".into());
+        }
+        query.export(
+            self.bodies
+                .get(id)
+                .ok_or("that response is no longer in memory; send it again")?,
+        )
     }
 }
 
@@ -466,6 +127,16 @@ struct WorkspaceDto {
     /// `globals.yml`: the widest variable layer, shared by every collection.
     globals: Vec<VariableDto>,
     live_variables: Vec<LiveVariableDto>,
+    scripts: Vec<SharedScriptDto>,
+}
+
+#[derive(Serialize)]
+struct SharedScriptDto {
+    name: String,
+    pre_request: String,
+    post_response: String,
+    /// Names of the collections that include it anywhere in their tree.
+    used_by: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -485,6 +156,7 @@ struct AppConfig {
 #[derive(Serialize)]
 struct EnvironmentDto {
     name: String,
+    main_slot: Option<String>,
     platforms: Vec<collection::model::Platform>,
     /// Shown in the UI next to the selector, so an unverified connection is
     /// never a surprise.
@@ -576,6 +248,7 @@ struct ResponseDto {
 
 #[derive(Serialize)]
 struct ProjectionDto {
+    view_id: u64,
     text: String,
     /// Length of the projection as JSON, before pretty-printing for display.
     bytes: usize,
@@ -652,88 +325,12 @@ fn config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
         .map(|dir| dir.join("rq").join("state.json"))
 }
 
-fn history_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+fn history(app: &tauri::AppHandle) -> Result<History, String> {
     use tauri::Manager;
     app.path()
         .app_data_dir()
-        .map(|dir| dir.join("rq").join("history"))
+        .map(|dir| History::new(dir.join("rq").join("history")))
         .map_err(|error| error.to_string())
-}
-
-fn history_limit(dir: &std::path::Path) -> u64 {
-    std::fs::read(dir.join("settings.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<u64>(&bytes).ok())
-        .unwrap_or(DEFAULT_HISTORY_LIMIT)
-}
-
-fn read_history(dir: &std::path::Path) -> Vec<HistoryEntry> {
-    let Ok(files) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut entries = files
-        .flatten()
-        .filter(|item| item.path().extension().is_some_and(|ext| ext == "json"))
-        .filter_map(|item| std::fs::read(item.path()).ok())
-        .filter_map(|bytes| serde_json::from_slice::<HistoryEntry>(&bytes).ok())
-        .collect::<Vec<_>>();
-    for entry in &mut entries {
-        entry.response_available = dir.join(format!("{}.body", entry.id)).is_file();
-    }
-    entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
-    entries
-}
-
-fn history_entry_bytes(dir: &std::path::Path, entry: &HistoryEntry) -> u64 {
-    std::fs::metadata(dir.join(format!("{}.body", entry.id)))
-        .map(|metadata| metadata.len())
-        .unwrap_or(0)
-}
-
-fn prune_history(dir: &std::path::Path, limit: u64) -> Result<u64, String> {
-    let mut entries = read_history(dir);
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
-    let mut total = entries.iter().fold(0u64, |sum, entry| {
-        sum.saturating_add(history_entry_bytes(dir, entry))
-    });
-    for mut entry in entries {
-        if total <= limit {
-            break;
-        }
-        let entry_bytes = history_entry_bytes(dir, &entry);
-        let body = dir.join(format!("{}.body", entry.id));
-        if entry_bytes == 0 {
-            continue;
-        }
-        if std::fs::remove_file(&body).is_err() {
-            continue;
-        }
-        entry.response_available = false;
-        if let Ok(metadata) = serde_json::to_vec(&entry) {
-            let _ = std::fs::write(dir.join(format!("{}.json", entry.id)), metadata);
-        }
-        total = total.saturating_sub(entry_bytes);
-    }
-    let known = read_history(dir)
-        .into_iter()
-        .map(|entry| entry.id)
-        .collect::<std::collections::HashSet<_>>();
-    if let Ok(files) = std::fs::read_dir(dir) {
-        for file in files.flatten() {
-            let path = file.path();
-            if path
-                .extension()
-                .is_some_and(|extension| extension == "body")
-            {
-                if let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) {
-                    if !known.contains(id) {
-                        let _ = std::fs::remove_file(path);
-                    }
-                }
-            }
-        }
-    }
-    Ok(total)
 }
 
 struct ResponseContext {
@@ -741,102 +338,24 @@ struct ResponseContext {
     deployment: Option<collection::deployment::Target>,
 }
 
-fn persist_response(
-    app: &tauri::AppHandle,
-    name: &str,
-    method: &str,
-    collection: &str,
-    path: &[usize],
-    sent: &collection::send::SentResponse,
-    context: &ResponseContext,
-) -> Option<String> {
-    let dir = history_dir(app).ok()?;
-    std::fs::create_dir_all(&dir).ok()?;
-    let id = format!(
-        "{}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_nanos(),
-        std::process::id()
-    );
-    let entry = HistoryEntry {
-        id: id.clone(),
-        environment: Some(context.environment.clone()),
-        deployment: context.deployment.clone(),
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_secs(),
-        name: name.to_string(),
-        collection: collection.to_string(),
-        path: path.to_vec(),
-        method: method.to_string(),
-        url: sent.url.clone(),
-        status: sent.status,
-        elapsed_ms: sent.elapsed.as_millis() as u64,
-        bytes: sent.body.len(),
-        content_type: sent.content_type.clone(),
-        insecure: sent.insecure,
-        missing: sent.missing.clone(),
-        error: None,
-        response_available: true,
-    };
-    std::fs::write(dir.join(format!("{id}.body")), &sent.body).ok()?;
-    let metadata = serde_json::to_vec(&entry).ok()?;
-    if std::fs::write(dir.join(format!("{id}.json")), metadata).is_err() {
-        let _ = std::fs::remove_file(dir.join(format!("{id}.body")));
-        return None;
-    }
-    let _ = prune_history(&dir, history_limit(&dir));
-    Some(id)
-}
-
-fn persist_failed_request(
-    app: &tauri::AppHandle,
+/// The parts of a history entry every send knows, sent or failed.
+fn history_entry(
     name: &str,
     method: &str,
     collection: &str,
     path: &[usize],
     url: &str,
-    failure: (&str, &ResponseContext),
-) {
-    let Some(dir) = history_dir(app).ok() else {
-        return;
-    };
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    let Ok(timestamp) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
-        return;
-    };
-    let id = format!("{}-{}", timestamp.as_nanos(), std::process::id());
-    let entry = HistoryEntry {
-        id: id.clone(),
-        environment: Some(failure.1.environment.clone()),
-        deployment: failure.1.deployment.clone(),
-        timestamp: timestamp.as_secs(),
+    context: &ResponseContext,
+) -> history::Entry {
+    history::Entry {
+        environment: Some(context.environment.clone()),
+        deployment: context.deployment.clone(),
         name: name.to_string(),
         collection: collection.to_string(),
         path: path.to_vec(),
         method: method.to_string(),
         url: url.to_string(),
-        status: 0,
-        elapsed_ms: 0,
-        bytes: 0,
-        content_type: None,
-        insecure: false,
-        missing: Vec::new(),
-        error: Some(failure.0.to_string()),
-        response_available: false,
-    };
-    if std::fs::write(dir.join(format!("{id}.body")), []).is_err() {
-        return;
-    }
-    if let Ok(metadata) = serde_json::to_vec(&entry) {
-        if std::fs::write(dir.join(format!("{id}.json")), metadata).is_ok() {
-            let _ = prune_history(&dir, history_limit(&dir));
-        }
+        ..Default::default()
     }
 }
 
@@ -845,54 +364,20 @@ fn list_history(
     app: tauri::AppHandle,
     collection: Option<String>,
     path: Option<Vec<usize>>,
-) -> Result<HistoryDto, String> {
-    let dir = history_dir(&app)?;
-    let entries = read_history(&dir)
-        .into_iter()
-        .filter(|entry| {
-            collection
-                .as_ref()
-                .is_none_or(|slug| &entry.collection == slug)
-        })
-        .filter(|entry| path.as_ref().is_none_or(|path| &entry.path == path))
-        .collect::<Vec<_>>();
-    let bytes = entries.iter().fold(0u64, |sum, entry| {
-        sum.saturating_add(history_entry_bytes(&dir, entry))
-    });
-    Ok(HistoryDto {
-        entries,
-        bytes,
-        limit: history_limit(&dir),
-    })
+) -> Result<history::Listing, String> {
+    Ok(history(&app)?.list(collection.as_deref(), path.as_deref()))
 }
 
 #[tauri::command]
-fn set_history_limit(app: tauri::AppHandle, limit: u64) -> Result<HistoryDto, String> {
-    let dir = history_dir(&app)?;
-    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-    std::fs::write(
-        dir.join("settings.json"),
-        serde_json::to_vec(&limit).unwrap(),
-    )
-    .map_err(|error| error.to_string())?;
-    prune_history(&dir, limit)?;
-    list_history(app, None, None)
+fn set_history_limit(app: tauri::AppHandle, limit: u64) -> Result<history::Listing, String> {
+    let history = history(&app)?;
+    history.set_limit(limit)?;
+    Ok(history.list(None, None))
 }
 
 #[tauri::command]
 fn clear_history(app: tauri::AppHandle) -> Result<(), String> {
-    let dir = history_dir(&app)?;
-    if dir.exists() {
-        for item in std::fs::read_dir(&dir)
-            .map_err(|error| error.to_string())?
-            .flatten()
-        {
-            if item.file_name() != "settings.json" {
-                std::fs::remove_file(item.path()).map_err(|error| error.to_string())?;
-            }
-        }
-    }
-    Ok(())
+    history(&app)?.clear()
 }
 
 #[tauri::command]
@@ -901,16 +386,7 @@ fn open_history(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<ResponseDto, String> {
-    let dir = history_dir(&app)?;
-    let metadata = std::fs::read(dir.join(format!("{id}.json")))
-        .map_err(|_| "history entry was removed".to_string())?;
-    let entry: HistoryEntry =
-        serde_json::from_slice(&metadata).map_err(|error| error.to_string())?;
-    let body = match std::fs::read(dir.join(format!("{id}.body"))) {
-        Ok(body) => body,
-        Err(_) if entry.error.is_some() => Vec::new(),
-        Err(_) => return Err("response body was removed by history retention".to_string()),
-    };
+    let (entry, body) = history(&app)?.open(&id)?;
     let mut responses = state.responses.lock().map_err(|_| "state poisoned")?;
     let response_id = responses.insert(body);
     Ok(ResponseDto {
@@ -988,6 +464,7 @@ fn workspace_dto(root: &std::path::Path) -> Result<WorkspaceDto, String> {
         .iter()
         .map(|environment| EnvironmentDto {
             name: environment.name.clone(),
+            main_slot: environment.main_slot.clone(),
             platforms: environment.platforms.clone(),
             insecure: environment.insecure,
             variables: environment.variables.iter().map(variable_dto).collect(),
@@ -1000,6 +477,21 @@ fn workspace_dto(root: &std::path::Path) -> Result<WorkspaceDto, String> {
         environments,
         globals: loaded.globals.iter().map(variable_dto).collect(),
         live_variables,
+        scripts: loaded
+            .scripts
+            .iter()
+            .map(|(name, scripts)| SharedScriptDto {
+                name: name.clone(),
+                pre_request: scripts.pre_request.clone(),
+                post_response: scripts.post_response.clone(),
+                used_by: loaded
+                    .collections
+                    .iter()
+                    .filter(|collection| collection.includes(name))
+                    .map(|collection| collection.name.clone())
+                    .collect(),
+            })
+            .collect(),
     })
 }
 
@@ -1135,6 +627,22 @@ struct Located {
     environment: Option<Environment>,
     /// `globals.yml`, the widest variable layer.
     globals: Vec<Variable>,
+    /// `scripts/`, for includes.
+    scripts: BTreeMap<String, Scripts>,
+}
+
+impl Located {
+    fn context(
+        &self,
+        deployment: Option<&collection::model::Deployment>,
+    ) -> Result<RequestContext<'_>, String> {
+        RequestContext::new(
+            &self.collection,
+            self.environment.as_ref(),
+            &self.globals,
+            deployment,
+        )
+    }
 }
 
 fn locate(
@@ -1142,29 +650,29 @@ fn locate(
     slug: &str,
     environment: Option<&str>,
 ) -> Result<Located, String> {
-    let loaded = live::load(root)?;
+    let mut loaded = live::load(root)?;
 
-    let collection = loaded
+    let index = loaded
         .collections
-        .into_iter()
-        .find(|candidate| store::slugify(&candidate.name) == slug)
+        .iter()
+        .position(|candidate| store::slugify(&candidate.name) == slug)
         .ok_or_else(|| format!("no collection called `{slug}`"))?;
 
     let environment = match environment {
         Some(name) => Some(
             loaded
-                .environments
-                .into_iter()
-                .find(|candidate| candidate.name == name)
+                .environment(name)
+                .cloned()
                 .ok_or_else(|| format!("no environment called `{name}`"))?,
         ),
         None => None,
     };
 
     Ok(Located {
-        collection,
+        collection: loaded.collections.swap_remove(index),
         environment,
         globals: loaded.globals,
+        scripts: loaded.scripts,
     })
 }
 
@@ -1180,15 +688,39 @@ fn request_for(
     }
 }
 
-/// The auth that applies to `request` at `path`: its own setting (which the
-/// editor may have just changed) resolved against everything above it. Using
-/// the stored `resolved.auth` after a draft edit would send the old method.
-fn auth_for<'a>(
-    collection: &'a Collection,
-    path: &[usize],
-    request: &'a collection::model::RequestDef,
-) -> Option<&'a collection::model::Auth> {
-    request.auth.resolve(collection.inherited_auth_at(path))
+/// Why `send` produced no response. The window shows a cancellation quietly
+/// and records only real failures in history.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", content = "message", rename_all = "snake_case")]
+enum SendError {
+    Cancelled,
+    Failed(String),
+}
+
+impl From<String> for SendError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for SendError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_string())
+    }
+}
+
+/// Forgets a request's cancel handle however `send` returns.
+struct CancelHandle<'a> {
+    state: &'a AppState,
+    request_id: String,
+}
+
+impl Drop for CancelHandle<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut cancellations) = self.state.cancellations.lock() {
+            cancellations.remove(&self.request_id);
+        }
+    }
 }
 
 #[tauri::command]
@@ -1202,7 +734,7 @@ async fn send(
     deployment: Option<collection::model::Deployment>,
     request_id: String,
     state: tauri::State<'_, AppState>,
-) -> Result<ResponseDto, String> {
+) -> Result<ResponseDto, SendError> {
     let root = workspace_path(&state)?;
     let response_root = root.clone();
     let response_environment = environment.clone().unwrap_or_default();
@@ -1212,182 +744,100 @@ async fn send(
         .lock()
         .map_err(|_| "state poisoned")?
         .insert(request_id.clone(), cancel_tx);
+    let _cancel_handle = CancelHandle {
+        state: &state,
+        request_id,
+    };
 
-    let runtime_namespace = root.display().to_string();
     let prepared = tauri::async_runtime::spawn_blocking(move || {
-        let collection_slug = collection.clone();
-        let request_path = path.clone();
         let located = locate(&root, &collection, environment.as_deref())?;
-        let collection = &located.collection;
-        let target = collection::deployment::resolve(
-            collection,
-            located.environment.as_ref(),
-            deployment.as_ref(),
-        )?;
-        let resolved = collection
+        let context = located.context(deployment.as_ref())?;
+        let resolved = context
+            .collection
             .request_at(&path)
             .ok_or("that request is no longer in the file")?;
         let name = resolved.name.to_string();
         let mut request = request_for(draft, &resolved);
-        let auth = auth_for(collection, &path, &request).cloned();
-        let insecure = located
-            .environment
-            .as_ref()
-            .is_some_and(|environment| environment.insecure);
+        let auth = context.auth(&path, &request).cloned();
+        let plan = rq_scripts::Plan::new(&context, &path, &request, &located.scripts)?;
 
-        let base_vars = collection::send::variables_for_target(
-            collection,
-            located.environment.as_ref(),
-            &located.globals,
-            &path,
-            target.as_ref(),
-        );
-        let mut variable_map = base_vars
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let scoped_collection = format!("{runtime_namespace}::{collection_slug}");
-        let mut script_layers = scripts_for_path(collection, &scoped_collection, &path);
-        if let Some((key, scripts)) = script_layers.last_mut() {
-            if key.starts_with("request::") {
-                *scripts = request.scripts.clone();
-            }
-        }
-        let mut scope_keys = vec![
-            format!("global::{runtime_namespace}"),
-            format!(
-                "environment::{}::{}",
-                runtime_namespace,
-                located
-                    .environment
-                    .as_ref()
-                    .map(|e| store::slugify(&e.name))
-                    .unwrap_or_else(|| "default".into())
-            ),
-        ];
-        scope_keys.extend(script_layers.iter().map(|(key, _)| key.clone()));
-        let mut runtime_writes = BTreeMap::<String, BTreeMap<String, String>>::new();
-        for (scope, scripts) in &script_layers {
-            let writes = apply_script(
-                &scripts.pre_request,
-                &mut request,
-                &mut variable_map,
-                scope,
-                &scope_keys,
-                insecure,
-                None,
-                if target.is_some() {
-                    &collection::deployment::RESERVED
-                } else {
-                    &[]
-                },
-            )?;
-            for (target, values) in writes {
-                runtime_writes.entry(target).or_default().extend(values);
-            }
-        }
-        persist_script_writes(&root, &collection_slug, runtime_writes)?;
-        let updated = locate(&root, &collection_slug, environment.as_deref())?;
-        let effective = collection::send::variables_for_target(
-            &updated.collection,
-            updated.environment.as_ref(),
-            &updated.globals,
-            &request_path,
-            target.as_ref(),
-        );
-        variable_map = effective
+        let mut variables: BTreeMap<_, _> = context
+            .variables(&path)
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let vars = collection::send::Variables::from(variable_map.clone());
-        Ok::<_, String>((
+        let writes = plan.pre_request(&mut request, &mut variables)?;
+        persist_script_writes(&root, &collection, writes)?;
+        // Script writes are current values now; read them back through the
+        // same scope chain so a narrower saved value still wins.
+        let updated = locate(&root, &collection, environment.as_deref())?;
+        let variables: BTreeMap<_, _> = updated
+            .context(deployment.as_ref())?
+            .variables(&path)
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        Ok::<_, String>(Prepared {
             name,
-            target,
-            collection_slug,
-            request_path,
-            request.method.clone(),
-            request,
+            target: context.target.clone(),
+            collection,
+            path,
             auth,
-            vars,
-            script_layers,
-            scope_keys,
-            variable_map,
-            collection::send::SendOptions {
-                insecure,
+            options: collection::send::SendOptions {
+                insecure: context.insecure(),
                 timeout: Duration::from_secs(60),
             },
-        ))
+            request,
+            plan,
+            variables,
+        })
     })
     .await
-    .map_err(|error| format!("request task failed: {error}"));
+    .map_err(|error| format!("request task failed: {error}"))
+    .and_then(|prepared| prepared);
 
     let sent = match prepared {
-        Ok(Ok((
-            name,
-            target,
-            collection_slug,
-            request_path,
-            method,
-            request,
-            auth,
-            vars,
-            script_layers,
-            scope_keys,
-            mut variable_map,
-            options,
-        ))) => {
+        Ok(prepared) => {
+            let Prepared {
+                name,
+                target,
+                collection: collection_slug,
+                path: request_path,
+                auth,
+                options,
+                request,
+                plan,
+                mut variables,
+            } = prepared;
+            let method = request.method.clone();
             let requested_url = request.url.clone();
+            let vars = collection::send::Variables::from(variables.clone());
             let result = tokio::select! {
-                _ = cancel_rx => Err("Request cancelled".to_string()),
-                result = collection::send::send_async(&request, auth.as_ref(), &vars, &options) => result.map_err(|e| e.to_string()),
+                _ = cancel_rx => Err(SendError::Cancelled),
+                result = collection::send::send_async(&request, auth.as_ref(), &vars, &options) => result.map_err(SendError::Failed),
             };
             match result {
                 Ok(sent) => {
                     let post_root = response_root.clone();
                     let post_collection = collection_slug.clone();
-                    let deployment_enabled = target.is_some();
                     let post = tauri::async_runtime::spawn_blocking(move || {
-                        let mut writes_all = BTreeMap::<String, BTreeMap<String, String>>::new();
-                        let mut script_errors = Vec::new();
-                        let mut post_request = request;
-                        let body = if script_layers
-                            .iter()
-                            .any(|(_, scripts)| !scripts.post_response.trim().is_empty())
-                        {
-                            String::from_utf8_lossy(&sent.body).to_string()
-                        } else {
-                            String::new()
-                        };
-                        for (scope, scripts) in &script_layers {
-                            match apply_script(
-                                &scripts.post_response,
-                                &mut post_request,
-                                &mut variable_map,
-                                scope,
-                                &scope_keys,
-                                options.insecure,
-                                Some((
-                                    sent.status,
-                                    sent.elapsed.as_millis() as u64,
-                                    sent.body.len(),
-                                    &body,
-                                )),
-                                if deployment_enabled {
-                                    &collection::deployment::RESERVED
-                                } else {
-                                    &[]
-                                },
-                            ) {
-                                Ok(writes) => {
-                                    for (target, values) in writes {
-                                        writes_all.entry(target).or_default().extend(values);
-                                    }
-                                }
-                                Err(error) => script_errors.push(format!("{scope}: {error}")),
-                            }
+                        if !plan.has_post_response() {
+                            return (sent, Vec::new());
                         }
+                        let mut request = request;
+                        let body = String::from_utf8_lossy(&sent.body).to_string();
+                        let (writes, mut script_errors) = plan.post_response(
+                            &mut request,
+                            &mut variables,
+                            &rq_scripts::Response {
+                                status: sent.status,
+                                elapsed_ms: sent.elapsed.as_millis() as u64,
+                                size: sent.body.len(),
+                                body: &body,
+                            },
+                        );
                         if let Err(error) =
-                            persist_script_writes(&post_root, &post_collection, writes_all)
+                            persist_script_writes(&post_root, &post_collection, writes)
                         {
                             script_errors.push(format!("script variable write failed: {error}"));
                         }
@@ -1402,7 +852,7 @@ async fn send(
                         request_path,
                         method,
                         requested_url,
-                        Ok((post.0, post.1)),
+                        Ok(post),
                     ))
                 }
                 Err(error) => Ok((
@@ -1416,14 +866,8 @@ async fn send(
                 )),
             }
         }
-        Ok(Err(error)) => Err(error),
         Err(error) => Err(error),
     };
-    state
-        .cancellations
-        .lock()
-        .map_err(|_| "state poisoned")?
-        .remove(&request_id);
     let (name, target, collection_slug, request_path, method, requested_url, sent) = sent?;
     let response_context = ResponseContext {
         environment: response_environment,
@@ -1432,29 +876,42 @@ async fn send(
     let (sent, script_errors) = match sent {
         Ok((sent, errors)) => (sent, errors),
         Err(error) => {
-            if error != "Request cancelled" {
-                persist_failed_request(
-                    &app,
-                    &name,
-                    &method,
-                    &collection_slug,
-                    &request_path,
-                    &requested_url,
-                    (&error, &response_context),
-                );
+            if let SendError::Failed(message) = &error {
+                if let Ok(history) = history(&app) {
+                    let mut entry = history_entry(
+                        &name,
+                        &method,
+                        &collection_slug,
+                        &request_path,
+                        &requested_url,
+                        &response_context,
+                    );
+                    entry.error = Some(message.clone());
+                    history.record(entry, &[]);
+                }
             }
             return Err(error);
         }
     };
-    let history_id = persist_response(
-        &app,
-        &name,
-        &method,
-        &collection_slug,
-        &request_path,
-        &sent,
-        &response_context,
-    );
+    let history_id = history(&app).ok().and_then(|history| {
+        let entry = history::Entry {
+            status: sent.status,
+            elapsed_ms: sent.elapsed.as_millis() as u64,
+            bytes: sent.body.len(),
+            content_type: sent.content_type.clone(),
+            insecure: sent.insecure,
+            missing: sent.missing.clone(),
+            ..history_entry(
+                &name,
+                &method,
+                &collection_slug,
+                &request_path,
+                &sent.url,
+                &response_context,
+            )
+        };
+        history.record(entry, &sent.body)
+    });
 
     let mut responses = state.responses.lock().map_err(|_| "state poisoned")?;
     let bytes = sent.body.len();
@@ -1502,6 +959,174 @@ fn save(
         written: outcome.written,
         removed: outcome.removed,
     })
+}
+
+#[tauri::command]
+fn create_collection(
+    name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<WorkspaceDto, String> {
+    let root = workspace_path(&state)?;
+    store::create_collection(&root, &name)?;
+    workspace_dto(&root)
+}
+
+#[derive(Serialize)]
+struct CreatedDto {
+    workspace: WorkspaceDto,
+    path: Vec<usize>,
+    warnings: Vec<String>,
+}
+
+/// Adds a request (optionally read from a cURL command) or, with `folder`,
+/// an empty folder under `parent`.
+#[tauri::command]
+fn create_item(
+    collection: String,
+    parent: Vec<usize>,
+    name: String,
+    folder: bool,
+    curl: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<CreatedDto, String> {
+    let root = workspace_path(&state)?;
+    let (request, warnings) = match curl.as_deref().map(str::trim) {
+        _ if folder => (None, Vec::new()),
+        Some(text) if !text.is_empty() => {
+            let imported = collection::curl_import::parse(text)?;
+            (Some(imported.request), imported.warnings)
+        }
+        _ => (
+            Some(collection::model::RequestDef {
+                method: "GET".to_string(),
+                ..Default::default()
+            }),
+            Vec::new(),
+        ),
+    };
+    let path = store::add_item(&root, &collection, &parent, &name, request)?;
+    Ok(CreatedDto {
+        workspace: workspace_dto(&root)?,
+        path,
+        warnings,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum TreeEdit {
+    Rename {
+        path: Vec<usize>,
+        name: String,
+    },
+    Delete {
+        path: Vec<usize>,
+    },
+    Duplicate {
+        path: Vec<usize>,
+    },
+    Move {
+        from: Vec<usize>,
+        parent: Vec<usize>,
+        index: usize,
+    },
+    RenameCollection {
+        name: String,
+    },
+    DeleteCollection,
+}
+
+#[derive(Serialize)]
+struct TreeEditDto {
+    workspace: WorkspaceDto,
+    /// The collection's slug afterwards; `None` once it is deleted.
+    collection: Option<String>,
+    /// Where a duplicated or moved item now is.
+    path: Option<Vec<usize>>,
+}
+
+/// Structural edits from the tree's context menu and drag and drop.
+#[tauri::command]
+fn edit_tree(
+    collection: String,
+    edit: TreeEdit,
+    state: tauri::State<'_, AppState>,
+) -> Result<TreeEditDto, String> {
+    let root = workspace_path(&state)?;
+    let mut slug = Some(collection.clone());
+    let path = match edit {
+        TreeEdit::Rename { path, name } => {
+            store::rename_item(&root, &collection, &path, &name)?;
+            None
+        }
+        TreeEdit::Delete { path } => {
+            store::delete_item(&root, &collection, &path)?;
+            None
+        }
+        TreeEdit::Duplicate { path } => Some(store::duplicate_item(&root, &collection, &path)?),
+        TreeEdit::Move {
+            from,
+            parent,
+            index,
+        } => Some(store::move_item(&root, &collection, &from, &parent, index)?),
+        TreeEdit::RenameCollection { name } => {
+            slug = Some(store::rename_collection(&root, &collection, &name)?);
+            None
+        }
+        TreeEdit::DeleteCollection => {
+            store::delete_collection(&root, &collection)?;
+            slug = None;
+            None
+        }
+    };
+    Ok(TreeEditDto {
+        workspace: workspace_dto(&root)?,
+        collection: slug,
+        path,
+    })
+}
+
+#[derive(Serialize)]
+struct SharedScriptSaved {
+    workspace: WorkspaceDto,
+    name: String,
+}
+
+/// Creates or updates `scripts/<name>.yml`. `previous` is the name being
+/// edited; renaming updates every include of it.
+#[tauri::command]
+fn save_shared_script(
+    previous: Option<String>,
+    name: String,
+    pre_request: String,
+    post_response: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<SharedScriptSaved, String> {
+    let root = workspace_path(&state)?;
+    let name = store::save_shared_script(
+        &root,
+        previous.as_deref(),
+        &name,
+        Scripts {
+            pre_request,
+            post_response,
+            ..Default::default()
+        },
+    )?;
+    Ok(SharedScriptSaved {
+        workspace: workspace_dto(&root)?,
+        name,
+    })
+}
+
+#[tauri::command]
+fn delete_shared_script(
+    name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<WorkspaceDto, String> {
+    let root = workspace_path(&state)?;
+    store::delete_shared_script(&root, &name)?;
+    workspace_dto(&root)
 }
 
 #[tauri::command]
@@ -1625,14 +1250,6 @@ fn update_variable(variable: &mut Variable, value: Option<String>, secret: bool)
     variable.secret = secret;
 }
 
-/// A folder's variables, or a request's.
-fn item_variables(item: &Item) -> &[Variable] {
-    match &item.request {
-        Some(request) => &request.variables,
-        None => &item.variables,
-    }
-}
-
 #[tauri::command]
 fn curl_preview(
     collection: String,
@@ -1665,38 +1282,25 @@ fn curl_for(
     include_secrets: bool,
 ) -> Result<PreviewDto, String> {
     let located = locate(root, collection, environment)?;
-    let collection = &located.collection;
-    let target =
-        collection::deployment::resolve(collection, located.environment.as_ref(), deployment)?;
-    let resolved = collection
+    let context = located.context(deployment)?;
+    let resolved = context
+        .collection
         .request_at(path)
         .ok_or("that request is no longer in the file")?;
     let request = request_for(draft, &resolved);
-    let auth = auth_for(collection, path, &request);
+    let auth = context.auth(path, &request);
 
     let variables = if include_secrets {
-        collection::send::variables_for_target(
-            collection,
-            located.environment.as_ref(),
-            &located.globals,
-            path,
-            target.as_ref(),
-        )
+        context.variables(path)
     } else {
-        collection::curl::masked_variables_for_target(
-            collection,
-            located.environment.as_ref(),
-            &located.globals,
-            path,
-            target.as_ref(),
-        )
+        context.masked_variables(path)
     };
     let preview = collection::curl::render(&request, auth, &variables);
     Ok(PreviewDto {
         text: preview.text,
         masked: preview.masked,
         problem: preview.problem,
-        deployment: target,
+        deployment: context.target,
     })
 }
 
@@ -1736,45 +1340,28 @@ fn response_export(body: &[u8], query: &str) -> Result<Vec<u8>, String> {
     response_export_with_variables(body, query, || Ok(BTreeMap::new().into()))
 }
 
+#[cfg(test)]
 fn response_export_with_variables(
     body: &[u8],
     query: &str,
     load: impl FnOnce() -> Result<collection::send::Variables, String>,
 ) -> Result<Vec<u8>, String> {
-    if query.trim().is_empty() {
-        return Ok(body.to_vec());
-    }
-    let selection = query::parse(query, load)?;
-    let projected = project(body, &selection).map_err(|diag| diag.render(query))?;
-    let value: serde_json::Value =
-        serde_json::from_slice(&projected).map_err(|error| error.to_string())?;
-    serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())
+    view::FrozenQuery::parse(query, load)?.export(body)
 }
 
 #[tauri::command]
 fn save_response(
     id: u64,
-    query: String,
-    context: Option<query::Context>,
+    view_id: u64,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<bool, String> {
     use tauri_plugin_dialog::DialogExt;
 
-    let body = {
+    let bytes = {
         let responses = state.responses.lock().map_err(|_| "state poisoned")?;
-        responses
-            .bodies
-            .get(&id)
-            .cloned()
-            .ok_or("that response is no longer in memory; send it again")?
+        responses.export_view(id, view_id)?
     };
-    let bytes = response_export_with_variables(&body, &query, || {
-        let context = context
-            .as_ref()
-            .ok_or("select a request to resolve query variables")?;
-        context.variables(&workspace_path(&state)?)
-    })?;
     let is_json = serde_json::from_slice::<serde::de::IgnoredAny>(&bytes).is_ok();
     let Some(file) = app
         .dialog()
@@ -1813,54 +1400,20 @@ fn project_body(
             .ok_or("that response is no longer in memory; send it again")?
     };
 
-    if query.trim().is_empty() {
-        let started = std::time::Instant::now();
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
-            let text = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
-            return Ok(ProjectionDto {
-                text,
-                bytes: body.len(),
-                elapsed_ms: started.elapsed().as_micros() as u64 / 1000,
-                truncated: false,
-                is_raw: false,
-            });
-        }
-        let truncated = body.len() > RAW_VIEW_LIMIT;
-        let slice = &body[..body.len().min(RAW_VIEW_LIMIT)];
-        return Ok(ProjectionDto {
-            text: String::from_utf8_lossy(slice).to_string(),
-            bytes: body.len(),
-            elapsed_ms: 0,
-            truncated,
-            is_raw: true,
-        });
-    }
-
-    let selection = query::parse(&query, || {
+    let frozen = view::FrozenQuery::parse(&query, || {
         let context = context
             .as_ref()
             .ok_or("select a request to resolve query variables")?;
         context.variables(&workspace_path(&state)?)
     })?;
 
-    let started = std::time::Instant::now();
-    let projected = project(&body, &selection).map_err(|diag| diag.render(&query))?;
-    let elapsed = started.elapsed();
-
-    let bytes = projected.len();
-    let text = match serde_json::from_slice::<serde_json::Value>(&projected) {
-        Ok(value) => serde_json::to_string_pretty(&value)
-            .unwrap_or_else(|_| String::from_utf8_lossy(&projected).to_string()),
-        Err(_) => String::from_utf8_lossy(&projected).to_string(),
-    };
-
-    Ok(ProjectionDto {
-        text,
-        bytes,
-        elapsed_ms: elapsed.as_micros() as u64 / 1000,
-        truncated: false,
-        is_raw: false,
-    })
+    let mut projection = frozen.project(&body)?;
+    projection.view_id = state
+        .responses
+        .lock()
+        .map_err(|_| "state poisoned")?
+        .remember_view(id, frozen)?;
+    Ok(projection)
 }
 
 /// The no-spec path: infer a schema from what just came back, then write a
@@ -1904,6 +1457,11 @@ fn main() {
             open_history,
             cancel_send,
             save,
+            create_collection,
+            create_item,
+            edit_tree,
+            save_shared_script,
+            delete_shared_script,
             create_environment,
             update_environment,
             delete_environment,
@@ -1926,7 +1484,12 @@ mod deployment_tests {
     #[tokio::test]
     async fn both_transports_send_to_the_selected_target() {
         use std::io::{BufRead, Write};
-        for (asynchronous, tenant) in [(false, "north"), (false, "south"), (true, "north"), (true, "south")] {
+        for (asynchronous, tenant) in [
+            (false, "north"),
+            (false, "south"),
+            (true, "north"),
+            (true, "south"),
+        ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let template = format!(
                 "http://{}/{{{{serviceName}}}}{{{{basePath}}}}",
@@ -1963,6 +1526,7 @@ mod deployment_tests {
                 Some("/{{tenant == 'north' ? serviceName : 'shared'}}-{{slot}}".into());
             let environment = collection::Environment {
                 name: "stage".into(),
+                main_slot: None,
                 insecure: false,
                 variables: Vec::new(),
                 platforms: vec![collection::model::Platform {
@@ -2053,9 +1617,9 @@ mod deployment_tests {
         )
         .unwrap();
         for preview in [&protected, &revealed] {
-            assert!(preview.text.contains(
-                "https://navsvc.stage-a.test/navsvc-candidate/acme/menu"
-            ));
+            assert!(preview
+                .text
+                .contains("https://navsvc.stage-a.test/navsvc-candidate/acme/menu"));
             assert!(!preview.text.contains("wrong.test"));
             assert_eq!(
                 preview.deployment.as_ref().unwrap().base_path,
@@ -2066,41 +1630,6 @@ mod deployment_tests {
         assert!(!protected.text.contains("private-token"));
         assert!(revealed.text.contains("private-token"));
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn scripts_cannot_assign_generated_target_inputs_but_ordinary_variables_still_work() {
-        for name in collection::deployment::RESERVED {
-            let mut request = collection::model::RequestDef::default();
-            let mut variables = BTreeMap::new();
-            let error = apply_script(
-                &format!("pm.variables.set('{name}', 'wrong');"),
-                &mut request,
-                &mut variables,
-                "collection::test",
-                &[],
-                false,
-                None,
-                &collection::deployment::RESERVED,
-            )
-            .unwrap_err();
-            assert!(error.contains("read-only"), "{error}");
-            assert!(!variables.contains_key(name));
-        }
-        let mut request = collection::model::RequestDef::default();
-        let mut variables = BTreeMap::new();
-        apply_script(
-            "pm.variables.set('baseUrl', 'https://ordinary.test');",
-            &mut request,
-            &mut variables,
-            "collection::test",
-            &[],
-            false,
-            None,
-            &[],
-        )
-        .unwrap();
-        assert_eq!(variables["baseUrl"], "https://ordinary.test");
     }
 }
 
@@ -2320,7 +1849,7 @@ mod response_environment_tests {
             "url": "https://api.test", "status": 200, "elapsed_ms": 1,
             "bytes": 2, "content_type": null, "insecure": false, "missing": []
         });
-        let entry: HistoryEntry = serde_json::from_value(legacy).unwrap();
+        let entry: history::Entry = serde_json::from_value(legacy).unwrap();
         assert_eq!(entry.environment, None);
         assert_eq!(entry.deployment, None);
         for environment in ["", "Dev", "Stage"] {
@@ -2333,9 +1862,10 @@ mod response_environment_tests {
                 tenant: "acme".into(),
                 platform: "stage-a".into(),
                 slot: "candidate".into(),
+                slot_suffix: "-candidate".into(),
                 base_url: "https://navsvc-candidate.stage-a.test/acme".into(),
             });
-            let restored: HistoryEntry =
+            let restored: history::Entry =
                 serde_json::from_slice(&serde_json::to_vec(&entry).unwrap()).unwrap();
             assert_eq!(restored.environment.as_deref(), Some(environment));
             assert_eq!(restored.deployment, entry.deployment);

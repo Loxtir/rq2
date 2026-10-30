@@ -17,7 +17,9 @@ fn sample() -> store::Workspace {
 #[test]
 fn the_sample_composes_globals_and_collection_values() {
     let workspace = sample();
-    let collection = &workspace.collections[0];
+    let collection = workspace
+        .collection("JSONPlaceholder")
+        .expect("the JSONPlaceholder collection");
 
     let resolved = variables(collection, None, &workspace.globals, &[0, 0]);
     assert_eq!(
@@ -29,7 +31,9 @@ fn the_sample_composes_globals_and_collection_values() {
 #[test]
 fn the_sample_reads_a_folder_and_a_request_scope() {
     let workspace = sample();
-    let collection = &workspace.collections[0];
+    let collection = workspace
+        .collection("JSONPlaceholder")
+        .expect("the JSONPlaceholder collection");
 
     // Posts folder: `limit` for the list request.
     let list = variables(collection, None, &workspace.globals, &[0, 0]);
@@ -48,7 +52,9 @@ fn the_sample_reads_a_folder_and_a_request_scope() {
 #[test]
 fn the_sample_environment_overrides_the_global_origin() {
     let workspace = sample();
-    let collection = &workspace.collections[0];
+    let collection = workspace
+        .collection("JSONPlaceholder")
+        .expect("the JSONPlaceholder collection");
     let local = workspace
         .environments
         .iter()

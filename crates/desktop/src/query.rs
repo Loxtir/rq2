@@ -19,18 +19,9 @@ impl Context {
         if located.collection.request_at(&self.path).is_none() {
             return Err("that query's request is no longer in the collection".into());
         }
-        let target = collection::deployment::resolve(
-            &located.collection,
-            located.environment.as_ref(),
-            self.deployment.as_ref(),
-        )?;
-        Ok(collection::send::variables_for_target(
-            &located.collection,
-            located.environment.as_ref(),
-            &located.globals,
-            &self.path,
-            target.as_ref(),
-        ))
+        Ok(located
+            .context(self.deployment.as_ref())?
+            .variables(&self.path))
     }
 }
 

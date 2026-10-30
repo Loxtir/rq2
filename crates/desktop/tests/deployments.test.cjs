@@ -74,7 +74,7 @@ test("deployment choices are filtered by environment and tenant, with no automat
   assert.equal(h.element("deployment-tenant").disabled, true);
   h.state.env = "stage";
   h.context.renderDeployments();
-  assert.deepEqual(h.element("deployment-tenant").children.map((option) => option.value), ["", "globex", "acme"]);
+  assert.deepEqual(h.element("deployment-tenant").children.map((option) => option.value), ["", "acme", "globex"]);
   h.tenant("acme");
   assert.deepEqual(h.element("deployment-target").children.map((option) => option.textContent), ["Select deployment…", "stage-a / stable", "stage-a / candidate"]);
   assert.equal(h.element("send").disabled, true);
@@ -94,6 +94,22 @@ test("deployment choices are filtered by environment and tenant, with no automat
   assert.equal(h.state.response.id, 8);
   assert.match(h.element("response-environment").textContent, /globex.*stage-b/);
   assert.equal(h.element("response-environment").className, "tag tag-warn");
+});
+
+test("the tenant is one workspace choice that keeps each collection's platform and slot when it can", () => {
+  const h = harness();
+  h.state.env = "stage";
+  h.collection.deployments.push({ tenant: "globex", platform: "stage-a", slot: "candidate" });
+  h.tenant("acme");
+  h.target(1);
+  assert.equal(h.storage.get("rq.tenant:test"), "acme");
+  h.tenant("globex");
+  assert.deepEqual(JSON.parse(JSON.stringify(h.context.currentDeployment())), { tenant: "globex", platform: "stage-a", slot: "candidate" });
+  h.collection.deployments.pop();
+  h.context.renderDeployments();
+  assert.equal(h.context.currentDeployment(), null, "no stage-a / candidate for globex: choose again, nothing substituted");
+  h.tenant("acme");
+  assert.equal(h.context.currentDeployment().slot, "candidate", "the collection's platform/slot was remembered");
 });
 
 test("target preferences are isolated per collection and restored from local storage", () => {
@@ -117,13 +133,39 @@ test("generated URL and template inputs are read-only rather than editable varia
   h.state.env = "stage";
   h.tenant("acme");
   h.target(0);
-  for (const name of ["baseUrl", "serviceName", "tenant", "platform", "slot"]) {
+  for (const name of ["baseUrl", "serviceName", "tenant", "platform", "slot", "slotSuffix"]) {
     const info = h.context.variableInfo(name);
     assert.equal(info.readOnly, true);
     assert.equal(info.kind, "deployment");
     assert.equal(info.defined, true);
   }
   assert.equal(h.context.variableInfo("baseUrl").value, "https://navsvc-stable.stage-a.test/acme");
+});
+
+test("an environment-wide named main slot omits every optional URL suffix but retains its identity", () => {
+  const h = harness();
+  h.state.env = "stage";
+  const environment = h.state.workspace.environments[0];
+  environment.main_slot = "default";
+  environment.platforms[0].url_template = "https://grid-{{tenant}}{{slotSuffix}}.stage.test/{{serviceName}}{{slotSuffix}}";
+  h.placements[0].slot = "default";
+  h.placements[1].slot = "worker";
+  h.tenant("acme");
+  h.target(0);
+  assert.equal(h.context.deploymentInputs().baseUrl, "https://grid-acme.stage.test/navsvc");
+  assert.equal(h.context.variableInfo("slot").value, "default");
+  assert.equal(h.context.variableInfo("slotSuffix").value, "");
+  assert.equal(h.context.variableInfo("slotSuffix").defined, true);
+  assert.equal(h.context.variableInfo("slotSuffix").readOnly, true);
+  assert.ok(h.element("deployment-target").children.some((option) => option.textContent === "stage-a / default"));
+  const key = h.context.deploymentResolutionKey();
+  environment.main_slot = "primary";
+  assert.notEqual(h.context.deploymentResolutionKey(), key);
+  assert.equal(h.context.deploymentInputs().baseUrl, "https://grid-acme-default.stage.test/navsvc-default");
+  environment.main_slot = "default";
+  h.target(1);
+  assert.equal(h.context.deploymentInputs().baseUrl, "https://grid-acme-worker.stage.test/navsvc-worker");
+  assert.equal(h.context.currentDeployment().slot, "worker");
 });
 
 test("preview, protected copy, unprotected copy and Send pass the same deployment", async () => {

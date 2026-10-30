@@ -6,11 +6,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod expression;
 
-pub const RESERVED: [&str; 6] = [
+pub const RESERVED: [&str; 7] = [
     "serviceName",
     "tenant",
     "platform",
     "slot",
+    "slotSuffix",
     "basePath",
     "baseUrl",
 ];
@@ -23,6 +24,8 @@ pub struct Target {
     pub platform: String,
     pub slot: String,
     #[serde(default)]
+    pub slot_suffix: String,
+    #[serde(default)]
     pub base_path: String,
     pub base_url: String,
 }
@@ -34,6 +37,7 @@ impl Target {
             ("tenant", &self.tenant),
             ("platform", &self.platform),
             ("slot", &self.slot),
+            ("slotSuffix", &self.slot_suffix),
             ("basePath", &self.base_path),
             ("baseUrl", &self.base_url),
         ] {
@@ -65,6 +69,9 @@ fn validate_name(kind: &str, name: &str) -> Result<(), String> {
 pub fn validate(collections: &[Collection], environments: &[Environment]) -> Result<(), String> {
     let mut platforms = BTreeSet::new();
     for environment in environments {
+        if let Some(main_slot) = &environment.main_slot {
+            validate_name("main_slot", main_slot)?;
+        }
         for platform in &environment.platforms {
             validate_name("platform", &platform.name)?;
             if !platforms.insert(&platform.name) {
@@ -80,6 +87,7 @@ pub fn validate(collections: &[Collection], environments: &[Environment]) -> Res
                 "tenant",
                 &platform.name,
                 "slot",
+                "-slot",
                 "/base",
             )?;
         }
@@ -96,7 +104,7 @@ pub fn validate(collections: &[Collection], environments: &[Environment]) -> Res
         })?;
         validate_name("service_name", service)?;
         if let Some(template) = &collection.base_path {
-            render_base_path(template, service, "tenant", "platform", "slot")?;
+            render_base_path(template, service, "tenant", "platform", "slot", "-slot")?;
         }
         let mut placements = BTreeSet::new();
         for deployment in &collection.deployments {
@@ -110,6 +118,7 @@ pub fn validate(collections: &[Collection], environments: &[Environment]) -> Res
                     &deployment.tenant,
                     &deployment.platform,
                     &deployment.slot,
+                    &format!("-{}", deployment.slot),
                 )?;
             }
             if !placements.insert((&deployment.tenant, &deployment.platform, &deployment.slot)) {
@@ -129,6 +138,7 @@ fn render_template(
     tenant: &str,
     platform: &str,
     slot: &str,
+    slot_suffix: &str,
     base_path: &str,
 ) -> Result<String, String> {
     let inputs = BTreeMap::from([
@@ -136,12 +146,13 @@ fn render_template(
         ("tenant".into(), tenant.into()),
         ("platform".into(), platform.into()),
         ("slot".into(), slot.into()),
+        ("slotSuffix".into(), slot_suffix.into()),
         ("basePath".into(), base_path.into()),
     ]);
     let mut missing = Vec::new();
     let url = crate::send::substitute(template, &inputs, &mut missing);
     if !missing.is_empty() || url.contains(['{', '}']) {
-        return Err(format!("invalid URL template for platform `{platform}`: use only serviceName, tenant, platform, slot and basePath"));
+        return Err(format!("invalid URL template for platform `{platform}`: use only serviceName, tenant, platform, slot, slotSuffix and basePath"));
     }
     let parsed = reqwest::Url::parse(&url)
         .map_err(|e| format!("invalid URL template for platform `{platform}`: {e}"))?;
@@ -163,12 +174,14 @@ fn render_base_path(
     tenant: &str,
     platform: &str,
     slot: &str,
+    slot_suffix: &str,
 ) -> Result<String, String> {
     let inputs = BTreeMap::from([
         ("serviceName".into(), service.into()),
         ("tenant".into(), tenant.into()),
         ("platform".into(), platform.into()),
         ("slot".into(), slot.into()),
+        ("slotSuffix".into(), slot_suffix.into()),
     ]);
     let path = expression::render(template, &inputs)?;
     if (!path.is_empty() && !path.starts_with('/'))
@@ -211,6 +224,14 @@ pub fn resolve(
     validate_name("tenant", &selection.tenant)?;
     validate_name("platform", &selection.platform)?;
     validate_name("slot", &selection.slot)?;
+    if let Some(main_slot) = &environment.main_slot {
+        validate_name("main_slot", main_slot)?;
+    }
+    let slot_suffix = if environment.main_slot.as_deref() == Some(selection.slot.as_str()) {
+        String::new()
+    } else {
+        format!("-{}", selection.slot)
+    };
     let base_path = match &collection.base_path {
         Some(template) => render_base_path(
             template,
@@ -218,6 +239,7 @@ pub fn resolve(
             &selection.tenant,
             &selection.platform,
             &selection.slot,
+            &slot_suffix,
         )?,
         None => String::new(),
     };
@@ -242,8 +264,10 @@ pub fn resolve(
             &selection.tenant,
             &selection.platform,
             &selection.slot,
+            &slot_suffix,
             &base_path,
         )?,
         base_path,
+        slot_suffix,
     }))
 }

@@ -165,6 +165,24 @@ async function checkQueryControls() {
     showVariable("basePath", $("url").getBoundingClientRect());
     check($("var-value").value === "/navsvc-candidate" && $("var-value").readOnly, "generated basePath must be visible and read-only");
     check($("var-value").readOnly, "generated basePath must not allow automatic variable edits");
+    hideVariable();
+    const original = state.requestTabs.find((tab) => tab.key === state.activeRequestTab);
+    const originalResponse = state.response;
+    const evaluations = window.calls.filter((call) => call.command === "project_body").length;
+    const activeTab = [...document.querySelectorAll(".request-tab")].find((tab) => tab.getAttribute("aria-selected") === "true");
+    activeTab.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 40, clientY: 40 }));
+    check(!$("context-menu").hidden, "right-clicking a request tab must open its menu");
+    [...$("context-menu").querySelectorAll("button")].find((item) => item.textContent === "Duplicate tab").click();
+    check($("context-menu").hidden, "choosing an item must close the menu");
+    const duplicate = state.requestTabs.find((tab) => tab.key === state.activeRequestTab);
+    check(duplicate.key !== original.key && duplicate.slug === original.slug, "Duplicate tab must open the same saved request with an independent identity");
+    check(state.response === null && duplicate.view === null, "a duplicated draft must not pretend to have sent another response");
+    state.draft.url = "https://different-store.test";
+    activateRequestTab(original.key);
+    check(state.response === originalResponse, "returning to the original must restore its own response");
+    check(state.draft.url !== "https://different-store.test", "duplicate drafts must not share mutable request fields");
+    check(window.calls.filter((call) => call.command === "project_body").length === evaluations, "switching back must not reevaluate the response query");
+    check(document.querySelectorAll(".request-tab").length >= 2, "both copies must be visible in the tab strip");
     result.textContent = JSON.stringify({ ok: true });
   } catch (error) {
     result.textContent = JSON.stringify({ error: error.message });

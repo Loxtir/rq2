@@ -403,6 +403,25 @@ fn describe(schema: &Schema) -> String {
     }
 }
 
+/// Script writes are per-user current values, like in the app. Failing to save
+/// them should not fail a request that already went out.
+fn save_script_edits(
+    values: Option<&collection::live::LiveValues>,
+    workspace: &std::path::Path,
+    edits: Vec<collection::live::Entry>,
+) {
+    if edits.is_empty() {
+        return;
+    }
+    let Some(values) = values else {
+        eprintln!("warning: no config directory; script variable writes were not saved");
+        return;
+    };
+    if let Err(error) = values.write(workspace, edits, false) {
+        eprintln!("warning: script variable write failed: {error}");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_send(
     workspace: PathBuf,
@@ -416,18 +435,20 @@ fn cmd_send(
 ) -> Result<ExitCode> {
     use std::io::Write as _;
 
-    let loaded = collection::store::load(&workspace).map_err(anyhow::Error::msg)?;
+    let live_values =
+        collection::live::LiveValues::default_path().map(collection::live::LiveValues::new);
+    let loaded = match &live_values {
+        Some(values) => values.load(&workspace),
+        None => collection::store::load(&workspace),
+    }
+    .map_err(anyhow::Error::msg)?;
     if loaded.collections.is_empty() {
         bail!("no collections found in {}", workspace.display());
     }
 
     let collection = match &collection_name {
         Some(name) => loaded
-            .collections
-            .iter()
-            .find(|candidate| {
-                collection::store::slugify(&candidate.name) == collection::store::slugify(name)
-            })
+            .collection(name)
             .ok_or_else(|| anyhow!("no collection called `{name}`"))?,
         None if loaded.collections.len() == 1 => &loaded.collections[0],
         None => bail!("several collections here; pass --collection"),
@@ -436,46 +457,15 @@ fn cmd_send(
     let environment = match &environment_name {
         Some(name) => Some(
             loaded
-                .environments
-                .iter()
-                .find(|candidate| {
-                    collection::store::slugify(&candidate.name) == collection::store::slugify(name)
-                })
+                .environment(name)
                 .ok_or_else(|| anyhow!("no environment called `{name}`"))?,
         ),
         None => None,
     };
 
-    let requests = collection.requests();
-    let wanted = request_name.to_ascii_lowercase();
-    let exact: Vec<_> = requests
-        .iter()
-        .filter(|candidate| candidate.name.to_ascii_lowercase() == wanted)
-        .collect();
-    let matches: Vec<_> = if exact.is_empty() {
-        requests
-            .iter()
-            .filter(|candidate| candidate.name.to_ascii_lowercase().contains(&wanted))
-            .collect()
-    } else {
-        exact
-    };
-
-    let found = match matches.as_slice() {
-        [only] => *only,
-        [] => {
-            let names: Vec<_> = requests.iter().map(|r| r.name).collect();
-            bail!(
-                "no request called `{request_name}`. Available: {}",
-                names.join(", ")
-            )
-        }
-        many => bail!(
-            "`{request_name}` matches {} requests: {}",
-            many.len(),
-            many.iter().map(|r| r.name).collect::<Vec<_>>().join(", ")
-        ),
-    };
+    let found = collection
+        .find_request(&request_name)
+        .map_err(anyhow::Error::msg)?;
 
     let selection = match (deployment.tenant, deployment.platform, deployment.slot) {
         (Some(tenant), Some(platform), Some(slot)) => Some(collection::model::Deployment {
@@ -486,19 +476,52 @@ fn cmd_send(
         (None, None, None) => None,
         _ => bail!("pass --tenant, --platform and --slot together"),
     };
-    let target = collection::deployment::resolve(collection, environment, selection.as_ref())
-        .map_err(anyhow::Error::msg)?;
-    let vars = collection::send::variables_for_target(
+    let context = collection::context::RequestContext::new(
         collection,
         environment,
         &loaded.globals,
-        &found.path,
-        target.as_ref(),
-    );
-    let insecure = insecure_flag || environment.is_some_and(|environment| environment.insecure);
+        selection.as_ref(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let slug = collection::store::slugify(&collection.name);
+    let mut request = found.request.clone();
+    let plan = rq_scripts::Plan::new(&context, &found.path, &request, &loaded.scripts)
+        .map_err(anyhow::Error::msg)?;
+    let mut variables: std::collections::BTreeMap<_, _> = context
+        .variables(&found.path)
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let writes = plan
+        .pre_request(&mut request, &mut variables)
+        .map_err(|error| anyhow!("pre-request script: {error}"))?;
+
+    // Script writes become current values; resolve again through the scope
+    // chain so a narrower saved value still wins, as in the app.
+    let mut updated = loaded.clone();
+    let edits = rq_scripts::edits(&mut updated, &slug, writes).map_err(anyhow::Error::msg)?;
+    collection::live::apply(&mut updated, &edits);
+    save_script_edits(live_values.as_ref(), &workspace, edits);
+    let context = collection::context::RequestContext::new(
+        updated
+            .collection(&slug)
+            .expect("the collection was just found"),
+        environment.and_then(|environment| updated.environment(&environment.name)),
+        &updated.globals,
+        selection.as_ref(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let mut variables: std::collections::BTreeMap<_, _> = context
+        .variables(&found.path)
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+
+    let vars = collection::send::Variables::from(variables.clone());
+    let insecure = insecure_flag || context.insecure();
     let sent = collection::send::send(
-        found.request,
-        found.auth,
+        &request,
+        context.auth(&found.path, &request),
         &vars,
         &collection::send::SendOptions {
             insecure,
@@ -506,6 +529,27 @@ fn cmd_send(
         },
     )
     .map_err(anyhow::Error::msg)?;
+
+    if plan.has_post_response() {
+        let body = String::from_utf8_lossy(&sent.body).to_string();
+        let (writes, errors) = plan.post_response(
+            &mut request,
+            &mut variables,
+            &rq_scripts::Response {
+                status: sent.status,
+                elapsed_ms: sent.elapsed.as_millis() as u64,
+                size: sent.body.len(),
+                body: &body,
+            },
+        );
+        for error in errors {
+            eprintln!("warning: post-response script {error}");
+        }
+        match rq_scripts::edits(&mut updated.clone(), &slug, writes) {
+            Ok(edits) => save_script_edits(live_values.as_ref(), &workspace, edits),
+            Err(error) => eprintln!("warning: script variable write failed: {error}"),
+        }
+    }
 
     if insecure {
         eprintln!("warning: certificate verification is off for this request");

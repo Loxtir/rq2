@@ -6,7 +6,6 @@
 
 use crate::model::{Auth, Body, Collection, Environment, RequestDef, Variable};
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::time::{Duration, Instant};
 
 /// Bodies above this are refused rather than swapped to disk. A 500k-line
@@ -306,116 +305,68 @@ fn replace_segment(url: &str, name: &str, value: &str) -> String {
         .join("/")
 }
 
+/// Appends auth query pairs. Unlike hand-written params these are opaque
+/// values (API keys), so they are percent-encoded.
+pub(crate) fn append_auth_query(url: &mut String, query: &[(String, String)]) {
+    if query.is_empty() {
+        return;
+    }
+    url.push(if url.contains('?') { '&' } else { '?' });
+    let pairs: Vec<String> = query
+        .iter()
+        .map(|(name, value)| format!("{}={}", encode(name), encode(value)))
+        .collect();
+    url.push_str(&pairs.join("&"));
+}
+
+pub(crate) fn encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~*".contains(&byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 #[derive(Default)]
 pub(crate) struct AuthParts {
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) query: Vec<(String, String)>,
 }
 
+/// Blocking transport for the CLI and for scripts. It is the async one run on
+/// a private runtime, so both front ends send byte-for-byte the same request.
 pub fn send(
     request: &RequestDef,
     auth: Option<&Auth>,
     vars: &Variables,
     options: &SendOptions,
 ) -> Result<SentResponse, String> {
-    let mut missing = vars.problems.clone();
-
-    let (mut url, problem) = resolve_url(request, vars, &mut missing);
-    if let Some(problem) = problem {
-        return Err(problem);
-    }
-    if url.is_empty() {
-        return Err("request has no URL".to_string());
-    }
-
-    let auth = match auth {
-        Some(auth) => auth_parts(auth, vars, &mut missing)?,
-        None => AuthParts::default(),
+    let run = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("starting the HTTP runtime: {error}"))?
+            .block_on(send_async(request, auth, vars, options))
     };
-
-    if !auth.query.is_empty() {
-        url.push(if url.contains('?') { '&' } else { '?' });
-        url.push_str(
-            &auth
-                .query
-                .iter()
-                .map(|(name, value)| format!("{name}={value}"))
-                .collect::<Vec<_>>()
-                .join("&"),
-        );
+    // A runtime cannot be started inside another, so a caller already on one
+    // (an async test, a blocking task) gets a plain thread of its own.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|threads| {
+            threads
+                .spawn(run)
+                .join()
+                .map_err(|_| "the HTTP thread crashed".to_string())?
+        })
+    } else {
+        run()
     }
-
-    // native-tls is never picked up implicitly by ureq, so it has to be handed
-    // to the builder. On Windows this is SChannel, which means no C toolchain.
-    // The same builder is what lets us stop verifying, for internal endpoints
-    // whose certificates no public CA signed.
-    let tls = ureq::native_tls::TlsConnector::builder()
-        .danger_accept_invalid_certs(options.insecure)
-        .danger_accept_invalid_hostnames(options.insecure)
-        .build()
-        .map_err(|e| format!("no TLS backend available: {e}"))?;
-    let agent = ureq::AgentBuilder::new()
-        .timeout(options.timeout)
-        .tls_connector(std::sync::Arc::new(tls))
-        .build();
-    let mut call = agent.request(&request.method, &url);
-
-    for header in &request.headers {
-        if header.disabled {
-            continue;
-        }
-        let name = substitute(&header.name, vars, &mut missing);
-        let value = substitute(&header.value, vars, &mut missing);
-        call = call.set(&name, &value);
-    }
-    // Auth last, so a header it sets wins over a stale hand-written one.
-    for (name, value) in &auth.headers {
-        call = call.set(name, value);
-    }
-
-    let started = Instant::now();
-
-    let sent = match &request.body {
-        Some(body) => {
-            let text = body_text(body, vars, &mut missing);
-            if body.language.as_deref() == Some("json") && !has_header(request, "content-type") {
-                call = call.set("Content-Type", "application/json");
-            }
-            call.send_string(&text)
-        }
-        None => call.call(),
-    };
-
-    let response = match sent {
-        Ok(response) => response,
-        // A 404 is a response, not a failure. Show it.
-        Err(ureq::Error::Status(_, response)) => response,
-        Err(ureq::Error::Transport(transport)) => return Err(transport.to_string()),
-    };
-
-    let elapsed = started.elapsed();
-    let status = response.status();
-    let content_type = response.header("content-type").map(str::to_string);
-
-    let mut body = Vec::new();
-    response
-        .into_reader()
-        .take(MAX_BODY)
-        .read_to_end(&mut body)
-        .map_err(|e| format!("reading the response body: {e}"))?;
-
-    Ok(SentResponse {
-        status,
-        elapsed,
-        body,
-        content_type,
-        url,
-        insecure: options.insecure,
-        missing,
-    })
 }
 
-/// Async desktop transport. Dropping this future cancels both the connection
+/// Async transport. Dropping this future cancels both the connection
 /// and response-body read, which lets the UI stop a slow request immediately.
 pub async fn send_async(
     request: &RequestDef,
@@ -436,17 +387,7 @@ pub async fn send_async(
         Some(auth) => auth_parts(auth, vars, &mut missing)?,
         None => AuthParts::default(),
     };
-    if !auth.query.is_empty() {
-        url.push(if url.contains('?') { '&' } else { '?' });
-        url.push_str(
-            &auth
-                .query
-                .iter()
-                .map(|(name, value)| format!("{name}={value}"))
-                .collect::<Vec<_>>()
-                .join("&"),
-        );
-    }
+    append_auth_query(&mut url, &auth.query);
 
     let client = reqwest::Client::builder()
         .timeout(options.timeout)
@@ -467,9 +408,17 @@ pub async fn send_async(
         let value = substitute(&header.value, vars, &mut missing);
         call = call.header(name, value);
     }
+    // Auth last and replacing, so it wins over a stale hand-written header.
+    let mut auth_headers = reqwest::header::HeaderMap::new();
     for (name, value) in &auth.headers {
-        call = call.header(name, value);
+        auth_headers.insert(
+            reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|error| format!("invalid auth header `{name}`: {error}"))?,
+            reqwest::header::HeaderValue::from_str(value)
+                .map_err(|error| format!("invalid value for auth header `{name}`: {error}"))?,
+        );
     }
+    call = call.headers(auth_headers);
     if let Some(body) = &request.body {
         let text = body_text(body, vars, &mut missing);
         if body.language.as_deref() == Some("json") && !has_header(request, "content-type") {

@@ -30,20 +30,20 @@ const state = {
   activeRequestTab: null,
   pendingRequests: new Set(),
   cancelRequests: new Map(),
-  projectionVersion: 0,
   treeSearch: "",
 };
 
-// Unsaved edits, per node. Switching requests does not throw work away: the
-// draft stays here and comes back when you return. The tree marks it.
+// Unsaved edits, per editor. Copies of a request have separate entries; switching
+// tabs does not throw either draft away. The tree marks any unsaved copy.
 const drafts = new Map();
 
 const nodeKey = (slug, path) => `${slug}:${path.join(".")}`;
 const draftKey = (kind, slug, path) => `${kind}:${nodeKey(slug, path)}`;
 const requestTabKey = (slug, path) => `${state.workspace?.path || ""}|${nodeKey(slug, path)}`;
+let nextRequestTab = 0;
+const tabDraftKey = (tab) => tab.draftKey || draftKey(tab.kind, tab.slug, tab.path);
 
-function draftFor(kind, slug, path, build) {
-  const key = draftKey(kind, slug, path);
+function draftFor(kind, slug, path, build, key = draftKey(kind, slug, path)) {
   const existing = drafts.get(key);
   if (existing) return existing;
 
@@ -101,6 +101,10 @@ function applyLayout() {
 
   document.body.classList.toggle("left-closed", !layout.leftOpen);
   document.body.classList.toggle("right-closed", !layout.rightOpen);
+  for (const [key, variable] of [["request", "--request-h"], ["query", "--query-h"], ["script", "--script-h"]]) {
+    if (layout[key]) root.setProperty(variable, `${layout[key]}px`);
+    else root.removeProperty(variable);
+  }
 }
 
 function saveLayout() {
@@ -163,6 +167,566 @@ function setupSplitter(element, side) {
     applyLayout();
     saveLayout();
   });
+}
+
+// Drags the height of `target()` and stores it as `layout[key]`. `bounds()`
+// gives the allowed range at drag start; a double-click returns to the CSS
+// default.
+function setupRowSplitter(element, key, target, bounds) {
+  let startY = 0;
+  let startHeight = 0;
+  let range = [0, Infinity];
+  let dragging = false;
+
+  element.addEventListener("pointerdown", (event) => {
+    dragging = true;
+    startY = event.clientY;
+    startHeight = target().getBoundingClientRect().height;
+    range = bounds();
+    element.setPointerCapture(event.pointerId);
+    document.body.classList.add("dragging", "dragging-row");
+    event.preventDefault();
+  });
+
+  element.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    const next = startHeight + event.clientY - startY;
+    layout[key] = Math.round(Math.max(range[0], Math.min(range[1], next)));
+    applyLayout();
+  });
+
+  const end = (event) => {
+    if (!dragging) return;
+    dragging = false;
+    try {
+      element.releasePointerCapture(event.pointerId);
+    } catch {
+      /* the pointer can already be gone */
+    }
+    document.body.classList.remove("dragging", "dragging-row");
+    saveLayout();
+  };
+
+  element.addEventListener("pointerup", end);
+  element.addEventListener("pointercancel", end);
+  element.addEventListener("dblclick", () => {
+    delete layout[key];
+    applyLayout();
+    saveLayout();
+  });
+}
+
+function setupRowSplitters() {
+  const tabBody = () => document.querySelector("#request-view > .tab-body");
+  setupRowSplitter($("split-request"), "request", tabBody, () => {
+    const view = $("request-view").getBoundingClientRect();
+    const top = tabBody().getBoundingClientRect().top;
+    // Keep room for the response bar, the query and a few lines of body.
+    return [90, Math.max(90, view.bottom - top - 180)];
+  });
+  setupRowSplitter($("split-query"), "query", () => $("query"), () => [22, 480]);
+  setupRowSplitter($("split-script"), "script", () => $("request-pre-script").closest(".field"), () => {
+    const panel = $("tab-scripts").getBoundingClientRect().height;
+    return [40, Math.max(40, panel - 60)];
+  });
+}
+
+/* ---------- tree editing: rename, delete, duplicate, move ---------- */
+
+const startsWithPath = (path, prefix) => prefix.length <= path.length && prefix.every((value, index) => path[index] === value);
+
+// How paths change when the item at `removed` is taken out: it and its
+// children are gone, and later siblings move up one place.
+function removalMap(removed) {
+  const depth = removed.length - 1;
+  const parent = removed.slice(0, -1);
+  return (path) => {
+    if (startsWithPath(path, removed)) return null;
+    if (path.length > depth && startsWithPath(path, parent) && path[depth] > removed[depth]) {
+      const moved = [...path];
+      moved[depth] -= 1;
+      return moved;
+    }
+    return path;
+  };
+}
+
+// How paths change when an item is put in at `inserted`.
+function insertionMap(inserted) {
+  const depth = inserted.length - 1;
+  const parent = inserted.slice(0, -1);
+  return (path) => {
+    if (path.length > depth && startsWithPath(path, parent) && path[depth] >= inserted[depth]) {
+      const moved = [...path];
+      moved[depth] += 1;
+      return moved;
+    }
+    return path;
+  };
+}
+
+function moveMap(from, to) {
+  const remove = removalMap(from);
+  const insert = insertionMap(to);
+  return (path) => (startsWithPath(path, from) ? [...to, ...path.slice(from.length)] : insert(remove(path)));
+}
+
+const draftSlug = (key) => key.split(":")[1];
+
+// Points open tabs and their drafts at where their items are after a tree
+// edit. Tabs whose item is gone close without asking: the user chose this.
+function retargetTabs(oldSlug, newSlug, mapPath) {
+  const activeKey = state.activeTab;
+  let activeTab = state.requestTabs.find((tab) => tab.key === activeKey) || null;
+  const kept = [];
+  for (const tab of state.requestTabs) {
+    if (tab.kind === "history" || tab.slug !== oldSlug) {
+      kept.push(tab);
+      continue;
+    }
+    const oldDraftKey = tabDraftKey(tab);
+    const entry = drafts.get(oldDraftKey);
+    drafts.delete(oldDraftKey);
+    const path = newSlug == null ? null : mapPath(tab.path);
+    if (!path) {
+      if (tab === activeTab) activeTab = null;
+      continue;
+    }
+    tab.slug = newSlug;
+    tab.path = [...path];
+    if (tab.kind === "request") tab.draftKey = `${draftKey(tab.kind, tab.slug, tab.path)}|${tab.key}`;
+    else {
+      tab.key = editorTabKey(tab.kind, tab.slug, tab.path);
+      tab.draftKey = null;
+    }
+    if (entry) drafts.set(tabDraftKey(tab), entry);
+    kept.push(tab);
+  }
+  state.requestTabs = kept;
+  // A draft no tab owns would otherwise attach to whatever now sits at its old path.
+  const owned = new Set(kept.filter((tab) => tab.kind !== "history").map(tabDraftKey));
+  for (const key of [...drafts.keys()]) {
+    if ((draftSlug(key) === oldSlug || draftSlug(key) === newSlug) && !owned.has(key)) drafts.delete(key);
+  }
+  return activeTab;
+}
+
+function showOpenTab(tab) {
+  if (!tab) {
+    state.activeTab = null;
+    state.activeRequestTab = null;
+    state.selection = null;
+    state.draft = null;
+    state.saved = "";
+    state.response = null;
+    renderRequestTabs();
+    const next = state.requestTabs[state.requestTabs.length - 1];
+    if (next) activateRequestTab(next.key);
+    else {
+      showEmpty();
+      resetResponse("Send the request to see a response.");
+    }
+    return;
+  }
+  if (tab.kind === "history") {
+    activateRequestTab(tab.key);
+    return;
+  }
+  const found = findNode(tab.slug, tab.path);
+  if (!found) return showOpenTab(null);
+  state.activeTab = tab.key;
+  if (found.kind === "request") openRequest(found.node, found.collection, found.path, true, tab.key);
+  else if (found.kind === "folder") openFolder(found.node, found.collection, found.path, true);
+  else openCollection(found.collection, true);
+}
+
+async function editTree(collection, edit, mapPath) {
+  try {
+    const result = await invoke("edit_tree", { collection, edit });
+    cacheActiveRequestTab();
+    const active = retargetTabs(collection, result.collection, mapPath(result));
+    state.workspace = result.workspace;
+    renderWorkspace();
+    showOpenTab(active);
+    return result;
+  } catch (error) {
+    window.alert(error?.message ?? String(error));
+    return null;
+  }
+}
+
+const unchanged = () => (path) => path;
+
+function hasUnsavedUnder(slug, path) {
+  return state.requestTabs.some((tab) => {
+    if (tab.kind === "history" || tab.slug !== slug || !startsWithPath(tab.path, path)) return false;
+    const entry = drafts.get(tabDraftKey(tab));
+    return entry && JSON.stringify(entry.draft) !== entry.saved;
+  });
+}
+
+async function deleteNode(collection, path, node) {
+  const what = path.length ? (node.kind === "folder" ? "folder" : "request") : "collection";
+  const inside = what === "request" ? "" : " and everything in it";
+  const unsaved = hasUnsavedUnder(collection.slug, path) ? "\n\nUnsaved changes in open tabs will be lost." : "";
+  if (!window.confirm(`Delete ${what} “${node.name}”${inside}?${unsaved}`)) return;
+  if (!path.length) await editTree(collection.slug, { action: "delete_collection" }, unchanged);
+  else await editTree(collection.slug, { action: "delete", path }, () => removalMap(path));
+}
+
+async function duplicateNode(collection, path) {
+  const result = await editTree(collection.slug, { action: "duplicate", path }, (done) => insertionMap(done.path));
+  if (!result) return;
+  const created = findNode(collection.slug, result.path);
+  if (created?.kind === "request") openRequest(created.node, created.collection, created.path);
+}
+
+async function renameNode(collection, path, name) {
+  if (!path.length) {
+    await editTree(collection.slug, { action: "rename_collection", name }, unchanged);
+  } else {
+    await editTree(collection.slug, { action: "rename", path, name }, unchanged);
+  }
+}
+
+// Swaps a tree label for a text box. Enter or leaving the box saves, Escape
+// cancels.
+function startRename(label, collection, path, name) {
+  const input = document.createElement("input");
+  input.className = "tree-rename";
+  input.value = name;
+  input.spellcheck = false;
+  input.setAttribute("aria-label", "New name");
+  let finished = false;
+  const finish = (commit) => {
+    if (finished) return;
+    finished = true;
+    const next = input.value.trim();
+    if (commit && next && next !== name) void renameNode(collection, path, next);
+    else renderTree();
+  };
+  input.addEventListener("keydown", (event) => {
+    event.stopPropagation();
+    if (event.key === "Enter") finish(true);
+    else if (event.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
+  for (const type of ["click", "pointerdown", "dblclick"]) input.addEventListener(type, (event) => event.stopPropagation());
+  label.replaceChildren(input);
+  input.focus();
+  input.select();
+}
+
+function treeMenu(event, collection, path, node, label) {
+  const items = [];
+  if (node.kind === "request") {
+    items.push({ label: "Open in new tab", action: () => duplicateFromTree(node, collection, path) });
+  } else {
+    items.push({ label: "New request or folder…", action: () => openCreateDialog({ kind: "item", collection, parent: path }) });
+  }
+  items.push({ label: "Rename", action: () => startRename(label, collection, path, node.name) });
+  if (path.length) items.push({ label: "Duplicate", action: () => duplicateNode(collection, path) });
+  items.push({ label: "Delete", danger: true, action: () => deleteNode(collection, path, node) });
+  showContextMenu(event, items);
+}
+
+/* ---------- tree drag and drop ---------- */
+
+let dragging = null;
+
+function dropZone(event, element, kind) {
+  const bounds = element.getBoundingClientRect();
+  const offset = (event.clientY - bounds.top) / bounds.height;
+  if (kind === "collection") return "into";
+  if (kind === "folder") return offset < 0.25 ? "before" : offset > 0.75 ? "after" : "into";
+  return offset < 0.5 ? "before" : "after";
+}
+
+// The destination in the tree as it is after the dragged item is taken out,
+// which is what `move_item` expects; `null` for a drop that changes nothing.
+function moveTarget(from, path, zone, length) {
+  let parent;
+  let index;
+  if (zone === "into") {
+    parent = path;
+    index = length;
+  } else {
+    parent = path.slice(0, -1);
+    index = path[path.length - 1] + (zone === "after" ? 1 : 0);
+  }
+  if (startsWithPath(parent, from)) return null;
+  const fromParent = from.slice(0, -1);
+  const sameParent = parent.length === fromParent.length && startsWithPath(parent, fromParent);
+  if (sameParent && index > from[from.length - 1]) index -= 1;
+  parent = removalMap(from)(parent);
+  if (sameParent && index === from[from.length - 1]) return null;
+  return { parent, index };
+}
+
+function clearDropMarks() {
+  for (const element of document.querySelectorAll(".drop-before, .drop-after, .drop-into")) {
+    element.classList.remove("drop-before", "drop-after", "drop-into");
+  }
+}
+
+function makeDraggable(element, collection, path) {
+  element.draggable = true;
+  element.addEventListener("dragstart", (event) => {
+    dragging = { slug: collection.slug, path };
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", nodeKey(collection.slug, path));
+    element.classList.add("dragging-source");
+  });
+  element.addEventListener("dragend", () => {
+    dragging = null;
+    element.classList.remove("dragging-source");
+    clearDropMarks();
+  });
+}
+
+function makeDropTarget(element, collection, path, kind, length = 0) {
+  const target = (event) => {
+    if (!dragging || dragging.slug !== collection.slug) return null;
+    const zone = dropZone(event, element, kind);
+    const move = moveTarget(dragging.path, path, zone, length);
+    return move && { zone, move };
+  };
+  element.addEventListener("dragover", (event) => {
+    const found = target(event);
+    clearDropMarks();
+    if (!found) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "move";
+    element.classList.add(`drop-${found.zone}`);
+  });
+  element.addEventListener("dragleave", () => element.classList.remove("drop-before", "drop-after", "drop-into"));
+  element.addEventListener("drop", (event) => {
+    const found = target(event);
+    clearDropMarks();
+    if (!found) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const from = dragging.path;
+    dragging = null;
+    void editTree(collection.slug, { action: "move", from, parent: found.move.parent, index: found.move.index },
+      (done) => moveMap(from, done.path));
+  });
+}
+
+/* ---------- shared scripts ---------- */
+
+const sharedScripts = () => state.workspace?.scripts || [];
+
+// Every shared script as a tick box, ticked ones first in run order. A name
+// the draft includes but scripts/ lacks stays visible, marked, so it can be
+// unticked.
+function renderNodeIncludes() {
+  const host = $("node-includes");
+  host.replaceChildren();
+  const included = state.draft?.scripts?.include || [];
+  const known = sharedScripts().map((script) => script.name);
+  for (const name of [...included, ...known.filter((item) => !included.includes(item))]) {
+    const chip = document.createElement("span");
+    chip.className = "include-chip";
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = included.includes(name);
+    box.addEventListener("change", () => toggleInclude(name, box.checked));
+    const text = document.createElement("span");
+    const position = included.indexOf(name);
+    text.textContent = position >= 0 && included.length > 1 ? `${position + 1}. ${name}` : name;
+    label.append(box, text);
+    chip.append(label);
+    if (known.includes(name)) {
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "icon-btn";
+      edit.title = `Edit shared script ${name}`;
+      edit.textContent = "✎";
+      edit.addEventListener("click", () => openSharedScripts(name));
+      chip.append(edit);
+    } else {
+      chip.classList.add("include-missing");
+      chip.title = `scripts/${name}.yml does not exist. Sending fails until it is unticked or created.`;
+    }
+    host.append(chip);
+  }
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "btn btn-ghost include-new";
+  add.textContent = "+ New shared script";
+  add.addEventListener("click", () => openSharedScripts(null));
+  host.append(add);
+}
+
+function toggleInclude(name, on) {
+  if (!state.draft) return;
+  const scripts = (state.draft.scripts ||= { pre_request: "", post_response: "" });
+  const next = (scripts.include || []).filter((item) => item !== name);
+  if (on) next.push(name);
+  // Absent rather than empty, so ticking and unticking leaves the draft clean.
+  if (next.length) scripts.include = next;
+  else delete scripts.include;
+  renderNodeIncludes();
+  updateDirty();
+}
+
+// Name of the script the dialog is editing; null for a new one.
+let sharedEditing = null;
+
+function sharedScriptFields() {
+  return {
+    name: $("shared-script-name").value.trim(),
+    pre_request: $("shared-script-pre").value,
+    post_response: $("shared-script-post").value,
+  };
+}
+
+function sharedScriptChanged() {
+  const fields = sharedScriptFields();
+  const script = sharedScripts().find((item) => item.name === sharedEditing);
+  const base = script || { name: "", pre_request: "", post_response: "" };
+  return fields.name !== base.name || fields.pre_request !== base.pre_request || fields.post_response !== base.post_response;
+}
+
+function loadSharedScript(name) {
+  const script = sharedScripts().find((item) => item.name === name) || null;
+  sharedEditing = script?.name ?? null;
+  const pick = $("shared-script-pick");
+  pick.replaceChildren();
+  for (const item of sharedScripts()) {
+    const option = document.createElement("option");
+    option.value = item.name;
+    option.textContent = item.name;
+    pick.append(option);
+  }
+  const fresh = document.createElement("option");
+  fresh.value = "";
+  fresh.textContent = "+ New shared script";
+  pick.append(fresh);
+  pick.value = sharedEditing ?? "";
+  $("shared-script-name").value = script?.name || "";
+  $("shared-script-pre").value = script?.pre_request || "";
+  $("shared-script-post").value = script?.post_response || "";
+  paintVariables($("shared-script-pre"));
+  paintVariables($("shared-script-post"));
+  $("shared-script-used").textContent = !script
+    ? ""
+    : script.used_by.length
+      ? `Used by ${script.used_by.join(", ")}.`
+      : "Not included anywhere yet.";
+  $("shared-script-delete").hidden = !script;
+}
+
+function openSharedScripts(name = null) {
+  loadSharedScript(name);
+  $("shared-script-note").textContent = "";
+  if (!$("shared-script-dialog").open) $("shared-script-dialog").showModal();
+  (name ? $("shared-script-pre") : $("shared-script-name")).focus();
+}
+
+// A rename rewrote includes on disk; open drafts get the same change, in both
+// the draft and its saved copy, so they stay clean.
+function renameIncludes(from, to) {
+  const fix = (scripts) => {
+    if (scripts?.include) scripts.include = scripts.include.map((name) => (name === from ? to : name));
+  };
+  for (const entry of drafts.values()) {
+    fix(entry.draft?.scripts);
+    try {
+      const saved = JSON.parse(entry.saved);
+      fix(saved?.scripts);
+      entry.saved = JSON.stringify(saved);
+    } catch { /* Not a node draft. */ }
+    if (entry.draft === state.draft) state.saved = entry.saved;
+  }
+}
+
+function afterSharedScriptChange(workspace) {
+  state.workspace = workspace;
+  renderWorkspace();
+  if (state.selection?.kind === "collection" || state.selection?.kind === "folder") renderNodeIncludes();
+}
+
+async function saveSharedScript(event) {
+  event?.preventDefault();
+  const fields = sharedScriptFields();
+  try {
+    const result = await invoke("save_shared_script", {
+      previous: sharedEditing,
+      name: fields.name,
+      preRequest: fields.pre_request,
+      postResponse: fields.post_response,
+    });
+    if (sharedEditing && sharedEditing !== result.name) renameIncludes(sharedEditing, result.name);
+    afterSharedScriptChange(result.workspace);
+    loadSharedScript(result.name);
+    $("shared-script-note").textContent = `Saved scripts/${result.name}.yml.`;
+  } catch (error) {
+    $("shared-script-note").textContent = error?.message ?? String(error);
+  }
+}
+
+async function deleteSharedScript() {
+  const script = sharedScripts().find((item) => item.name === sharedEditing);
+  if (!script) return;
+  const used = script.used_by.length
+    ? `\n\nStill included by ${script.used_by.join(", ")}; sending there fails until the include is removed.`
+    : "";
+  if (!window.confirm(`Delete shared script “${script.name}”?${used}`)) return;
+  try {
+    afterSharedScriptChange(await invoke("delete_shared_script", { name: script.name }));
+    loadSharedScript(sharedScripts()[0]?.name ?? null);
+    $("shared-script-note").textContent = `Deleted scripts/${script.name}.yml.`;
+  } catch (error) {
+    $("shared-script-note").textContent = error?.message ?? String(error);
+  }
+}
+
+function closeSharedScripts() {
+  if (sharedScriptChanged() && !window.confirm("Discard unsaved changes to this shared script?")) return;
+  $("shared-script-dialog").close();
+}
+
+/* ---------- context menu ---------- */
+
+function showContextMenu(event, items) {
+  event.preventDefault();
+  event.stopPropagation();
+  const menu = $("context-menu");
+  menu.replaceChildren(...items.map(({ label, action, danger }) => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = danger ? "context-item context-item-danger" : "context-item";
+    item.setAttribute("role", "menuitem");
+    item.textContent = label;
+    item.addEventListener("click", () => {
+      hideContextMenu();
+      action();
+    });
+    return item;
+  }));
+  menu.hidden = false;
+  const bounds = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(4, Math.min(event.clientX, window.innerWidth - bounds.width - 4))}px`;
+  menu.style.top = `${Math.max(4, Math.min(event.clientY, window.innerHeight - bounds.height - 4))}px`;
+  menu.querySelector("button")?.focus();
+}
+
+function hideContextMenu() {
+  $("context-menu").hidden = true;
+}
+
+function duplicateFromTree(node, collection, path) {
+  openRequest(node, collection, path);
+  duplicateRequestTab();
+}
+
+function duplicateFromTab(key) {
+  activateRequestTab(key);
+  duplicateRequestTab();
 }
 
 /* ---------- URL and parameter helpers ---------- */
@@ -260,17 +824,60 @@ function deploymentStorageKey() {
   return `rq.deployment:${state.workspace.path}:${state.selection.slug}`;
 }
 
+// Each collection remembers a platform and slot. The tenant is one choice for
+// the whole workspace, so switching it keeps the same platform/slot where the
+// new tenant has one, and asks again where it does not.
 function deploymentChoice() {
   const key = deploymentStorageKey();
   if (!state.deploymentSelections.has(key)) {
     let saved;
     try { saved = JSON.parse(localStorage.getItem(key)); } catch { /* Ignore obsolete local preferences. */ }
-    state.deploymentSelections.set(key, {
-      tenant: typeof saved?.tenant === "string" ? saved.tenant : "",
-      deployment: saved?.deployment || null,
-    });
+    state.deploymentSelections.set(key, { deployment: saved?.deployment || null });
   }
   return state.deploymentSelections.get(key);
+}
+
+const tenantStorageKey = () => `rq.tenant:${state.workspace?.path || ""}`;
+
+function loadTenant() {
+  state.tenant = localStorage.getItem(tenantStorageKey()) || "";
+}
+
+function hasDeployments() {
+  return (state.workspace?.collections || []).some((collection) => deploymentEnabled(collection));
+}
+
+function availableTenants() {
+  const environment = state.workspace?.environments?.find((item) => item.name === state.env);
+  const platforms = new Set((environment?.platforms || []).map((platform) => platform.name));
+  const tenants = new Set();
+  for (const collection of state.workspace?.collections || []) {
+    for (const deployment of collection.deployments || []) {
+      if (platforms.has(deployment.platform)) tenants.add(deployment.tenant);
+    }
+  }
+  return [...tenants].sort();
+}
+
+function renderTenants() {
+  $("tenant-row").hidden = !hasDeployments();
+  const tenants = availableTenants();
+  const select = $("deployment-tenant");
+  select.replaceChildren();
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = state.env ? "Select tenant…" : "Select an environment first";
+  select.append(none);
+  for (const tenant of tenants) {
+    const option = document.createElement("option");
+    option.value = tenant;
+    option.textContent = tenant;
+    select.append(option);
+  }
+  // A tenant missing from this environment is kept, not forgotten, so
+  // switching environments back and forth does not lose it.
+  select.value = tenants.includes(state.tenant) ? state.tenant : "";
+  select.disabled = !tenants.length;
 }
 
 function availableDeployments() {
@@ -285,26 +892,28 @@ function sameDeployment(a, b) {
 
 function currentDeployment() {
   if (!deploymentEnabled()) return null;
-  const choice = deploymentChoice();
-  return availableDeployments().find((deployment) => deployment.tenant === choice.tenant && sameDeployment(deployment, choice.deployment)) || null;
+  const wanted = deploymentChoice().deployment;
+  return availableDeployments().find((deployment) => deployment.tenant === state.tenant &&
+    wanted && deployment.platform === wanted.platform && deployment.slot === wanted.slot) || null;
 }
 
 function deploymentResolutionKey() {
   const deployment = currentDeployment();
   if (!deployment) return null;
   const collection = selectedCollection();
-  const platform = state.workspace.environments.find((item) => item.name === state.env)
-    .platforms.find((item) => item.name === deployment.platform);
+  const environment = state.workspace.environments.find((item) => item.name === state.env);
+  const platform = environment.platforms.find((item) => item.name === deployment.platform);
   return JSON.stringify([state.workspace.path, collection.slug, state.env, deployment,
-    collection.service_name, collection.base_path, platform.url_template]);
+    collection.service_name, collection.base_path, platform.url_template, environment.main_slot]);
 }
 
 function deploymentInputs() {
   const deployment = currentDeployment();
   if (!deployment) return null;
-  const platform = state.workspace.environments.find((item) => item.name === state.env)
-    .platforms.find((item) => item.name === deployment.platform);
-  const inputs = { serviceName: selectedCollection().service_name, basePath: "", ...deployment };
+  const environment = state.workspace.environments.find((item) => item.name === state.env);
+  const platform = environment.platforms.find((item) => item.name === deployment.platform);
+  const slotSuffix = environment.main_slot === deployment.slot ? "" : `-${deployment.slot}`;
+  const inputs = { serviceName: selectedCollection().service_name, basePath: "", slotSuffix, ...deployment };
   const resolved = state.deploymentResolution;
   if (resolved?.key === deploymentResolutionKey()) {
     if (!resolved.target) return null;
@@ -335,14 +944,13 @@ function renderDeploymentDestination() {
 }
 
 function renderDeployments() {
+  renderTenants();
   const enabled = state.selection?.kind === "request" && deploymentEnabled();
   $("deployment-bar").hidden = !enabled;
   if (!enabled) return;
   const choice = deploymentChoice();
-  const deployments = availableDeployments();
-  const tenants = [...new Set(deployments.map((deployment) => deployment.tenant))].sort();
-  if (!tenants.includes(choice.tenant)) choice.tenant = "";
-  choice.deployment = currentDeployment();
+  const deployments = availableDeployments().filter((item) => item.tenant === state.tenant);
+  const current = currentDeployment();
 
   const addOption = (select, value, text) => {
     const option = document.createElement("option");
@@ -350,32 +958,24 @@ function renderDeployments() {
     option.textContent = text;
     select.append(option);
   };
-  const tenantSelect = $("deployment-tenant");
-  tenantSelect.replaceChildren();
-  addOption(tenantSelect, "", "Select tenant…");
-  for (const tenant of tenants) addOption(tenantSelect, tenant, tenant);
-  tenantSelect.value = choice.tenant;
-  tenantSelect.disabled = !tenants.length;
-
   const targetSelect = $("deployment-target");
   targetSelect.replaceChildren();
-  addOption(targetSelect, "", "Select deployment…");
-  for (const deployment of deployments.filter((item) => item.tenant === choice.tenant)) {
+  addOption(targetSelect, "", state.tenant ? "Select deployment…" : "Select a tenant first");
+  for (const deployment of deployments) {
     addOption(targetSelect, JSON.stringify(deployment), `${deployment.platform} / ${deployment.slot}`);
   }
-  targetSelect.value = choice.deployment ? JSON.stringify(choice.deployment) : "";
-  targetSelect.disabled = !choice.tenant;
+  targetSelect.value = current ? JSON.stringify(current) : "";
+  targetSelect.disabled = !deployments.length;
   renderDeploymentDestination();
   localStorage.setItem(deploymentStorageKey(), JSON.stringify(choice));
 }
 
 function changeDeployment(tenantChanged = false) {
-  const choice = deploymentChoice();
   if (tenantChanged) {
-    choice.tenant = $("deployment-tenant").value;
-    choice.deployment = null;
+    state.tenant = $("deployment-tenant").value;
+    localStorage.setItem(tenantStorageKey(), state.tenant);
   } else {
-    choice.deployment = $("deployment-target").value ? JSON.parse($("deployment-target").value) : null;
+    deploymentChoice().deployment = $("deployment-target").value ? JSON.parse($("deployment-target").value) : null;
   }
   hideVariable();
   renderDeployments();
@@ -443,7 +1043,7 @@ function variableScopes(name) {
 /// Nested `{{...}}` inside a value is expanded by Rust at send time,
 /// so the raw value is what the editor shows.
 function variableInfo(name) {
-  if (deploymentEnabled() && ["serviceName", "tenant", "platform", "slot", "basePath", "baseUrl"].includes(name)) {
+  if (deploymentEnabled() && ["serviceName", "tenant", "platform", "slot", "slotSuffix", "basePath", "baseUrl"].includes(name)) {
     const inputs = deploymentInputs();
     const value = inputs?.[name] ?? "";
     return { defined: inputs != null, scope: "selected deployment", kind: "deployment", value,
@@ -753,7 +1353,6 @@ async function saveVariable(reset = false) {
     renderWorkspace();
     repaintVariables();
     refreshPreview();
-    if (state.response) void applyQuery();
     if (varHoverName === name && sameScope()) {
       const current = variableInfo(name);
       $("var-scope").textContent = current.scope + (current.live ? " · local" : "");
@@ -925,6 +1524,9 @@ function requestMatchesSearch(node, query) {
   return haystack.includes(query);
 }
 
+// Folders the user closed, by tree key; renders keep them closed.
+const collapsedFolders = new Set();
+
 function buildNodes(items, collection, parent, query) {
   const fragment = document.createDocumentFragment();
   let count = 0;
@@ -936,8 +1538,13 @@ function buildNodes(items, collection, parent, query) {
       const children = buildNodes(node.items, collection, path, query);
       if (query && children.count === 0) return;
       const details = document.createElement("details");
-      details.open = true;
-      details.dataset.key = keyFor(collection.slug, path);
+      const folderKey = keyFor(collection.slug, path);
+      details.open = !collapsedFolders.has(folderKey);
+      details.dataset.key = folderKey;
+      details.addEventListener("toggle", () => {
+        if (details.open) collapsedFolders.delete(folderKey);
+        else collapsedFolders.add(folderKey);
+      });
 
       const summary = document.createElement("summary");
       const label = document.createElement("span");
@@ -950,7 +1557,10 @@ function buildNodes(items, collection, parent, query) {
             ? "Sends no auth; requests below inherit nothing"
             : `${folderAuth} auth set on this folder`;
       }
-      summary.append(label);
+      summary.append(label, addButton("Add a request or folder here", collection, path));
+      summary.addEventListener("contextmenu", (event) => treeMenu(event, collection, path, node, label));
+      makeDraggable(summary, collection, path);
+      makeDropTarget(summary, collection, path, "folder", node.items.length);
       // Clicking the name opens the folder for editing; the caret still toggles.
       summary.addEventListener("click", (event) => {
         if (!event.target.closest(".folder-name")) return;
@@ -978,12 +1588,30 @@ function buildNodes(items, collection, parent, query) {
 
       row.append(method, name);
       row.addEventListener("click", () => openRequest(node, collection, path));
+      row.addEventListener("contextmenu", (event) => treeMenu(event, collection, path, node, name));
+      makeDraggable(row, collection, path);
+      makeDropTarget(row, collection, path, "request");
       fragment.append(row);
       count += 1;
     }
   });
 
   return { fragment, count };
+}
+
+function addButton(title, collection, path) {
+  const button = document.createElement("span");
+  button.className = "tree-add";
+  button.setAttribute("role", "button");
+  button.setAttribute("aria-label", title);
+  button.title = title;
+  button.textContent = "+";
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    openCreateDialog({ kind: "item", collection, parent: path });
+  });
+  return button;
 }
 
 function renderTree() {
@@ -1013,7 +1641,12 @@ function renderTree() {
 
     const children = buildNodes(collection.items, collection, [], query);
     if (query && children.count === 0) continue;
-    group.append(name, children.fragment);
+    const head = document.createElement("div");
+    head.className = "collection-head";
+    head.append(name, addButton("Add a request or folder to this collection", collection, []));
+    head.addEventListener("contextmenu", (event) => treeMenu(event, collection, [], { ...collection, kind: "collection" }, name));
+    makeDropTarget(head, collection, [], "collection", collection.items.length);
+    group.append(head, children.fragment);
     tree.append(group);
   }
 
@@ -1047,7 +1680,7 @@ function renderRequestTabs() {
   const host = $("request-tabs");
   host.replaceChildren();
   for (const tab of state.requestTabs) {
-    const entry = tab.kind === "history" ? null : drafts.get(draftKey(tab.kind, tab.slug, tab.path));
+    const entry = tab.kind === "history" ? null : drafts.get(tabDraftKey(tab));
     const dirty = entry && JSON.stringify(entry.draft) !== entry.saved;
     const button = document.createElement("button");
     button.type = "button";
@@ -1055,7 +1688,7 @@ function renderRequestTabs() {
     button.classList.toggle("active", tab.key === state.activeTab);
     button.setAttribute("role", "tab");
     button.setAttribute("aria-selected", String(tab.key === state.activeTab));
-    button.title = tab.kind === "request" ? tab.url || tab.name : tab.kind;
+    button.title = tab.kind === "request" ? tab.response?.url || tab.url || tab.name : tab.kind;
 
     const method = document.createElement("span");
     if (tab.kind === "request") {
@@ -1067,7 +1700,7 @@ function renderRequestTabs() {
     }
     const name = document.createElement("span");
     name.className = "tab-name";
-    name.textContent = tab.name;
+    name.textContent = tab.instance ? `${tab.name} (${tab.instance})` : tab.name;
     button.append(method, name);
     if (dirty) {
       const marker = document.createElement("span");
@@ -1088,9 +1721,15 @@ function renderRequestTabs() {
     });
     button.append(close);
     button.addEventListener("click", () => activateRequestTab(tab.key));
+    button.addEventListener("contextmenu", (event) => showContextMenu(event, [
+      ...(tab.kind === "request" ? [{ label: "Duplicate tab", action: () => duplicateFromTab(tab.key) }] : []),
+      { label: "Close tab", action: () => closeRequestTab(tab.key) },
+    ]));
     host.append(button);
   }
   host.hidden = state.requestTabs.length === 0;
+  // Keep the active tab in view, e.g. a new one added past the right edge.
+  host.querySelector(".request-tab.active")?.scrollIntoView({ block: "nearest", inline: "nearest" });
 }
 
 function setHistoryViewer(active) {
@@ -1168,6 +1807,12 @@ async function showRequestHistory() {
 }
 
 async function openHistoryEntry(item) {
+  const existing = state.requestTabs.find((tab) => tab.key === `history:${item.id}`);
+  if (existing) {
+    $("request-history-dialog").close();
+    activateRequestTab(existing.key);
+    return;
+  }
   try {
     const response = await invoke("open_history", { id: item.id });
     const key = `history:${item.id}`;
@@ -1251,7 +1896,7 @@ function activateRequestTab(key) {
     if (tab.response.error) showRequestError(tab.response.error);
     else {
       showResponseMetadata(tab.response);
-      void applyQuery();
+      restoreResponseView(tab);
     }
     return;
   }
@@ -1263,23 +1908,22 @@ function activateRequestTab(key) {
     return;
   }
 
-  state.activeTab = key;
   if (tab.kind === "request") {
-    state.activeRequestTab = null;
-    state.response = tab.response || null;
-    $("query").value = tab.query || "";
-    openRequest(restored.node, restored.collection, restored.path, true);
+    openRequest(restored.node, restored.collection, restored.path, false, tab.key);
+    return;
   } else if (tab.kind === "folder") {
+    state.activeTab = key;
     state.activeRequestTab = null;
     openFolder(restored.node, restored.collection, restored.path, true);
   } else {
+    state.activeTab = key;
     state.activeRequestTab = null;
     openCollection(restored.collection, true);
   }
   renderRequestTabs();
   if (tab.kind === "request" && tab.response) {
     showResponseMetadata(tab.response);
-    applyQuery();
+    restoreResponseView(tab);
   } else if (tab.kind === "request" && tab.error) {
     if (tab.cancelled) showRequestCancelled();
     else showRequestError(tab.error);
@@ -1291,7 +1935,7 @@ function activateRequestTab(key) {
 function closeRequestTab(key) {
   const tab = state.requestTabs.find((item) => item.key === key);
   if (!tab) return;
-  const entry = tab.kind === "history" ? null : drafts.get(draftKey(tab.kind, tab.slug, tab.path));
+  const entry = tab.kind === "history" ? null : drafts.get(tabDraftKey(tab));
   if (entry && JSON.stringify(entry.draft) !== entry.saved &&
       !window.confirm(`Discard unsaved changes and close “${tab.name}”?`)) {
     return;
@@ -1299,7 +1943,7 @@ function closeRequestTab(key) {
 
   if (state.pendingRequests.has(key)) void cancelCurrentRequest(key);
   if (state.activeRequestTab === key) cacheActiveRequestTab();
-  if (tab.kind !== "history") drafts.delete(draftKey(tab.kind, tab.slug, tab.path));
+  if (tab.kind !== "history") drafts.delete(tabDraftKey(tab));
   const index = state.requestTabs.indexOf(tab);
   state.requestTabs.splice(index, 1);
   if (state.activeTab !== key) {
@@ -1327,28 +1971,27 @@ function isDirty() {
   return Boolean(state.draft) && JSON.stringify(state.draft) !== state.saved;
 }
 
-function dropDraft(kind, slug, path) {
-  drafts.delete(draftKey(kind, slug, path));
-}
-
 function markUnsaved() {
   for (const element of $("tree").querySelectorAll("[data-key]")) {
     const key = element.dataset.key;
     const dirty = ["request", "folder", "collection"].some((kind) => {
-      const entry = drafts.get(`${kind}:${key}`);
-      return entry && JSON.stringify(entry.draft) !== entry.saved;
+      return [...drafts].some(([draft, entry]) => (draft === `${kind}:${key}` || draft.startsWith(`${kind}:${key}|`))
+        && JSON.stringify(entry.draft) !== entry.saved);
     });
     element.classList.toggle("unsaved", Boolean(dirty));
   }
 }
 
-function openRequest(node, collection, path, keepResponse = false) {
+function openRequest(node, collection, path, keepResponse = false, existingTabKey = null) {
   setHistoryViewer(false);
   hideVariable();
   cacheActiveRequestTab();
-  const tabKey = requestTabKey(collection.slug, path);
-  let tab = state.requestTabs.find((item) => item.key === tabKey);
+  const matches = (item) => item.kind === "request" && item.slug === collection.slug && JSON.stringify(item.path) === JSON.stringify(path);
+  let tab = existingTabKey ? state.requestTabs.find((item) => item.key === existingTabKey)
+    : state.requestTabs.find((item) => item.key === state.activeRequestTab && matches(item)) || state.requestTabs.find(matches);
   if (!tab) {
+    const baseKey = requestTabKey(collection.slug, path);
+    const tabKey = state.requestTabs.some((item) => item.key === baseKey) ? `${baseKey}|copy-${++nextRequestTab}` : baseKey;
     tab = {
       key: tabKey,
       kind: "request",
@@ -1362,6 +2005,8 @@ function openRequest(node, collection, path, keepResponse = false) {
     };
     state.requestTabs.push(tab);
   }
+  const tabKey = tab.key;
+  tab.draftKey ||= draftKey("request", collection.slug, path);
   tab.name = node.name;
   tab.method = node.method || "GET";
   tab.url = node.url || "";
@@ -1385,7 +2030,7 @@ function openRequest(node, collection, path, keepResponse = false) {
     auth: clone(node.auth ?? "inherit"),
     scripts: clone(node.scripts || { pre_request: "", post_response: "" }),
     queries: clone(node.queries || {}),
-  }));
+  }), tab.draftKey);
   state.draft = entry.draft;
   state.saved = entry.saved;
   tab.name = state.draft.name;
@@ -1397,7 +2042,7 @@ function openRequest(node, collection, path, keepResponse = false) {
 
   if (!keepResponse && tab.response) {
     showResponseMetadata(tab.response);
-    applyQuery();
+    restoreResponseView(tab);
   } else if (!keepResponse && tab.error) {
     if (tab.cancelled) showRequestCancelled();
     else showRequestError(tab.error);
@@ -1434,11 +2079,21 @@ function openRequest(node, collection, path, keepResponse = false) {
   markSelected();
   renderRequestTabs();
   updateSendButton();
-  if (!keepResponse && tab.response) {
-    showResponseMetadata(tab.response);
-    applyQuery();
-  }
   refreshPreview();
+}
+
+function duplicateRequestTab() {
+  const source = state.requestTabs.find((tab) => tab.key === state.activeRequestTab);
+  if (!source || state.selection?.kind !== "request") return;
+  cacheActiveRequestTab();
+  const key = `${requestTabKey(source.slug, source.path)}|copy-${++nextRequestTab}`;
+  const duplicate = { ...source, key, path: [...source.path], draftKey: `${draftKey("request", source.slug, source.path)}|${key}`,
+    instance: Math.max(...state.requestTabs.filter((tab) => tab.kind === "request" && tab.slug === source.slug && JSON.stringify(tab.path) === JSON.stringify(source.path)).map((tab) => tab.instance || 1)) + 1,
+    response: null, view: null, queryError: null, queryVersion: 0, projecting: false, error: null, cancelled: false };
+  const entry = drafts.get(tabDraftKey(source));
+  drafts.set(duplicate.draftKey, { draft: clone(state.draft), saved: entry?.saved || state.saved });
+  state.requestTabs.push(duplicate);
+  openRequest(state.selection.node, state.selection.collection, source.path, false, key);
 }
 
 function editorTabKey(kind, slug, path) {
@@ -1586,6 +2241,7 @@ function renderNodeScripts() {
   $("node-post-script").value = state.draft?.scripts?.post_response || "";
   paintVariables($("node-pre-script"));
   paintVariables($("node-post-script"));
+  renderNodeIncludes();
 }
 function showNode(kind) {
   $("empty-state").hidden = true;
@@ -1993,6 +2649,8 @@ async function save() {
   const selection = state.selection;
   const kind = selection.kind;
   const path = [...selection.path];
+  const savingTab = state.requestTabs.find((tab) => tab.key === state.activeTab);
+  const savingDraftKey = savingTab ? tabDraftKey(savingTab) : draftKey(kind, selection.slug, path);
 
   $("save").disabled = true;
   $("node-save").disabled = true;
@@ -2003,28 +2661,28 @@ async function save() {
       edit: editForIpc(),
     });
 
-    dropDraft(kind, selection.slug, path);
-    // A collection rename changes every node's slug, so no stashed draft can be
-    // matched to a node any more.
-    if (result.collection !== selection.slug) drafts.clear();
+    drafts.delete(savingDraftKey);
 
     if (result.collection !== selection.slug) {
       const activeEditorTab = state.requestTabs.find((tab) => tab.key === state.activeTab);
       for (const tab of state.requestTabs) {
         if (tab.slug !== selection.slug) continue;
+        const oldDraftKey = tabDraftKey(tab);
+        const entry = drafts.get(oldDraftKey);
         tab.slug = result.collection;
-        tab.key = tab.kind === "request"
-          ? requestTabKey(tab.slug, tab.path)
-          : editorTabKey(tab.kind, tab.slug, tab.path);
-      }
-      if (state.activeRequestTab === requestTabKey(selection.slug, path)) {
-        state.activeRequestTab = requestTabKey(result.collection, path);
+        if (tab.kind === "request") tab.draftKey = `${draftKey(tab.kind, tab.slug, tab.path)}|${tab.key}`;
+        else tab.key = editorTabKey(tab.kind, tab.slug, tab.path);
+        if (entry) {
+          drafts.delete(oldDraftKey);
+          drafts.set(tabDraftKey(tab), entry);
+        }
       }
       if (activeEditorTab) state.activeTab = activeEditorTab.key;
     }
 
     state.workspace = result.workspace;
     renderWorkspace();
+    if (savingTab && state.activeTab !== savingTab.key) return;
 
     const restored = findNode(result.collection, path);
     if (!restored) {
@@ -2035,7 +2693,7 @@ async function save() {
     }
 
     if (restored.kind === "request") {
-      openRequest(restored.node, restored.collection, restored.path, true);
+      openRequest(restored.node, restored.collection, restored.path, true, savingTab?.key);
     } else if (restored.kind === "folder") {
       openFolder(restored.node, restored.collection, restored.path, true);
     } else {
@@ -2245,6 +2903,8 @@ async function send() {
   }
   if (deploymentUnavailable()) return;
   const tab = state.requestTabs.find((item) => item.key === tabKey);
+  const responseQuery = $("query").value;
+  const responseContext = queryContext();
   const requestId = `${tabKey}:${Date.now()}:${Math.random()}`;
   state.pendingRequests.add(tabKey);
   state.cancelRequests.set(tabKey, requestId);
@@ -2291,19 +2951,21 @@ async function send() {
     if (state.activeRequestTab === tabKey) {
       state.response = response;
       showResponseMetadata(response);
-      await applyQuery();
     }
+    if (tab && state.requestTabs.includes(tab)) await applyQuery({ tab, response, query: responseQuery, context: responseContext });
     if ($("history-section").open) void refreshHistory();
   } catch (error) {
-    const message = String(error);
+    // `send` rejects with { kind: "cancelled" } or { kind: "failed", message }.
+    const cancelled = error?.kind === "cancelled";
+    const message = cancelled ? "Request cancelled" : error?.message ?? String(error);
     if (tab && state.requestTabs.includes(tab)) {
       tab.response = null;
       tab.error = message;
-      tab.cancelled = message === "Request cancelled";
+      tab.cancelled = cancelled;
     }
     if (state.activeRequestTab === tabKey) {
       state.response = null;
-      if (message === "Request cancelled") showRequestCancelled();
+      if (cancelled) showRequestCancelled();
       else showRequestError(message);
     }
   } finally {
@@ -3039,9 +3701,14 @@ function resetResponse(message) {
   state.response = null;
   renderResponseEnvironment();
   renderSavedQueries();
-  state.projectionVersion += 1;
   const activeTab = state.requestTabs.find((tab) => tab.key === state.activeRequestTab);
-  if (activeTab) activeTab.response = null;
+  if (activeTab) {
+    activeTab.response = null;
+    activeTab.view = null;
+    activeTab.queryError = null;
+    activeTab.queryVersion = (activeTab.queryVersion || 0) + 1;
+    activeTab.projecting = false;
+  }
   $("status").textContent = "no response";
   $("status").className = "status status-idle";
   $("timing").textContent = "";
@@ -3071,15 +3738,15 @@ function queryContext() {
 async function saveResponse() {
   const response = state.response;
   if (!response || state.savingResponse) return;
-  const query = $("query").value;
-  const context = queryContext();
+  const tab = state.requestTabs.find((item) => item.key === state.activeTab);
+  const view = tab?.view;
   state.savingResponse = true;
   renderResponseEnvironment();
   const note = $("response-save-note");
   note.hidden = true;
   try {
-    if (variableWrites) await waitForVariableWrites();
-    const saved = await invoke("save_response", { id: response.id, query, context });
+    if (!view || view.responseId !== response.id) throw new Error("Apply the query before exporting this response.");
+    const saved = await invoke("save_response", { id: response.id, viewId: view.projection.view_id });
     if (state.response !== response) return;
     note.className = "muted query-note";
     note.textContent = "Response saved.";
@@ -3170,43 +3837,65 @@ function removeSavedQuery() {
   $("query-note").hidden = false;
 }
 
-async function applyQuery() {
-  if (!state.response) return;
+function renderProjection(projection, response) {
+  $("query-error").hidden = true;
+  renderResponseText(projection.text);
+  if (projection.is_raw) {
+    $("sizes").textContent = projection.truncated
+      ? `raw · showing first ${bytes(512 * 1024)} of ${bytes(projection.bytes)}`
+      : `raw · ${bytes(projection.bytes)}`;
+  } else {
+    const saved = response.bytes ? Math.round((projection.bytes / response.bytes) * 100) : 100;
+    $("sizes").textContent = `${bytes(response.bytes)} → ${bytes(projection.bytes)} (${saved}%) · ${elapsed(projection.elapsed_ms)}`;
+  }
+}
 
-  const response = state.response;
-  const version = ++state.projectionVersion;
-  const query = $("query").value;
-  const context = queryContext();
+function restoreResponseView(tab) {
+  if (tab.view?.responseId === tab.response.id) renderProjection(tab.view.projection, tab.response);
+  else {
+    $("response-body").textContent = tab.projecting ? "Applying query…" : "Apply the query to view this response.";
+    $("sizes").textContent = "";
+  }
+  $("query-error").hidden = !tab.queryError;
+  $("query-error").textContent = tab.queryError || "";
+  // Only an unseen response needs an initial evaluation; tab switches reuse it.
+  if (!tab.view && !tab.queryError && !tab.projecting) void applyQuery();
+}
+
+async function applyQuery(options = {}) {
+  const tab = options.tab || state.requestTabs.find((item) => item.key === state.activeTab);
+  const response = options.response || state.response;
+  if (!response || !tab) return;
+  const query = options.query ?? $("query").value;
+  const context = options.context === undefined ? queryContext() : options.context;
+  tab.response = response;
+  tab.queryVersion = (tab.queryVersion || 0) + 1;
+  const version = tab.queryVersion;
+  tab.projecting = true;
+  const current = () => state.requestTabs.includes(tab) && tab.queryVersion === version && tab.response?.id === response.id;
+  const visible = () => state.activeTab === tab.key && state.response?.id === response.id;
 
   try {
     if (variableWrites) await waitForVariableWrites();
-    if (version !== state.projectionVersion || state.response?.id !== response.id) return;
+    if (!current()) return;
     const projection = await invoke("project_body", {
       id: response.id,
       query,
       context,
     });
-    if (version !== state.projectionVersion || state.response?.id !== response.id) return;
-
-    $("query-error").hidden = true;
-    renderResponseText(projection.text);
-
-    if (projection.is_raw) {
-      $("sizes").textContent = projection.truncated
-        ? `raw · showing first ${bytes(512 * 1024)} of ${bytes(projection.bytes)}`
-        : `raw · ${bytes(projection.bytes)}`;
-    } else {
-      const saved = state.response.bytes
-        ? Math.round((projection.bytes / state.response.bytes) * 100)
-        : 100;
-      $("sizes").textContent = `${bytes(state.response.bytes)} → ${bytes(
-        projection.bytes
-      )} (${saved}%) · ${elapsed(projection.elapsed_ms)}`;
-    }
+    if (!current()) return;
+    tab.view = { responseId: response.id, query, projection };
+    tab.queryError = null;
+    if (visible()) renderProjection(projection, response);
   } catch (error) {
-    if (version !== state.projectionVersion || state.response?.id !== response.id) return;
-    $("query-error").hidden = false;
-    $("query-error").textContent = String(error);
+    if (!current()) return;
+    tab.queryError = String(error);
+    if (visible()) {
+      $("query-error").hidden = false;
+      $("query-error").textContent = tab.queryError;
+    }
+  } finally {
+    if (current()) tab.projecting = false;
   }
 }
 
@@ -3370,6 +4059,103 @@ async function deleteSelectedEnvironment() {
   }
 }
 
+/* ---------- creating collections, folders and requests ---------- */
+
+let createTarget = null;
+
+function openCreateDialog(target) {
+  if (!state.workspace) return;
+  createTarget = target;
+  const item = target.kind === "item";
+  $("create-title").textContent = item ? "New request" : "New collection";
+  $("create-where").textContent = item
+    ? `In ${[target.collection.name, ...folderNames(target.collection, target.parent)].join(" / ")}`
+    : `In ${state.workspace.path}`;
+  $("create-kind-field").hidden = !item;
+  $("create-kind").value = "request";
+  $("create-name").value = "";
+  $("create-curl").value = "";
+  $("create-note").textContent = "";
+  syncCreateKind();
+  $("create-dialog").showModal();
+  $("create-name").focus();
+}
+
+function folderNames(collection, path) {
+  const names = [];
+  let items = collection.items;
+  for (const index of path) {
+    const node = items?.[index];
+    if (!node) break;
+    names.push(node.name);
+    items = node.items;
+  }
+  return names;
+}
+
+function syncCreateKind() {
+  const request = createTarget?.kind === "item" && $("create-kind").value === "request";
+  $("create-curl-field").hidden = !request;
+  $("create-curl-hint").hidden = !request;
+  if (createTarget?.kind === "item") {
+    $("create-title").textContent = request ? "New request" : "New folder";
+  }
+}
+
+// A name for a request read from cURL when none was typed: its last path segment.
+function nameFromCurl(text) {
+  const match = text.match(/https?:\/\/[^\s'"^`]+/);
+  if (!match) return "";
+  const path = match[0].replace(/[?#].*$/, "").replace(/^https?:\/\/[^/]+/, "");
+  const segments = path.split("/").filter(Boolean);
+  return segments.length ? decodeURIComponent(segments[segments.length - 1]) : match[0].replace(/^https?:\/\//, "").split("/")[0];
+}
+
+async function submitCreateDialog(event) {
+  event?.preventDefault();
+  const target = createTarget;
+  if (!target) return;
+  const button = $("create-submit");
+  const curl = $("create-curl").value.trim();
+  const folder = target.kind === "item" && $("create-kind").value === "folder";
+  const name = $("create-name").value.trim() || (target.kind === "item" && !folder ? nameFromCurl(curl) : "");
+  if (!name) {
+    $("create-note").textContent = "A name is required.";
+    $("create-name").focus();
+    return;
+  }
+  button.disabled = true;
+  $("create-note").textContent = "Creating…";
+  try {
+    if (target.kind === "collection") {
+      state.workspace = await invoke("create_collection", { name });
+      createTarget = null;
+      $("create-dialog").close();
+      renderWorkspace();
+      return;
+    }
+    const result = await invoke("create_item", {
+      collection: target.collection.slug,
+      parent: target.parent,
+      name,
+      folder,
+      curl: folder || !curl ? null : curl,
+    });
+    state.workspace = result.workspace;
+    createTarget = null;
+    $("create-dialog").close();
+    renderWorkspace();
+    const created = findNode(target.collection.slug, result.path);
+    if (created?.kind === "request") openRequest(created.node, created.collection, result.path);
+    else if (created) openFolder(created.node, created.collection, result.path);
+    if (result.warnings.length) window.alert(`Created “${name}”. Not carried over from the cURL command:\n\n• ${result.warnings.join("\n• ")}`);
+  } catch (error) {
+    $("create-note").textContent = error?.message ?? String(error);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 /* ---------- workspace ---------- */
 
 function openImportDialog() {
@@ -3410,17 +4196,20 @@ async function importPostman() {
 
 function renderWorkspace() {
   const workspace = state.workspace;
-  $("workspace-name").textContent =
-    workspace.collections.map((collection) => collection.name).join(", ") ||
-    "empty workspace";
+  $("workspace-name").textContent = workspace.path.split(/[\\/]/).filter(Boolean).pop() || workspace.path;
+  $("workspace-name").title = workspace.path;
   $("workspace-path").textContent = workspace.path;
-  $("import-postman").disabled = false;
+  $("collection-add").disabled = false;
+  if (state.tenantWorkspace !== workspace.path) {
+    state.tenantWorkspace = workspace.path;
+    loadTenant();
+  }
 
   const select = $("environment");
   select.replaceChildren();
   const none = document.createElement("option");
   none.value = "";
-  none.textContent = "no environment";
+  none.textContent = "none";
   select.append(none);
 
   for (const environment of workspace.environments) {
@@ -3512,6 +4301,7 @@ async function boot() {
   applyLayout();
   setupSplitter($("split-left"), "left");
   setupSplitter($("split-right"), "right");
+  setupRowSplitters();
 
   $("collapse-left").addEventListener("click", () => toggleLeft(false));
   $("collapse-right").addEventListener("click", () => toggleRight(false));
@@ -3524,6 +4314,21 @@ async function boot() {
   $("suggest").addEventListener("click", suggest);
   $("apply-query").addEventListener("click", applyQuery);
   $("save-response").addEventListener("click", saveResponse);
+  // The webview's own menu (reload, inspect…) means nothing here; text fields
+  // keep it for cut, copy and paste.
+  document.addEventListener("contextmenu", (event) => {
+    hideContextMenu();
+    if (!event.target.closest?.("input, textarea, [contenteditable='true']")) event.preventDefault();
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (!event.target.closest?.("#context-menu")) hideContextMenu();
+  });
+  window.addEventListener("blur", hideContextMenu);
+  window.addEventListener("resize", hideContextMenu);
+  document.addEventListener("scroll", hideContextMenu, true);
+  $("context-menu").addEventListener("keydown", (event) => {
+    if (event.key === "Escape") hideContextMenu();
+  });
   $("copy-curl").addEventListener("click", () => copyCurl(false));
   $("copy-curl-secrets").addEventListener("click", () => copyCurl(true));
   $("tree-search").addEventListener("input", () => {
@@ -3562,8 +4367,23 @@ async function boot() {
   $("saved-query").addEventListener("change", selectSavedQuery);
   $("store-query").addEventListener("click", storeQuery);
   $("remove-query").addEventListener("click", removeSavedQuery);
-  $("open-workspace").addEventListener("click", chooseWorkspace);
-  $("import-postman").addEventListener("click", openImportDialog);
+  $("workspace-menu").addEventListener("click", (event) => {
+    const bounds = $("workspace-menu").getBoundingClientRect();
+    const items = [{ label: "Open workspace…", action: chooseWorkspace }];
+    if (state.workspace) {
+      items.push(
+        { label: "Import from Postman…", action: openImportDialog },
+        { label: "Edit globals…", action: () => openEnvironmentEditor(null, true) },
+        { label: "Shared scripts…", action: () => openSharedScripts(sharedScripts()[0]?.name ?? null) },
+      );
+    }
+    showContextMenu({ preventDefault() {}, stopPropagation: () => event.stopPropagation(), clientX: bounds.left, clientY: bounds.bottom + 4 }, items);
+  });
+  $("collection-add").addEventListener("click", () => openCreateDialog({ kind: "collection" }));
+  $("create-kind").addEventListener("change", syncCreateKind);
+  $("create-form").addEventListener("submit", submitCreateDialog);
+  $("create-cancel").addEventListener("click", () => $("create-dialog").close());
+  $("create-close").addEventListener("click", () => $("create-dialog").close());
   $("import-choose").addEventListener("click", importPostman);
   $("import-close").addEventListener("click", () => $("import-dialog").close());
   $("import-done").addEventListener("click", () => $("import-dialog").close());
@@ -3572,7 +4392,7 @@ async function boot() {
     const environment = state.workspace.environments.find((item) => item.name === state.env);
     if (environment) openEnvironmentEditor(environment);
   });
-  $("globals-edit").addEventListener("click", () => openEnvironmentEditor(null, true));
+
   $("environment-add-variable").addEventListener("click", () => {
     state.environmentEditor.variables.push({ name: "", value: "", secret: false, stored: false });
     renderEnvironmentVariables();
@@ -3662,6 +4482,31 @@ async function boot() {
       updateDirty();
     });
   }
+  // A mouse wheel only scrolls vertically; turn that into sideways movement.
+  $("request-tabs").addEventListener("wheel", (event) => {
+    if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+    event.preventDefault();
+    $("request-tabs").scrollLeft += event.deltaY;
+  }, { passive: false });
+
+  $("shared-script-form").addEventListener("submit", saveSharedScript);
+  $("shared-script-delete").addEventListener("click", deleteSharedScript);
+  $("shared-script-cancel").addEventListener("click", closeSharedScripts);
+  $("shared-script-close").addEventListener("click", closeSharedScripts);
+  $("shared-script-dialog").addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeSharedScripts();
+  });
+  $("shared-script-pick").addEventListener("change", () => {
+    const next = $("shared-script-pick").value || null;
+    if (sharedScriptChanged() && !window.confirm("Discard unsaved changes to this shared script?")) {
+      $("shared-script-pick").value = sharedEditing ?? "";
+      return;
+    }
+    loadSharedScript(next);
+    $("shared-script-note").textContent = "";
+  });
+
   for (const [id, key] of [["request-pre-script", "pre_request"], ["request-post-script", "post_response"]]) {
     $(id).addEventListener("input", () => {
       if (!state.draft || state.selection?.kind !== "request") return;

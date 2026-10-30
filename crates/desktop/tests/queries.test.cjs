@@ -16,6 +16,7 @@ class Element {
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
   close() {}
+  addEventListener() {}
 }
 
 function harness(confirm = true, invoke) {
@@ -31,7 +32,7 @@ function harness(confirm = true, invoke) {
       __TAURI__: { core: { invoke: async (command, args) => {
         calls.push({ command, args });
         if (invoke) return invoke(command, args);
-        return { text: '{"id":1}', bytes: 8, elapsed_ms: 0 };
+        return { view_id: 17, text: '{"id":1}', bytes: 8, elapsed_ms: 0 };
       } } },
       confirm: (message) => { confirmations.push(message); return confirm; },
     },
@@ -61,6 +62,233 @@ function harness(confirm = true, invoke) {
   return { context, state, element, calls, confirmations, nodes, open };
 }
 
+function applied(h, viewId = 17) {
+  h.state.requestTabs.find((tab) => tab.key === h.state.activeTab).view = {
+    responseId: h.state.response.id, query: h.element("query").value,
+    projection: { view_id: viewId, text: '{"id":1}', bytes: 8, elapsed_ms: 0 },
+  };
+}
+
+test("duplicate request tabs own independent nested drafts, query text and responses without duplicating files", () => {
+  const h = harness();
+  const original = h.state.requestTabs[0];
+  h.state.draft.headers = [{ name: "Store", value: "A" }];
+  h.state.response = { id: 1, bytes: 20 };
+  h.element("query").value = '{ items[? id == "{{category}}"] { id } }';
+  applied(h, 11);
+  h.context.duplicateRequestTab();
+  const duplicate = h.state.requestTabs[1];
+  assert.notEqual(duplicate.key, original.key);
+  assert.notEqual(duplicate.draftKey, original.draftKey);
+  assert.equal(duplicate.instance, 2);
+  assert.equal(h.state.response, null);
+  assert.equal(duplicate.view, null);
+  assert.equal(h.element("query").value, original.query);
+  h.state.draft.headers[0].value = "B";
+  h.element("query").value = "{ other }";
+  h.context.queryEdited();
+  h.context.activateRequestTab(original.key);
+  assert.equal(h.state.draft.headers[0].value, "A");
+  assert.equal(h.state.response.id, 1);
+  assert.match(h.element("query").value, /category/);
+  h.context.activateRequestTab(duplicate.key);
+  assert.equal(h.state.draft.headers[0].value, "B");
+  assert.equal(h.element("query").value, "{ other }");
+  assert.equal(h.calls.length, 0);
+});
+
+test("two stores keep their applied category views across variable changes, tab switches and exports", async () => {
+  let liveCategory = "category-A";
+  let nextView = 0;
+  let h;
+  h = harness(true, (command, args) => {
+    if (command === "project_body") return { view_id: ++nextView, text: JSON.stringify({ category: liveCategory }), bytes: 25, elapsed_ms: 0 };
+    if (command === "set_variable") {
+      liveCategory = args.edit.value;
+      return h.state.workspace;
+    }
+    if (command === "save_response") return true;
+    throw new Error(command);
+  });
+  vm.runInContext('renderResponseText = (text) => { $("response-body").textContent = text; };', h.context);
+  h.state.workspace.collections[0].variables = [{ name: "category", value: "category-A", has_value: true }];
+  h.state.response = { id: 1, bytes: 40 };
+  h.element("query").value = '{ items[? id == "{{category}}"] { id } }';
+  await h.context.applyQuery();
+  const original = h.state.requestTabs[0];
+  h.context.duplicateRequestTab();
+  const duplicate = h.state.requestTabs[1];
+  liveCategory = "category-B";
+  h.state.response = { id: 2, bytes: 40 };
+  await h.context.applyQuery();
+  vm.runInContext('varHoverName = "category";', h.context);
+  h.element("var-value").value = "category-C";
+  await h.context.saveVariable();
+  assert.equal(h.element("response-body").textContent, '{"category":"category-B"}');
+  const evaluations = h.calls.filter((call) => call.command === "project_body").length;
+  h.context.activateRequestTab(original.key);
+  assert.equal(h.element("response-body").textContent, '{"category":"category-A"}');
+  h.element("query").value = "{ unapplied }";
+  h.context.queryEdited();
+  await h.context.saveResponse();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls.at(-1).args)), { id: 1, viewId: 1 });
+  h.context.activateRequestTab(duplicate.key);
+  assert.equal(h.element("response-body").textContent, '{"category":"category-B"}');
+  assert.equal(h.calls.filter((call) => call.command === "project_body").length, evaluations);
+  await h.context.applyQuery();
+  assert.equal(h.element("response-body").textContent, '{"category":"category-C"}');
+});
+
+test("closing one duplicate does not discard the other tab's draft or cancel its request", () => {
+  const h = harness();
+  const original = h.state.requestTabs[0];
+  h.context.duplicateRequestTab();
+  const duplicate = h.state.requestTabs[1];
+  h.state.draft.url = "https://store-b.test";
+  h.context.closeRequestTab(original.key);
+  assert.equal(h.state.requestTabs.length, 1);
+  assert.equal(h.state.activeRequestTab, duplicate.key);
+  assert.equal(h.state.draft.url, "https://store-b.test");
+  assert.equal(h.context.isDirty(), true);
+  assert.equal(h.calls.length, 0);
+});
+
+test("saving one duplicate updates the shared request while preserving the other tab's edits and response view", async () => {
+  let h;
+  h = harness(true, (command, args) => {
+    assert.equal(command, "save");
+    const workspace = JSON.parse(JSON.stringify(h.state.workspace));
+    Object.assign(workspace.collections[0].items[0], args.edit.draft);
+    return { workspace, collection: "queries", written: 1, removed: 0 };
+  });
+  h.state.draft.url = "https://store-a.test";
+  h.state.response = { id: 1, bytes: 20 };
+  applied(h, 11);
+  const original = h.state.requestTabs[0];
+  h.context.duplicateRequestTab();
+  h.state.draft.url = "https://store-b.test";
+  await h.context.save();
+  assert.equal(h.state.draft.url, "https://store-b.test");
+  assert.equal(h.context.isDirty(), false);
+  h.context.activateRequestTab(original.key);
+  assert.equal(h.state.draft.url, "https://store-a.test");
+  assert.equal(h.state.response.id, 1);
+  assert.equal(original.view.projection.view_id, 11);
+  assert.equal(h.calls.length, 1);
+});
+
+test("a projection completing in an inactive tab is cached there without replacing the visible tab", async () => {
+  const pending = [];
+  const h = harness(true, (_command, args) => new Promise((resolve) => pending.push({ args, resolve })));
+  vm.runInContext('renderResponseText = (text) => { $("response-body").textContent = text; };', h.context);
+  h.state.response = { id: 1, bytes: 20 };
+  const first = h.state.requestTabs[0];
+  const projection = h.context.applyQuery();
+  h.context.duplicateRequestTab();
+  h.state.response = { id: 2, bytes: 20 };
+  const second = h.context.applyQuery();
+  pending[1].resolve({ view_id: 2, text: "store-B", bytes: 7, elapsed_ms: 0 });
+  await second;
+  pending[0].resolve({ view_id: 1, text: "store-A", bytes: 7, elapsed_ms: 0 });
+  await projection;
+  assert.equal(h.element("response-body").textContent, "store-B");
+  h.context.activateRequestTab(first.key);
+  assert.equal(h.element("response-body").textContent, "store-A");
+  assert.equal(h.calls.length, 2);
+});
+
+test("duplicate requests can send concurrently and finish into their own responses and applied views", async () => {
+  const pending = [];
+  let h;
+  h = harness(true, (command, args) => {
+    if (command === "send") return new Promise((resolve) => pending.push(resolve));
+    if (command === "refresh_workspace") return h.state.workspace;
+    if (command === "project_body") return { view_id: args.id, text: JSON.stringify({ response: args.id }), bytes: 14, elapsed_ms: 0 };
+    throw new Error(command);
+  });
+  const original = h.state.requestTabs[0];
+  h.state.draft.url = "https://store-a.test";
+  h.element("query").value = "{ categoryA }";
+  const first = h.context.send();
+  h.context.duplicateRequestTab();
+  const duplicate = h.state.requestTabs[1];
+  h.state.draft.url = "https://store-b.test";
+  h.element("query").value = "{ categoryB }";
+  const second = h.context.send();
+  assert.equal(h.state.pendingRequests.size, 2);
+  const sends = h.calls.filter((call) => call.command === "send");
+  assert.notEqual(sends[0].args.requestId, sends[1].args.requestId);
+  assert.equal(sends[0].args.draft.url, "https://store-a.test");
+  assert.equal(sends[1].args.draft.url, "https://store-b.test");
+  pending[0]({ id: 1, bytes: 20, url: "https://store-a.test" });
+  await first;
+  assert.equal(original.response.id, 1);
+  assert.equal(original.view.projection.view_id, 1);
+  assert.equal(original.view.query, "{ categoryA }");
+  assert.equal(h.state.response, null);
+  assert.equal(h.state.pendingRequests.has(duplicate.key), true);
+  pending[1]({ id: 2, bytes: 20, url: "https://store-b.test" });
+  await second;
+  assert.equal(duplicate.response.id, 2);
+  assert.equal(duplicate.view.query, "{ categoryB }");
+  assert.equal(h.state.response.id, 2);
+  assert.equal(h.state.pendingRequests.size, 0);
+});
+
+test("a failed Apply keeps the last successful view and exports that snapshot", async () => {
+  let fail = false;
+  const h = harness(true, (command) => {
+    if (command === "save_response") return true;
+    if (fail) throw new Error("invalid query");
+    return { view_id: 1, text: "original result", bytes: 15, elapsed_ms: 0 };
+  });
+  h.state.response = { id: 1, bytes: 20 };
+  await h.context.applyQuery();
+  fail = true;
+  h.element("query").value = "{ invalid";
+  await h.context.applyQuery();
+  assert.match(h.element("query-error").textContent, /invalid query/);
+  assert.equal(h.state.requestTabs[0].view.projection.view_id, 1);
+  await h.context.saveResponse();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls.at(-1).args)), { id: 1, viewId: 1 });
+});
+
+test("discard confirmation applies to the selected duplicate's own dirty draft", () => {
+  const h = harness(false);
+  h.context.duplicateRequestTab();
+  const duplicate = h.state.requestTabs[1];
+  h.state.draft.url = "https://unsaved.test";
+  h.context.closeRequestTab(duplicate.key);
+  assert.equal(h.confirmations.length, 1);
+  assert.equal(h.state.requestTabs.length, 2);
+  assert.equal(h.state.draft.url, "https://unsaved.test");
+});
+
+test("renaming a collection preserves every duplicate request's draft and stable tab identity", async () => {
+  let h;
+  h = harness(true, () => {
+    const workspace = JSON.parse(JSON.stringify(h.state.workspace));
+    workspace.collections[0].slug = "renamed";
+    workspace.collections[0].name = "Renamed";
+    return { workspace, collection: "renamed", written: 1, removed: 1 };
+  });
+  vm.runInContext('paintNodeAuth = () => {}; showNode = () => {}; renderVariables = () => {};', h.context);
+  h.state.draft.url = "https://store-a.test";
+  const first = h.state.requestTabs[0];
+  h.context.duplicateRequestTab();
+  h.state.draft.url = "https://store-b.test";
+  const second = h.state.requestTabs[1];
+  h.context.openCollection(h.state.workspace.collections[0]);
+  h.state.draft.name = "Renamed";
+  await h.context.save();
+  assert.equal(first.slug, "renamed");
+  assert.equal(second.slug, "renamed");
+  h.context.activateRequestTab(first.key);
+  assert.equal(h.state.draft.url, "https://store-a.test");
+  h.context.activateRequestTab(second.key);
+  assert.equal(h.state.draft.url, "https://store-b.test");
+});
+
 test("saved queries load per request; selector waits for a response", () => {
   const h = harness();
   assert.deepEqual(h.element("saved-query").children.map((option) => option.textContent), ["Custom query", "Brief"]);
@@ -87,7 +315,7 @@ test("selecting a query projects the current response without sending HTTP", asy
   assert.equal(h.state.requestTabs[0].query, "{ id }");
 });
 
-test("query variables stay as placeholders in saves and both projection IPC paths", async () => {
+test("query placeholders stay saved while export references the applied view without resolving variables again", async () => {
   const h = harness();
   h.state.env = "Stage";
   h.state.response = { id: 7, bytes: 20 };
@@ -98,14 +326,13 @@ test("query variables stay as placeholders in saves and both projection IPC path
   assert.equal(h.context.draftForIpc().queries["By ID"], query);
   await h.context.applyQuery();
   await h.context.saveResponse();
-  for (const command of ["project_body", "save_response"]) {
-    const call = h.calls.find((call) => call.command === command);
-    assert.equal(call.args.query, query);
-    assert.deepEqual(JSON.parse(JSON.stringify(call.args.context)), {
+  const call = h.calls.find((call) => call.command === "project_body");
+  assert.equal(call.args.query, query);
+  assert.deepEqual(JSON.parse(JSON.stringify(call.args.context)), {
       collection: "queries", path: [0], environment: "Stage", deployment: null,
-    });
-    assert.equal(Object.hasOwn(call.args, "variables"), false);
-  }
+  });
+  assert.equal(Object.hasOwn(call.args, "variables"), false);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls.find((call) => call.command === "save_response").args)), { id: 7, viewId: 17 });
 });
 
 test("live values are scoped overrides, not a highest-priority layer or saved defaults", () => {
@@ -129,7 +356,7 @@ test("live values are scoped overrides, not a highest-priority layer or saved de
   assert.equal(h.context.variableInfo("envOnly").defined, false);
 });
 
-test("applying a live value leaves collection drafts and Save payloads unchanged and reapplies the query", async () => {
+test("applying a live value leaves collection drafts, Save payloads and applied queries unchanged", async () => {
   let h;
   h = harness(true, (command, args) => {
     assert.equal(command, "set_variable");
@@ -148,7 +375,7 @@ test("applying a live value leaves collection drafts and Save payloads unchanged
   h.element("var-value").value = "current";
   await h.context.saveVariable();
   assert.equal(h.context.variableInfo("id").value, "current");
-  assert.equal(h.context.queryApplied, true);
+  assert.equal(h.context.queryApplied, undefined);
   assert.equal(h.state.workspace.collections[0].variables[0].value, "saved");
   assert.equal(vm.runInContext('JSON.stringify(drafts.get("collection:queries:"))', h.context), before);
   assert.equal(JSON.stringify(h.context.draftForIpc()), request);
@@ -217,7 +444,7 @@ test("rapid automatic edits are serialized and keep the latest typed value witho
   assert.equal(h.context.editorClosed, undefined);
 });
 
-test("query and response export wait for automatic variable writes, including newer typing", async () => {
+test("explicit query Apply waits for automatic variable writes, including newer typing", async () => {
   const pending = [];
   let h;
   h = harness(true, (command, args) => {
@@ -234,7 +461,6 @@ test("query and response export wait for automatic variable writes, including ne
   h.state.response = { id: 7, bytes: 20 };
   h.element("query").value = '{ id == "{{id}}" }';
   const projected = h.context.applyQuery();
-  const exported = h.context.saveResponse();
   h.element("var-value").value = "ab";
   const second = h.context.saveVariable();
   await new Promise(setImmediate);
@@ -244,9 +470,8 @@ test("query and response export wait for automatic variable writes, including ne
   await new Promise(setImmediate);
   assert.deepEqual(h.calls.map((call) => call.command), ["set_variable", "set_variable"]);
   pending.shift()();
-  await Promise.all([second, projected, exported]);
+  await Promise.all([second, projected]);
   assert.ok(h.calls.some((call) => call.command === "project_body"));
-  assert.ok(h.calls.some((call) => call.command === "save_response"));
   assert.equal(h.context.variableInfo("id").value, "ab");
 });
 
@@ -534,16 +759,18 @@ test("editing or deleting an environment leaves the stored response intact", asy
   assert.equal(h.state.env, "");
 });
 
-test("Save to file sends the response ID, query and scope identifiers, never response bytes or variable values", async () => {
+test("Save to file sends only the response and applied view IDs, not edited query text or current variables", async () => {
   const h = harness(true, () => true);
   h.state.response = { id: 7, environment: "Dev" };
   h.element("query").value = "{ id title }";
+  applied(h);
+  h.element("query").value = "{ unapplied }";
   await h.context.saveResponse();
   assert.equal(h.calls.length, 1);
   assert.equal(h.calls[0].command, "save_response");
-  assert.deepEqual(Object.keys(h.calls[0].args).sort(), ["context", "id", "query"]);
+  assert.deepEqual(Object.keys(h.calls[0].args).sort(), ["id", "viewId"]);
   assert.equal(h.calls[0].args.id, 7);
-  assert.equal(h.calls[0].args.query, "{ id title }");
+  assert.equal(h.calls[0].args.viewId, 17);
   assert.equal(h.element("response-save-note").textContent, "Response saved.");
   assert.equal(h.element("response-save-note").hidden, false);
   assert.equal(h.element("save-response").disabled, false);
@@ -554,9 +781,10 @@ test("Save to file works with historical responses and an empty query", async ()
   h.state.selection = null;
   h.state.response = { id: 8 };
   h.element("query").value = "";
+  applied(h);
   await h.context.saveResponse();
   assert.equal(h.calls[0].args.id, 8);
-  assert.equal(h.calls[0].args.query, "");
+  assert.equal(h.calls[0].args.viewId, 17);
 });
 
 test("cancelling Save to file is silent and errors are reported without changing the response", async () => {
@@ -567,6 +795,7 @@ test("cancelling Save to file is silent and errors are reported without changing
     });
     const response = { id: 7 };
     h.state.response = response;
+    applied(h);
     await h.context.saveResponse();
     assert.equal(h.state.response, response);
     assert.equal(h.element("response-save-note").hidden, !fail);
@@ -581,6 +810,7 @@ test("saving prevents duplicate dialogs and does not show a result on a differen
   await h.context.saveResponse();
   assert.equal(h.calls.length, 0);
   h.state.response = { id: 7 };
+  applied(h);
   const pending = h.context.saveResponse();
   assert.equal(h.element("save-response").disabled, true);
   await h.context.saveResponse();

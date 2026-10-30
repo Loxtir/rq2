@@ -101,6 +101,10 @@ pub struct RequestDef {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Scripts {
+    /// Shared scripts from `scripts/<name>.yml`, run in this order before this
+    /// layer's own scripts and with this layer's scope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pre_request: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -109,7 +113,7 @@ pub struct Scripts {
 
 impl Scripts {
     pub fn is_empty(&self) -> bool {
-        self.pre_request.is_empty() && self.post_response.is_empty()
+        self.include.is_empty() && self.pre_request.is_empty() && self.post_response.is_empty()
     }
 }
 
@@ -266,6 +270,9 @@ pub struct Variable {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Environment {
     pub name: String,
+    /// Named primary slot, omitted by the optional URL suffix for every service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_slot: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub platforms: Vec<Platform>,
     /// Skip certificate verification for this environment.
@@ -328,6 +335,44 @@ impl Collection {
     /// The request at a [`ResolvedRequest::path`], with its auth resolved.
     pub fn request_at(&self, path: &[usize]) -> Option<ResolvedRequest<'_>> {
         self.requests().into_iter().find(|found| found.path == path)
+    }
+
+    /// A request by name, case-insensitively: an exact match first, then a
+    /// unique substring. The error lists the candidates.
+    pub fn find_request(&self, name: &str) -> Result<ResolvedRequest<'_>, String> {
+        let wanted = name.to_ascii_lowercase();
+        let mut requests = self.requests();
+        let exact = |candidate: &ResolvedRequest| candidate.name.to_ascii_lowercase() == wanted;
+        let partial =
+            |candidate: &ResolvedRequest| candidate.name.to_ascii_lowercase().contains(&wanted);
+        let matches: Vec<usize> = if requests.iter().any(exact) {
+            (0..requests.len())
+                .filter(|&i| exact(&requests[i]))
+                .collect()
+        } else {
+            (0..requests.len())
+                .filter(|&i| partial(&requests[i]))
+                .collect()
+        };
+        match matches.as_slice() {
+            [only] => Ok(requests.swap_remove(*only)),
+            [] => Err(format!(
+                "no request called `{name}`. Available: {}",
+                requests
+                    .iter()
+                    .map(|r| r.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            many => Err(format!(
+                "`{name}` matches {} requests: {}",
+                many.len(),
+                many.iter()
+                    .map(|&i| requests[i].name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
     }
 
     /// The auth a folder or request at `path` would get from everything above
@@ -432,6 +477,42 @@ impl Collection {
         }
 
         let mut out: Vec<&mut Variable> = self.variables.iter_mut().collect();
+        walk(&mut self.items, &mut out);
+        out
+    }
+
+    /// Whether the collection, a folder or a request includes shared script
+    /// `name`.
+    pub fn includes(&self, name: &str) -> bool {
+        fn walk(items: &[Item], name: &str) -> bool {
+            items.iter().any(|item| {
+                item.scripts.include.iter().any(|include| include == name)
+                    || item.request.as_ref().is_some_and(|request| {
+                        request
+                            .scripts
+                            .include
+                            .iter()
+                            .any(|include| include == name)
+                    })
+                    || walk(&item.items, name)
+            })
+        }
+        self.scripts.include.iter().any(|include| include == name) || walk(&self.items, name)
+    }
+
+    /// The collection's scripts, then every folder's and request's.
+    pub fn all_scripts_mut(&mut self) -> Vec<&mut Scripts> {
+        fn walk<'a>(items: &'a mut [Item], out: &mut Vec<&'a mut Scripts>) {
+            for item in items {
+                out.push(&mut item.scripts);
+                if let Some(request) = &mut item.request {
+                    out.push(&mut request.scripts);
+                }
+                walk(&mut item.items, out);
+            }
+        }
+
+        let mut out = vec![&mut self.scripts];
         walk(&mut self.items, &mut out);
         out
     }
