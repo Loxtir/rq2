@@ -3,6 +3,7 @@
 function syntaxParts(text, language, caret = null) {
   if (language === "query") return querySyntaxParts(text, caret);
   if (!language) return [{ text, kind: "" }];
+  if (language === "graphql") return graphqlSyntaxParts(text);
   const pattern = language === "json"
     ? /(?<comment>\/\/[^\r\n]*)|(?<variable>\{\{[^{}]+\}\})|(?<string>"(?:\\[\s\S]|[^"\\])*"?)|(?<number>-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)|(?<literal>\b(?:true|false|null)\b)|(?<punctuation>[{}\[\],:])/g
     : language === "shell"
@@ -79,4 +80,78 @@ function querySyntaxParts(text, caret) {
   return parts;
 }
 
-if (typeof module !== "undefined") module.exports = { syntaxParts };
+function graphqlSyntaxParts(text) {
+  const pattern = /(?<comment>#[^\r\n]*)|(?<variable>\{\{[^{}]+\}\})|(?<string>"""[\s\S]*?(?:"""|$)|"(?:\\[\s\S]|[^"\\\n])*"?)|(?<argument>\$[_A-Za-z]\w*)|(?<directive>@[_A-Za-z]\w*)|(?<number>-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)|(?<name>[_A-Za-z]\w*)|(?<punctuation>\.\.\.|[{}()\[\]:=!|&,])/g;
+  const keywords = new Set(["query", "mutation", "subscription", "fragment", "on"]);
+  const parts = [];
+  let at = 0;
+  for (const match of text.matchAll(pattern)) {
+    if (match.index > at) parts.push({ text: text.slice(at, match.index), kind: "" });
+    const type = Object.keys(match.groups).find((key) => match.groups[key] !== undefined);
+    const word = match[0];
+    const kind = type === "comment" ? "syntax-comment"
+      : type === "string" ? "json-string"
+      : type === "number" ? "json-number"
+      : type === "argument" ? "json-boolean"
+      : type === "directive" ? "syntax-keyword"
+      : type === "punctuation" ? "json-punctuation"
+      : type !== "name" ? ""
+      : keywords.has(word) ? "syntax-keyword"
+      : word === "null" ? "json-null"
+      : word === "true" || word === "false" ? "json-boolean"
+      : /^[A-Z]/.test(word) ? "syntax-function"
+      : "json-key";
+    parts.push({ text: word, kind });
+    at = match.index + word.length;
+  }
+  if (at < text.length) parts.push({ text: text.slice(at), kind: "" });
+  return parts;
+}
+
+// Re-indents JSON by its tokens rather than by parsing, so text that is not
+// strict JSON yet (`//` comments, unquoted {{placeholders}}) still formats.
+function formatJson(text) {
+  const pattern = /(?<comment>\/\/[^\r\n]*)|(?<variable>\{\{[^{}]+\}\})|(?<string>"(?:\\[\s\S]|[^"\\])*"?)|(?<punctuation>[{}\[\],:])|(?<atom>[^\s{}\[\],:"\/]+|\/)/g;
+  const tokens = [...text.matchAll(pattern)].map((match) => ({
+    text: match[0],
+    type: Object.keys(match.groups).find((key) => match.groups[key] !== undefined),
+    lineBefore: /\n/.test(text.slice(0, match.index).match(/\s*$/)[0]),
+  }));
+  let out = "";
+  let depth = 0;
+  let newline = false;
+  const pad = () => `\n${"  ".repeat(depth)}`;
+  tokens.forEach((token, index) => {
+    const value = token.text;
+    const close = value === "}" || value === "]";
+    if (token.type === "comment") {
+      if (!token.lineBefore && out) out = `${out.trimEnd()} ${value}`;
+      else out += (out && !/\n *$/.test(out) ? pad() : "") + value;
+      newline = true;
+      return;
+    }
+    if (token.type === "punctuation" && close) {
+      const empty = /[{[]$/.test(out);
+      if (!empty) depth = Math.max(0, depth - 1);
+      out = empty ? out + value : out.replace(/\n *$/, "") + pad() + value;
+    } else if (value === ",") {
+      out += "," + pad();
+    } else if (value === ":") {
+      out += ": ";
+    } else {
+      if (newline) out = out.replace(/\n *$/, "") + pad();
+      out += value;
+      if (value === "{" || value === "[") {
+        const next = tokens[index + 1]?.text;
+        if (next !== "}" && next !== "]") {
+          depth += 1;
+          out += pad();
+        }
+      }
+    }
+    newline = false;
+  });
+  return out.replace(/[ \t]+\n/g, "\n").trimEnd();
+}
+
+if (typeof module !== "undefined") module.exports = { syntaxParts, formatJson };

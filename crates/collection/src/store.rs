@@ -195,7 +195,7 @@ fn collection_files(collection: &Collection) -> (Files, SecretValues) {
 
     // Rendered from `committed`: a folder or request may declare a secret too,
     // and its value must not be written to that file.
-    render_items(&committed.items, &root, &mut files);
+    render_items(&committed.items, &root, &root, &mut files);
 
     let secrets: SecretValues = collection
         .secrets()
@@ -288,7 +288,7 @@ fn example_block(out: &mut String, kind: &str, name: &str, secrets: &SecretValue
     }
 }
 
-fn render_items(items: &[Item], base: &str, files: &mut BTreeMap<String, String>) {
+fn render_items(items: &[Item], root: &str, base: &str, files: &mut BTreeMap<String, String>) {
     let width = items.len().to_string().len().max(2);
     let mut used = BTreeSet::new();
 
@@ -298,10 +298,26 @@ fn render_items(items: &[Item], base: &str, files: &mut BTreeMap<String, String>
 
         match &item.request {
             Some(request) => {
+                let mut request = request.clone();
+                // Each saved query is its own file keyed by the request id, so
+                // keeping a query never touches the request file and a rename or
+                // reorder never touches the queries.
+                if !item.id.is_empty() {
+                    for (name, query) in std::mem::take(&mut request.queries) {
+                        files.insert(
+                            format!(
+                                "{root}/queries/{}/{}.query",
+                                item.id,
+                                query_file_name(&name)
+                            ),
+                            query,
+                        );
+                    }
+                }
                 let file = RequestFile {
                     id: item.id.clone(),
                     name: item.name.clone(),
-                    request: request.clone(),
+                    request,
                 };
                 files.insert(format!("{base}/{prefix}-{stem}.yml"), yaml(&file));
             }
@@ -315,10 +331,141 @@ fn render_items(items: &[Item], base: &str, files: &mut BTreeMap<String, String>
                     scripts: item.scripts.clone(),
                 };
                 files.insert(format!("{dir}/folder.yml"), yaml(&folder));
-                render_items(&item.items, &dir, files);
+                render_items(&item.items, root, &dir, files);
             }
         }
     }
+}
+
+/// A query name as a file stem: characters a file name cannot hold, and `%`
+/// itself, become `%XX`, so any name round-trips.
+fn query_file_name(name: &str) -> String {
+    let mut out = String::new();
+    for (index, c) in name.char_indices() {
+        let trailing = index + c.len_utf8() == name.len() && (c == '.' || c == ' ');
+        if c.is_control() || "%<>:\"/\\|?*".contains(c) || trailing {
+            out.push_str(&format!("%{:02X}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn query_name(stem: &str) -> String {
+    let mut out = String::new();
+    let mut rest = stem;
+    while let Some(at) = rest.find('%') {
+        out.push_str(&rest[..at]);
+        let code = rest
+            .get(at + 1..at + 3)
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match code {
+            Some(code) => {
+                out.push(code as char);
+                rest = &rest[at + 3..];
+            }
+            None => {
+                out.push('%');
+                rest = &rest[at + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `queries/<request id>/<name>.query` over each request's queries. Files win
+/// over a `queries:` map left in an older request file.
+fn load_queries(dir: &Path, items: &mut [Item]) -> Result<(), String> {
+    for item in items {
+        load_queries(dir, &mut item.items)?;
+        let Some(request) = item.request.as_mut() else {
+            continue;
+        };
+        if item.id.is_empty() {
+            continue;
+        }
+        let folder = dir.join("queries").join(&item.id);
+        if !folder.is_dir() {
+            continue;
+        }
+        for path in sorted_entries(&folder)?
+            .into_iter()
+            .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "query"))
+        {
+            request
+                .queries
+                .insert(query_name(&file_stem(&path)), read(&path)?);
+        }
+    }
+    Ok(())
+}
+
+/// Adds, replaces (`Some`) or removes (`None`) one saved query of the request
+/// at `path`. Only that query's file changes.
+pub fn save_query(
+    root: &Path,
+    collection_slug: &str,
+    path: &[usize],
+    name: &str,
+    query: Option<&str>,
+) -> Result<(), String> {
+    let name = required_name(name)?;
+    edit_collection(root, collection_slug, |collection| {
+        let request = item_at_mut(&mut collection.items, path)
+            .and_then(|item| item.request.as_mut())
+            .ok_or_else(|| "that request is no longer in the tree".to_string())?;
+        match query {
+            Some(query) if !query.trim().is_empty() => {
+                request.queries.insert(name, query.to_string());
+            }
+            Some(_) => return Err("a query needs some text".to_string()),
+            None => {
+                request.queries.remove(&name);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Moves `queries:` maps left in request files into `queries/<id>/` files.
+/// Returns how many request files changed.
+pub fn migrate_queries(root: &Path) -> Result<usize, String> {
+    let workspace = load(root)?;
+    let mut changed = 0;
+    for collection in &workspace.collections {
+        let rendered = render(collection, &workspace.environments);
+        refuse_leaks("migrate queries", &rendered.report.leaks)?;
+        let legacy: Vec<_> = rendered
+            .files
+            .iter()
+            .filter(|(path, _)| path.ends_with(".yml") && path.starts_with("collections/"))
+            .filter(|(path, _)| {
+                fs::read_to_string(root.join(path))
+                    .is_ok_and(|text| text.lines().any(|line| line.starts_with("queries:")))
+            })
+            .collect();
+        if legacy.is_empty() {
+            continue;
+        }
+        for (path, query) in &rendered.files {
+            let file = root.join(path);
+            if path.ends_with(".query") && !file.exists() {
+                if let Some(parent) = file.parent() {
+                    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                }
+                fs::write(&file, query).map_err(|error| format!("writing {path}: {error}"))?;
+            }
+        }
+        for (path, contents) in legacy {
+            fs::write(root.join(path), contents)
+                .map_err(|error| format!("writing {path}: {error}"))?;
+            changed += 1;
+        }
+    }
+    Ok(changed)
 }
 
 fn unique_stem(name: &str, used: &mut BTreeSet<String>) -> String {
@@ -494,9 +641,6 @@ pub struct RequestDraft {
     pub variables: Option<Vec<Variable>>,
     #[serde(default)]
     pub scripts: Option<Scripts>,
-    /// Omission keeps stored queries; an empty map explicitly removes them.
-    #[serde(default)]
-    pub queries: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug)]
@@ -525,7 +669,7 @@ impl RequestDraft {
                 .unwrap_or_else(|| base.variables.clone()),
             scripts: self.scripts.clone().unwrap_or_else(|| base.scripts.clone()),
             description: base.description.clone(),
-            queries: self.queries.clone().unwrap_or_else(|| base.queries.clone()),
+            queries: base.queries.clone(),
         };
         // A URL typed with `?a=1` still works; the canonical form keeps the
         // query in `params` so a later toggle can disable one entry.
@@ -1378,12 +1522,41 @@ pub fn save_shared_script(
 /// Files are edited in place, only by their `id:` line: nothing is renamed or
 /// re-rendered. Returns how many files changed.
 pub fn ensure_ids(root: &Path) -> Result<usize, String> {
-    fn top_level_id(text: &str) -> Option<String> {
-        let value: serde_norway::Value = serde_norway::from_str(text).ok()?;
-        Some(value.get("id")?.as_str()?.to_string()).filter(|id| !id.is_empty())
+    scan_ids(root).map(|(changed, _)| changed)
+}
+
+/// What opening a workspace needs: [`ensure_ids`], then [`migrate_queries`]
+/// only when that same pass saw a `queries:` map left in a request file.
+pub fn prepare(root: &Path) -> Result<(), String> {
+    if scan_ids(root)?.1 {
+        migrate_queries(root)?;
     }
-    fn fix(path: &Path, seen: &mut BTreeSet<String>, changed: &mut usize) -> Result<(), String> {
+    Ok(())
+}
+
+/// Returns how many files got an id, and whether any still has `queries:`.
+fn scan_ids(root: &Path) -> Result<(usize, bool), String> {
+    // A top-level key starts in column 0; anything nested or inside a block
+    // scalar is indented. Reading that one line avoids parsing every file.
+    fn top_level_id(text: &str) -> Option<String> {
+        text.lines()
+            .find_map(|line| line.strip_prefix("id:"))
+            .map(|value| {
+                value
+                    .trim()
+                    .trim_matches(|c| c == '\'' || c == '"')
+                    .to_string()
+            })
+            .filter(|id| !id.is_empty())
+    }
+    fn fix(
+        path: &Path,
+        seen: &mut BTreeSet<String>,
+        changed: &mut usize,
+        legacy: &mut bool,
+    ) -> Result<(), String> {
         let text = read(path)?;
+        *legacy |= text.lines().any(|line| line.starts_with("queries:"));
         if let Some(id) = top_level_id(&text) {
             if seen.insert(id) {
                 return Ok(());
@@ -1400,22 +1573,28 @@ pub fn ensure_ids(root: &Path) -> Result<usize, String> {
         *changed += 1;
         Ok(())
     }
-    fn walk(dir: &Path, seen: &mut BTreeSet<String>, changed: &mut usize) -> Result<(), String> {
+    fn walk(
+        dir: &Path,
+        seen: &mut BTreeSet<String>,
+        changed: &mut usize,
+        legacy: &mut bool,
+    ) -> Result<(), String> {
         for entry in sorted_entries(dir)? {
             if entry.is_dir() {
                 let folder = entry.join("folder.yml");
                 if folder.is_file() {
-                    fix(&folder, seen, changed)?;
-                    walk(&entry, seen, changed)?;
+                    fix(&folder, seen, changed, legacy)?;
+                    walk(&entry, seen, changed, legacy)?;
                 }
             } else if is_numbered(&entry) {
-                fix(&entry, seen, changed)?;
+                fix(&entry, seen, changed, legacy)?;
             }
         }
         Ok(())
     }
 
     let mut changed = 0;
+    let mut legacy = false;
     for dir in sorted_dirs(&root.join("collections"))? {
         let meta = dir.join("collection.yml");
         if !meta.is_file() {
@@ -1423,10 +1602,10 @@ pub fn ensure_ids(root: &Path) -> Result<usize, String> {
         }
         // Ids are unique within a collection, which includes its own.
         let mut seen = BTreeSet::new();
-        fix(&meta, &mut seen, &mut changed)?;
-        walk(&dir, &mut seen, &mut changed)?;
+        fix(&meta, &mut seen, &mut changed, &mut legacy)?;
+        walk(&dir, &mut seen, &mut changed, &mut legacy)?;
     }
-    Ok(changed)
+    Ok((changed, legacy))
 }
 
 /// Removes a shared script's file. Anything still including it fails to send
@@ -1474,6 +1653,8 @@ fn load_collection(dir: &Path) -> Result<Collection, String> {
     let text = read(&meta_path)?;
     let meta: CollectionFile =
         serde_norway::from_str(&text).map_err(|e| format!("{}: {e}", meta_path.display()))?;
+    let mut items = load_items(dir)?;
+    load_queries(dir, &mut items)?;
 
     Ok(Collection {
         id: meta.id,
@@ -1492,7 +1673,7 @@ fn load_collection(dir: &Path) -> Result<Collection, String> {
         auth: meta.auth,
         variables: meta.variables,
         scripts: meta.scripts,
-        items: load_items(dir)?,
+        items,
     })
 }
 

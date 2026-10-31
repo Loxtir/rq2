@@ -2032,6 +2032,31 @@ body.right-closed .request-tabs {
   min-height: 0;
 }
 
+#tab-body.graphql {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+#tab-body.graphql > .body-tools {
+  grid-column: 1 / -1;
+}
+
+#tab-body > .body-variables {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+#tab-body > .body-variables[hidden] {
+  display: none;
+}
+
+#tab-body > .body-variables > .varfield {
+  flex: 1;
+  min-height: 0;
+}
+
 #tab-scripts > .field:first-child {
   flex: 0 0 var(--script-h, calc(50% - 6px));
 }

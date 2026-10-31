@@ -168,6 +168,7 @@ struct EnvironmentDto {
 
 #[derive(Serialize)]
 struct CollectionDto {
+    id: String,
     name: String,
     service_name: Option<String>,
     base_path: Option<String>,
@@ -194,8 +195,10 @@ struct VariableDto {
 
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 enum TreeNode {
     Folder {
+        id: String,
         name: String,
         path: Vec<usize>,
         /// What the folder sets itself, so the editor can change it.
@@ -209,6 +212,7 @@ enum TreeNode {
         items: Vec<TreeNode>,
     },
     Request {
+        id: String,
         name: String,
         method: String,
         /// Base URL only. Enabled and disabled parameters are in `params`, and
@@ -487,6 +491,7 @@ fn workspace_dto(root: &std::path::Path) -> Result<WorkspaceDto, String> {
         .collections
         .iter()
         .map(|collection| CollectionDto {
+            id: collection.id.clone(),
             name: collection.name.clone(),
             service_name: collection.service_name.clone(),
             base_path: collection.base_path.clone(),
@@ -560,7 +565,7 @@ fn open_workspace(
     // Store and report an absolute path: a remembered relative path would
     // resolve against whatever directory the next launch happens to use.
     let root = std::path::absolute(&path).unwrap_or_else(|_| PathBuf::from(&path));
-    store::ensure_ids(&root)?;
+    store::prepare(&root)?;
     let dto = workspace_dto(&root)?;
 
     *state.workspace.lock().map_err(|_| "state poisoned")? = Some(root.clone());
@@ -625,6 +630,7 @@ fn tree(items: &[Item], path: &mut Vec<usize>, collection: &Collection) -> Vec<T
 
         match &item.request {
             Some(request) => out.push(TreeNode::Request {
+                id: item.id.clone(),
                 name: item.name.clone(),
                 method: request.method.clone(),
                 url: request.url.clone(),
@@ -640,6 +646,7 @@ fn tree(items: &[Item], path: &mut Vec<usize>, collection: &Collection) -> Vec<T
                 queries: request.queries.clone(),
             }),
             None => out.push(TreeNode::Folder {
+                id: item.id.clone(),
                 name: item.name.clone(),
                 path: path.clone(),
                 auth: item.auth.clone(),
@@ -1182,6 +1189,20 @@ fn delete_shared_script(
     workspace_dto(&root)
 }
 
+/// Writes or (with no `query`) removes one saved query file; the request file
+/// and any unsaved request draft are left alone.
+#[tauri::command]
+fn save_query(
+    collection: String,
+    path: Vec<usize>,
+    name: String,
+    query: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let root = workspace_path(&state)?;
+    store::save_query(&root, &collection, &path, &name, query.as_deref())
+}
+
 #[tauri::command]
 fn create_environment(
     name: String,
@@ -1515,6 +1536,7 @@ fn main() {
             edit_tree,
             save_shared_script,
             delete_shared_script,
+            save_query,
             create_environment,
             update_environment,
             delete_environment,
@@ -1739,6 +1761,7 @@ mod request_body_tests {
                     mode: "raw".to_string(),
                     language: Some("json".to_string()),
                     text: Some(source.to_string()),
+                    ..Body::default()
                 }),
                 ..Default::default()
             };

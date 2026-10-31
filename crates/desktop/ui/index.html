@@ -180,8 +180,10 @@
                 <option value="json">json</option>
                 <option value="text">text</option>
                 <option value="xml">xml</option>
+                <option value="graphql">graphql</option>
               </select>
               <span class="spacer"></span>
+              <button id="body-beautify" class="btn btn-ghost" title="Format the JSON (comments and {{variables}} are kept)">Beautify</button>
               <button id="body-clear" class="btn btn-ghost">Clear</button>
             </div>
             <textarea
@@ -190,6 +192,9 @@
               spellcheck="false"
               placeholder="request body"
             ></textarea>
+            <div id="body-variables-field" class="body-variables" hidden>
+              <textarea id="body-variables" class="body-text" spellcheck="false" aria-label="GraphQL variables" placeholder='variables (JSON), e.g. { "id": "{{id}}" }'></textarea>
+            </div>
           </div>
 
           <div id="tab-auth" class="tab-panel" hidden>

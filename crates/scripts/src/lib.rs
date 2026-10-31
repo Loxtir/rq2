@@ -585,6 +585,7 @@ fn script_request(spec: &serde_json::Value) -> RequestDef {
                 mode: "raw".into(),
                 language: Some("json".into()),
                 text: Some(text.into()),
+                ..Body::default()
             });
         }
     }

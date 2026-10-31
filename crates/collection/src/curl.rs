@@ -103,16 +103,23 @@ pub fn render(
         args.push(format!("-H {}", single_quote(&format!("{name}: {value}"))));
     }
 
+    let mut problem = problem;
     if let Some(body) = &request.body {
         if body.text.is_some() {
-            let text = send::body_text(body, variables, &mut missing);
-            if body.language.as_deref() == Some("json") && !has_content_type {
-                args.push(format!(
-                    "-H {}",
-                    single_quote("Content-Type: application/json")
-                ));
+            match send::body_payload(body, variables, &mut missing) {
+                Ok((text, json)) => {
+                    if json && !has_content_type {
+                        args.push(format!(
+                            "-H {}",
+                            single_quote("Content-Type: application/json")
+                        ));
+                    }
+                    args.push(format!("--data-raw {}", single_quote(&text)));
+                }
+                Err(error) => {
+                    problem.get_or_insert(error);
+                }
             }
-            args.push(format!("--data-raw {}", single_quote(&text)));
         }
     }
 

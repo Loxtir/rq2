@@ -108,9 +108,9 @@ async function checkQueryControls() {
     check(!layer.querySelector("img"), "query highlighting must never interpret HTML");
     $("query-name").value = "Tree";
     $("query").value = "{ children** { id } }";
-    storeQuery();
-    check(state.draft.queries.Tree === $("query").value, "Keep query did not update the draft");
-    check(!$("save").disabled, "request Save must enable for query edits");
+    await storeQuery();
+    check(state.selection.node.queries.Tree === $("query").value, "Keep query did not store the query");
+    check($("save").disabled, "keeping a query must not dirty the request");
     const storedBody = $("response-body").textContent;
     $("environment").replaceChildren(new Option("Dev", "Dev"), new Option("Stage", "Stage"));
     $("environment").value = "Stage";

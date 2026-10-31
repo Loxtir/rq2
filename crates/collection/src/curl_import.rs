@@ -217,6 +217,7 @@ pub fn parse(text: &str) -> Result<Imported, String> {
             mode: "raw".to_string(),
             language: is_json.then(|| "json".to_string()),
             text: Some(pretty.unwrap_or(text)),
+            ..Body::default()
         });
     }
 

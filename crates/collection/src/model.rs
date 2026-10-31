@@ -233,14 +233,18 @@ pub struct KeyValue {
     pub disabled: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Body {
     /// `raw`, `urlencoded`, `formdata`, `graphql`, `file`.
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// The payload; for `graphql`, the query document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// `graphql` only: the variables as JSON text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variables: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

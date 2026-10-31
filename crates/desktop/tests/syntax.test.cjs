@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
-const { syntaxParts } = require("../ui/syntax.js");
+const { syntaxParts, formatJson } = require("../ui/syntax.js");
 
 function has(parts, text, kind) {
   assert.ok(parts.some((part) => part.text === text && part.kind === kind), `${text}: ${kind}`);
@@ -174,4 +174,30 @@ test("recursive query edges and variable predicates retain highlighting and brac
     assert.equal(parts.filter((part) => part.kind.includes("query-match")).length, 2);
     assert.ok(!parts.some((part) => part.kind.includes("query-unmatched")));
   }
+});
+
+test("graphql highlights keywords, types, fields, arguments, directives and comments", () => {
+  const source = '# orders\nquery Order($id: ID!, $n: Int = 5) {\n  order(id: $id, ref: "{{ref}}") @include(if: true) { ...Parts total }\n}';
+  const parts = syntaxParts(source, "graphql");
+  assert.equal(parts.map((part) => part.text).join(""), source);
+  has(parts, "# orders", "syntax-comment");
+  has(parts, "query", "syntax-keyword");
+  has(parts, "Order", "syntax-function");
+  has(parts, "$id", "json-boolean");
+  has(parts, "ID", "syntax-function");
+  has(parts, "5", "json-number");
+  has(parts, "order", "json-key");
+  has(parts, '"{{ref}}"', "json-string");
+  has(parts, "@include", "syntax-keyword");
+  has(parts, "true", "json-boolean");
+  has(parts, "...", "json-punctuation");
+});
+
+test("formatJson indents JSON and keeps comments, placeholders and string contents", () => {
+  assert.equal(formatJson('{"a":1,"b":[1,{}],"c":{"d":"x, y: {z} // no"}}'),
+    '{\n  "a": 1,\n  "b": [\n    1,\n    {}\n  ],\n  "c": {\n    "d": "x, y: {z} // no"\n  }\n}');
+  assert.equal(formatJson('// head\n{"a": {{n}}, // trailing\n"b":"{{s}}"}'),
+    '// head\n{\n  "a": {{n}}, // trailing\n  "b": "{{s}}"\n}');
+  const formatted = formatJson('{ "id" : "{{id}}" , "list": [ ] }');
+  assert.equal(formatJson(formatted), formatted);
 });

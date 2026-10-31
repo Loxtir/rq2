@@ -322,8 +322,8 @@ test("query placeholders stay saved while export references the applied view wit
   const query = '{ items[? definition { item_id { value == "{{myVar}}" } }] { definition { item_id attributes } } }';
   h.element("query").value = query;
   h.element("query-name").value = "By ID";
-  h.context.storeQuery();
-  assert.equal(h.context.draftForIpc().queries["By ID"], query);
+  await h.context.storeQuery();
+  assert.equal(h.nodes[0].queries["By ID"], query);
   await h.context.applyQuery();
   await h.context.saveResponse();
   const call = h.calls.find((call) => call.command === "project_body");
@@ -545,7 +545,7 @@ test("rapid query selection ignores stale errors from the previous projection", 
     return { text: '{"title":"Test"}', bytes: 16, elapsed_ms: 0 };
   });
   h.state.response = { id: 7, bytes: 20 };
-  h.state.draft.queries.Titles = "{ title }";
+  h.nodes[0].queries.Titles = "{ title }";
   h.element("saved-query").value = "Brief";
   h.context.selectSavedQuery();
   h.element("saved-query").value = "Titles";
@@ -557,61 +557,39 @@ test("rapid query selection ignores stale errors from the previous projection", 
   assert.equal(h.element("query").value, "{ title }");
 });
 
-test("named queries are staged in the request draft and included in Save IPC", () => {
+test("keeping a query writes it at once without touching the request draft", async () => {
   const h = harness();
   h.element("query").value = "{ title }";
   h.element("query-name").value = "  Titles  ";
-  h.context.storeQuery();
-  assert.equal(h.state.draft.queries.Titles, "{ title }");
-  assert.equal(h.nodes[0].queries.Titles, undefined);
-  assert.equal(h.context.isDirty(), true);
-  assert.equal(h.context.draftForIpc().queries.Titles, "{ title }");
-  assert.match(h.element("query-note").textContent, /Save the request/);
-});
-
-test("request Save reloads named queries from the returned workspace and preserves the response", async () => {
-  const h = harness(true, (command, args) => {
-    assert.equal(command, "save");
-    const workspace = JSON.parse(JSON.stringify(h.state.workspace));
-    workspace.collections[0].items[0].queries = args.edit.draft.queries;
-    return { workspace, collection: "queries", written: 1, removed: 0 };
-  });
-  h.state.response = { id: 7, bytes: 20 };
-  h.element("query").value = "{ title }";
-  h.element("query-name").value = "Titles";
-  h.context.storeQuery();
-  await h.context.save();
+  await h.context.storeQuery();
+  const call = h.calls.at(-1);
+  assert.equal(call.command, "save_query");
+  assert.deepEqual(JSON.parse(JSON.stringify(call.args)), { collection: "queries", path: [0], name: "Titles", query: "{ title }" });
+  assert.equal(h.nodes[0].queries.Titles, "{ title }");
   assert.equal(h.context.isDirty(), false);
-  assert.equal(h.state.draft.queries.Titles, "{ title }");
-  assert.equal(h.element("query").value, "{ title }");
-  assert.equal(h.state.response.id, 7);
-  assert.equal(h.element("saved-query").disabled, false);
-  assert.match(h.element("save-note").textContent, /saved/);
+  assert.equal(Object.hasOwn(h.context.draftForIpc(), "queries"), false);
 });
 
-test("failed saves leave query changes in the draft and report the error", async () => {
+test("a failed query write keeps the stored queries and reports the error", async () => {
   const h = harness(true, () => { throw new Error("refusing to save: secret value found"); });
   h.element("query").value = "{ title }";
   h.element("query-name").value = "Titles";
-  h.context.storeQuery();
-  await h.context.save();
-  assert.equal(h.context.isDirty(), true);
-  assert.equal(h.state.draft.queries.Titles, "{ title }");
-  assert.match(h.element("save-note").textContent, /refusing to save/);
+  await h.context.storeQuery();
+  assert.equal(h.nodes[0].queries.Titles, undefined);
+  assert.match(h.element("query-note").textContent, /refusing to save/);
 });
 
-test("switching requests preserves unsaved named queries and freeform query text", () => {
+test("switching requests shows each request's own queries and freeform text", async () => {
   const h = harness();
   h.element("query").value = "{ children** { id } }";
   h.element("query-name").value = "Tree";
-  h.context.storeQuery();
+  await h.context.storeQuery();
   h.open(1);
-  assert.equal(h.state.draft.queries.Tree, undefined);
   assert.equal(h.element("query").value, "");
   assert.equal(h.element("query-name").value, "");
   assert.deepEqual(h.element("saved-query").children.map((option) => option.textContent), ["Custom query", "Titles"]);
   h.open(0);
-  assert.equal(h.state.draft.queries.Tree, "{ children** { id } }");
+  assert.equal(h.nodes[0].queries.Tree, "{ children** { id } }");
   assert.equal(h.element("query").value, "{ children** { id } }");
 });
 
@@ -621,56 +599,57 @@ test("editing a selected query remains freeform until explicitly kept", () => {
   h.context.queryEdited();
   assert.equal(h.element("saved-query").value, "");
   assert.equal(h.element("remove-query").disabled, true);
-  assert.equal(h.state.draft.queries.Brief, "{ id }");
+  assert.equal(h.nodes[0].queries.Brief, "{ id }");
   assert.equal(h.context.isDirty(), false);
 });
 
-test("overwriting a named query requires confirmation; cancelling keeps the original", () => {
+test("overwriting a named query requires confirmation; cancelling keeps the original", async () => {
   for (const confirmed of [false, true]) {
     const h = harness(confirmed);
     h.element("query").value = "{ title }";
     h.element("query-name").value = "Brief";
-    h.context.storeQuery();
+    await h.context.storeQuery();
     assert.equal(h.confirmations.length, 1);
-    assert.equal(h.state.draft.queries.Brief, confirmed ? "{ title }" : "{ id }");
+    assert.equal(h.nodes[0].queries.Brief, confirmed ? "{ title }" : "{ id }");
   }
 });
 
-test("removing a query stages an empty map without discarding the displayed view", () => {
+test("removing a query deletes it at once without discarding the displayed view", async () => {
   const h = harness();
   h.element("query").value = "{ id }";
   h.element("saved-query").value = "Brief";
-  h.context.removeSavedQuery();
-  assert.equal(Object.keys(h.context.draftForIpc().queries).length, 0);
+  await h.context.removeSavedQuery();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls.at(-1).args)), { collection: "queries", path: [0], name: "Brief", query: null });
+  assert.equal(Object.keys(h.nodes[0].queries).length, 0);
   assert.equal(h.element("query").value, "{ id }");
-  assert.equal(h.context.isDirty(), true);
+  assert.equal(h.context.isDirty(), false);
 });
 
-test("different names with identical query text keep the selected identity", () => {
+test("different names with identical query text keep the selected identity", async () => {
   const h = harness();
   h.state.response = { id: 1, bytes: 20 };
   h.element("query").value = "{ id }";
   h.element("query-name").value = "Another brief";
-  h.context.storeQuery();
+  await h.context.storeQuery();
   assert.equal(h.element("saved-query").value, "Another brief");
-  h.context.removeSavedQuery();
-  assert.equal(h.state.draft.queries["Another brief"], undefined);
-  assert.equal(h.state.draft.queries.Brief, "{ id }");
+  await h.context.removeSavedQuery();
+  assert.equal(h.nodes[0].queries["Another brief"], undefined);
+  assert.equal(h.nodes[0].queries.Brief, "{ id }");
 });
 
-test("blank names and blank queries are not stored; unusual names remain literal", () => {
+test("blank names and blank queries are not stored; unusual names remain literal", async () => {
   const h = harness();
   for (const [name, query] of [[" ", "{ id }"], ["Blank", " "]]) {
     h.element("query-name").value = name;
     h.element("query").value = query;
-    h.context.storeQuery();
-    assert.equal(Object.keys(h.state.draft.queries).length, 1);
+    await h.context.storeQuery();
+    assert.equal(Object.keys(h.nodes[0].queries).length, 1);
   }
   for (const name of ["__proto__", "<img src=x>", "résumé"]) {
     h.element("query-name").value = name;
     h.element("query").value = "{ title }";
-    h.context.storeQuery();
-    assert.ok(Object.hasOwn(h.state.draft.queries, name));
+    await h.context.storeQuery();
+    assert.ok(Object.hasOwn(h.nodes[0].queries, name));
     assert.ok(h.element("saved-query").children.some((option) => option.textContent === name));
   }
 });
@@ -822,4 +801,40 @@ test("saving prevents duplicate dialogs and does not show a result on a differen
   assert.equal(h.element("save-response").disabled, false);
   h.context.resetResponse("No response");
   assert.equal(h.element("save-response").disabled, true);
+});
+
+test("a graphql body keeps query and variables and switches back to raw", () => {
+  const h = harness();
+  h.element("body-language").value = "graphql";
+  h.element("body-text").value = "query { me { id } }";
+  h.element("body-variables").value = '{ "id": 1 }';
+  h.context.readBody();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.context.draftForIpc().body)),
+    { mode: "graphql", text: "query { me { id } }", variables: '{ "id": 1 }' });
+  h.element("body-language").value = "json";
+  h.context.readBody();
+  assert.deepEqual(JSON.parse(JSON.stringify(h.context.draftForIpc().body)),
+    { mode: "raw", language: "json", text: "query { me { id } }" });
+});
+
+test("open tabs are remembered by id and restored after a reorder", () => {
+  const h = harness();
+  const store = new Map();
+  h.context.localStorage = { getItem: (key) => store.get(key) ?? null, setItem: (key, value) => store.set(key, value), removeItem() {} };
+  const collection = h.state.workspace.collections[0];
+  collection.id = "c1";
+  h.nodes[0].id = "r1";
+  h.nodes[1].id = "r2";
+  h.open(1);
+  h.context.activateRequestTab(h.state.requestTabs[0].key);
+  h.context.rememberTabs();
+  collection.items.reverse();
+  vm.runInContext("drafts.clear()", h.context);
+  h.state.requestTabs = [];
+  h.state.activeTab = null;
+  h.state.activeRequestTab = null;
+  assert.equal(h.context.restoreTabs(), true);
+  assert.deepEqual(h.state.requestTabs.map((tab) => tab.name), ["First", "Second"]);
+  assert.deepEqual([...h.state.requestTabs[0].path], [1]);
+  assert.equal(h.state.selection.node.id, "r1");
 });

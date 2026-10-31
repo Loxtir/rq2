@@ -744,6 +744,11 @@ the last one is remembered. Three panes: the tree, the request, the command.
   saved YAML, but are stripped from sent bodies and cURL previews/copies before
   variable substitution. Quoted strings (including URLs and literal `//`) stay
   untouched. Other body languages are sent unchanged.
+- Choose **graphql** in the body language menu to edit a GraphQL query and a
+  JSON **Variables** panel. Both accept `{{name}}`; the request is sent as
+  `{"query": ..., "variables": ...}` with `Content-Type: application/json`, and
+  saved as `body: {mode: graphql, text, variables}`. Postman `graphql` bodies
+  import into the same form. There is no schema or introspection.
 - **Send** uses the current request draft; it becomes **Cancel** while a request
   is pending. The response shows status, timing, size, unresolved variables, TLS
   warnings, and post-response script errors.
@@ -763,14 +768,18 @@ the last one is remembered. Three panes: the tree, the request, the command.
   preserving its bytes even when the text preview is truncated. Line numbers and
   folded-view markers are not included. Captured responses may contain sensitive
   data; choose the destination accordingly.
-- Save named projections per request: enter a query and a **Query name**, click
-  **Keep query**, then **Save** the request. The saved-query selector becomes
+- Save named projections per request: enter a query and a **Query name** and
+  click **Keep query**; it is written at once, without saving the request or
+  its unsaved edits. The saved-query selector becomes
   available once a response arrives and immediately applies the chosen view
   without another HTTP call. Freeform edits remain possible; **Keep query** with
-  the same name updates it after confirmation. **Remove** stages its deletion;
-  **Save** makes query additions, updates, and removals durable. Queries live in
-  the request YAML as a `queries` map from names to query text, so they travel
-  with the request and survive restarts. History tabs remain read-only.
+  the same name updates it after confirmation, and **Remove** deletes it. Each
+  query is its own file, `collections/<collection>/queries/<request id>/<name>.query`
+  (characters a file name cannot hold are written as `%XX`), so keeping a query
+  never touches the request file, renaming or reordering a request never
+  touches its queries, and two people only conflict when they edit the same
+  query. A `queries:` map left in an older request file is moved into these
+  files when the workspace opens. History tabs remain read-only.
   The query editor supports multiline text (**Shift+Enter** for a newline;
   **Enter** applies the query), including comments in saved queries.
 - **History** records successful and failed sends, with a per-request history

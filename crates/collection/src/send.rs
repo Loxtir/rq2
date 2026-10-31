@@ -420,8 +420,8 @@ pub async fn send_async(
     }
     call = call.headers(auth_headers);
     if let Some(body) = &request.body {
-        let text = body_text(body, vars, &mut missing);
-        if body.language.as_deref() == Some("json") && !has_header(request, "content-type") {
+        let (text, json) = body_payload(body, vars, &mut missing)?;
+        if json && !has_header(request, "content-type") {
             call = call.header(reqwest::header::CONTENT_TYPE, "application/json");
         }
         call = call.body(text);
@@ -457,6 +457,35 @@ pub async fn send_async(
         insecure: options.insecure,
         missing,
     })
+}
+
+/// What goes on the wire, and whether it is JSON. A `graphql` body becomes
+/// `{"query": ..., "variables": ...}`; its variables must be a JSON object.
+pub(crate) fn body_payload(
+    body: &Body,
+    vars: &BTreeMap<String, String>,
+    missing: &mut Vec<String>,
+) -> Result<(String, bool), String> {
+    if body.mode != "graphql" {
+        return Ok((
+            body_text(body, vars, missing),
+            body.language.as_deref() == Some("json"),
+        ));
+    }
+    let query = substitute(body.text.as_deref().unwrap_or_default(), vars, missing);
+    let variables = body.variables.as_deref().unwrap_or_default();
+    let variables = substitute(&strip_json_line_comments(variables), vars, missing);
+    let mut payload = serde_json::Map::new();
+    payload.insert("query".into(), serde_json::Value::String(query));
+    if !variables.trim().is_empty() {
+        let parsed: serde_json::Value = serde_json::from_str(&variables)
+            .map_err(|error| format!("GraphQL variables are not valid JSON: {error}"))?;
+        if !parsed.is_object() {
+            return Err("GraphQL variables must be a JSON object".to_string());
+        }
+        payload.insert("variables".into(), parsed);
+    }
+    Ok((serde_json::Value::Object(payload).to_string(), true))
 }
 
 /// Shared by both transports and cURL. Strip source comments before expansion
@@ -609,6 +638,7 @@ mod body_tests {
             mode: "raw".to_string(),
             language: Some("json".to_string()),
             text: Some(text.to_string()),
+            ..Body::default()
         };
         let mut missing = Vec::new();
         assert_eq!(

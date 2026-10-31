@@ -1,4 +1,4 @@
-﻿//! The `curl` preview.
+//! The `curl` preview.
 //!
 //! The point of these tests is the mask: a preview is meant to be pasted into a
 //! ticket, so no secret value may survive the rendering, however it was used.
@@ -106,6 +106,7 @@ fn a_secret_in_the_body_is_masked_too() {
         mode: "raw".to_string(),
         language: Some("json".to_string()),
         text: Some("{\"key\":\"{{apiKey}}\"}".to_string()),
+        ..Body::default()
     });
 
     let preview = render(&request, None, &variables);
@@ -254,6 +255,7 @@ fn single_quotes_in_a_body_survive_a_shell() {
         mode: "raw".to_string(),
         language: Some("text".to_string()),
         text: Some("O'Brien".to_string()),
+        ..Body::default()
     });
 
     let preview = render(&request, None, &variables);
@@ -263,6 +265,38 @@ fn single_quotes_in_a_body_survive_a_shell() {
         "{}",
         preview.text
     );
+}
+
+#[test]
+fn a_graphql_body_is_sent_as_query_and_variables_json() {
+    let collection = collection(Default::default(), vec![variable("id", "42", false)]);
+    let variables = masked_variables(&collection, None, &[], &[]);
+    let mut request = request("POST", "https://acme.test/graphql");
+    request.body = Some(Body {
+        mode: "graphql".to_string(),
+        text: Some("query Order($id: ID!) { order(id: $id) { id } }".to_string()),
+        variables: Some("// comment\n{ \"id\": \"{{id}}\" }".to_string()),
+        ..Body::default()
+    });
+
+    let preview = render(&request, None, &variables);
+    assert!(preview.problem.is_none(), "{:?}", preview.problem);
+    assert!(
+        preview.text.contains("'Content-Type: application/json'"),
+        "{}",
+        preview.text
+    );
+    assert!(
+        preview.text.contains(
+            r#"--data-raw '{"query":"query Order($id: ID!) { order(id: $id) { id } }","variables":{"id":"42"}}'"#
+        ),
+        "{}",
+        preview.text
+    );
+
+    request.body.as_mut().unwrap().variables = Some("[1]".to_string());
+    let preview = render(&request, None, &variables);
+    assert!(preview.problem.unwrap().contains("JSON object"));
 }
 
 #[test]

@@ -8,5 +8,3 @@ params:
 headers:
 - name: Accept
   value: application/json
-queries:
-  id and title: '{ id title }'

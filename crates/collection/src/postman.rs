@@ -268,15 +268,31 @@ fn parse_body(value: &Value, warnings: &mut Vec<String>) -> Option<Body> {
                 .get("raw")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
+            ..Body::default()
         }),
+        "graphql" => {
+            let graphql = value.get("graphql");
+            let field = |name: &str| {
+                graphql
+                    .and_then(|g| g.get(name))
+                    .and_then(|v| v.as_str())
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string)
+            };
+            Some(Body {
+                mode: mode.to_string(),
+                text: field("query"),
+                variables: field("variables"),
+                ..Body::default()
+            })
+        }
         other => {
             warnings.push(format!(
                 "body mode `{other}` was not converted; the mode is recorded but the fields are not"
             ));
             Some(Body {
                 mode: other.to_string(),
-                language: None,
-                text: None,
+                ..Body::default()
             })
         }
     }

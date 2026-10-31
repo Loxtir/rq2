@@ -121,7 +121,6 @@ fn draft(name: &str, method: &str, url: &str) -> RequestDraft {
         auth: Default::default(),
         variables: None,
         scripts: None,
-        queries: None,
     }
 }
 
@@ -144,6 +143,7 @@ fn edits_a_request_and_leaves_its_auth_alone() {
         mode: "raw".to_string(),
         language: Some("json".to_string()),
         text: Some("{\"a\":1}".to_string()),
+        ..Body::default()
     });
 
     store::save(

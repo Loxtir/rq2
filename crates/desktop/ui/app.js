@@ -1117,7 +1117,8 @@ function paintVariables(input) {
   const script = input.classList.contains("script-editor");
   const language = script ? "javascript"
     : input.id === "query" ? "query"
-    : input.id === "body-text" && $("body-language").value === "json" ? "json" : null;
+    : input.id === "body-variables" ? "json"
+    : input.id === "body-text" && ["json", "graphql"].includes($("body-language").value) ? $("body-language").value : null;
   input.parentElement.classList.toggle("syntax-editor", Boolean(language));
   const caret = document.activeElement === input && input.selectionStart === input.selectionEnd
     ? input.selectionStart : null;
@@ -1758,6 +1759,7 @@ function renderRequestTabs() {
   host.hidden = state.requestTabs.length === 0;
   // Keep the active tab in view, e.g. a new one added past the right edge.
   host.querySelector(".request-tab.active")?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  rememberTabs();
 }
 
 function setHistoryViewer(active) {
@@ -2000,13 +2002,15 @@ function isDirty() {
 }
 
 function markUnsaved() {
+  // Each draft is compared once; per row this was rows × drafts serialisations.
+  const dirty = new Set();
+  for (const [draft, entry] of drafts) {
+    if (JSON.stringify(entry.draft) === entry.saved) continue;
+    const at = draft.indexOf(":");
+    if (["request", "folder", "collection"].includes(draft.slice(0, at))) dirty.add(draft.slice(at + 1).split("|")[0]);
+  }
   for (const element of $("tree").querySelectorAll("[data-key]")) {
-    const key = element.dataset.key;
-    const dirty = ["request", "folder", "collection"].some((kind) => {
-      return [...drafts].some(([draft, entry]) => (draft === `${kind}:${key}` || draft.startsWith(`${kind}:${key}|`))
-        && JSON.stringify(entry.draft) !== entry.saved);
-    });
-    element.classList.toggle("unsaved", Boolean(dirty));
+    element.classList.toggle("unsaved", dirty.has(element.dataset.key));
   }
 }
 
@@ -2057,7 +2061,6 @@ function openRequest(node, collection, path, keepResponse = false, existingTabKe
     body: clone(node.body || null),
     auth: clone(node.auth ?? "inherit"),
     scripts: clone(node.scripts || { pre_request: "", post_response: "" }),
-    queries: clone(node.queries || {}),
   }), tab.draftKey);
   state.draft = entry.draft;
   state.saved = entry.saved;
@@ -2487,23 +2490,57 @@ function updateHeadersCount() {
 
 function renderBody() {
   const body = state.draft.body;
+  const graphql = body?.mode === "graphql";
   $("body-text").value = body?.text || "";
-  $("body-language").value = body?.language || "json";
-  if (body?.language && $("body-language").value !== body.language) {
+  $("body-variables").value = body?.variables || "";
+  $("body-language").value = graphql ? "graphql" : body?.language || "json";
+  if (!graphql && body?.language && $("body-language").value !== body.language) {
     const option = document.createElement("option");
     option.textContent = body.language;
     $("body-language").append(option);
     $("body-language").value = body.language;
   }
+  showBodyVariables();
   paintVariables($("body-text"));
+  paintVariables($("body-variables"));
+}
+
+function showBodyVariables() {
+  const graphql = $("body-language").value === "graphql";
+  $("body-beautify").disabled = !["json", "graphql"].includes($("body-language").value);
+  $("body-beautify").title = graphql ? "Format the variables JSON" : "Format the JSON (comments and {{variables}} are kept)";
+  $("body-variables-field").hidden = !graphql;
+  $("tab-body").classList.toggle("graphql", graphql);
+  $("body-text").placeholder = graphql ? "query { … }" : "request body";
+}
+
+function beautifyBody() {
+  const language = $("body-language").value;
+  const input = language === "graphql" ? $("body-variables") : language === "json" ? $("body-text") : null;
+  if (!input || !input.value.trim()) return;
+  const formatted = formatJson(input.value);
+  if (formatted === input.value) return;
+  // insertText keeps the edit on the undo stack, so Ctrl+Z restores the original.
+  input.focus();
+  input.select();
+  if (document.execCommand?.("insertText", false, formatted)) return;
+  input.value = formatted;
+  paintVariables(input);
+  readBody();
 }
 
 function readBody() {
   const text = $("body-text").value;
   const language = $("body-language").value || "json";
-  state.draft.body = text
-    ? { mode: state.draft.body?.mode || "raw", language, text }
-    : null;
+  if (language === "graphql") {
+    const variables = $("body-variables").value;
+    state.draft.body = text || variables
+      ? { mode: "graphql", text, ...(variables ? { variables } : {}) }
+      : null;
+  } else {
+    const mode = state.draft.body?.mode === "graphql" ? "raw" : state.draft.body?.mode || "raw";
+    state.draft.body = text ? { mode, language, text } : null;
+  }
   updateDirty();
   schedulePreview();
 }
@@ -2615,7 +2652,9 @@ function draftForIpc() {
     path_params: draft.path_params || {},
     headers: draft.headers,
     body:
-      draft.body && draft.body.text
+      draft.body?.mode === "graphql"
+        ? { mode: "graphql", text: draft.body.text || "", ...(draft.body.variables ? { variables: draft.body.variables } : {}) }
+        : draft.body && draft.body.text
         ? {
             mode: draft.body.mode || "raw",
             language: draft.body.language || "json",
@@ -2624,7 +2663,6 @@ function draftForIpc() {
         : null,
     auth: draft.auth ?? "inherit",
     scripts: draft.scripts || { pre_request: "", post_response: "" },
-    queries: draft.queries || {},
   };
 }
 
@@ -2656,6 +2694,76 @@ function editForIpc() {
     auth: state.draft.auth ?? "inherit",
     scripts: state.draft.scripts || { pre_request: "", post_response: "" },
   };
+}
+
+// Open tabs, remembered per workspace by collection and item id so renames
+// and reorders between sessions still find them. History tabs are not kept.
+const openTabsKey = () => `rq.openTabs:${state.workspace?.path || ""}`;
+let restoringTabs = false;
+let rememberedTabs = "";
+
+function rememberTabs() {
+  if (!state.workspace || restoringTabs) return;
+  // Cheap fingerprint first: this runs on every tab-bar render, often several
+  // times per switch, and the storage write is synchronous.
+  const fingerprint = `${openTabsKey()}|${state.activeTab}|${state.requestTabs.map((tab) => tab.key).join(",")}`;
+  if (fingerprint === rememberedTabs) return;
+  rememberedTabs = fingerprint;
+  const tabs = [];
+  let active = null;
+  for (const tab of state.requestTabs) {
+    if (tab.kind === "history") continue;
+    const found = findNode(tab.slug, tab.path);
+    if (!found || !found.collection.id) continue;
+    if (tab.key === state.activeTab) active = tabs.length;
+    tabs.push({ kind: tab.kind, collection: found.collection.id, id: tab.kind === "collection" ? "" : found.node.id });
+  }
+  localStorage.setItem(openTabsKey(), JSON.stringify({ tabs, active }));
+}
+
+function findById(collectionId, id) {
+  const collection = (state.workspace?.collections || []).find((candidate) => candidate.id === collectionId);
+  if (!collection) return null;
+  if (!id) return { kind: "collection", node: collection, collection, path: [] };
+  const walk = (items, trail) => {
+    for (const [index, node] of (items || []).entries()) {
+      const path = [...trail, index];
+      if (node.id === id) return { kind: node.kind, node, collection, path };
+      const found = walk(node.items, path);
+      if (found) return found;
+    }
+    return null;
+  };
+  return walk(collection.items, []);
+}
+
+// Reopens the tabs of the last session; false when none of them are left.
+function restoreTabs() {
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(openTabsKey())); } catch { /* Ignore obsolete local preferences. */ }
+  if (!saved?.tabs?.length) return false;
+  const opened = [];
+  restoringTabs = true;
+  try {
+    for (const entry of saved.tabs) {
+      const found = findById(entry.collection, entry.id);
+      if (!found || found.kind !== entry.kind) {
+        opened.push(null);
+        continue;
+      }
+      if (found.kind === "request") openRequest(found.node, found.collection, found.path);
+      else if (found.kind === "folder") openFolder(found.node, found.collection, found.path);
+      else openCollection(found.collection);
+      opened.push(state.activeTab);
+    }
+  } finally {
+    restoringTabs = false;
+  }
+  const active = opened[saved.active] || opened.filter(Boolean).at(-1);
+  if (!active) return false;
+  activateRequestTab(active);
+  rememberTabs();
+  return true;
 }
 
 function findNode(slug, path) {
@@ -3803,7 +3911,7 @@ function renderSavedQueries() {
     $("query-note").hidden = true;
     return;
   }
-  const queries = state.draft.queries || {};
+  const queries = savedQueries();
   const select = $("saved-query");
   const selected = select.value;
   select.replaceChildren();
@@ -3834,39 +3942,57 @@ function queryEdited() {
 function selectSavedQuery() {
   if (state.selection?.kind !== "request" || !state.response) return;
   const name = $("saved-query").value;
-  if (!Object.hasOwn(state.draft.queries || {}, name)) return;
-  $("query").value = state.draft.queries[name];
+  if (!Object.hasOwn(savedQueries(), name)) return;
+  $("query").value = savedQueries()[name];
   $("query-name").value = name;
   queryEdited();
   void applyQuery();
 }
 
-function storeQuery() {
+// Saved queries live on the stored request, not the draft: each one is its own
+// file, written at once without saving the request.
+function savedQueries() {
+  return state.selection?.node?.queries || {};
+}
+
+async function writeQuery(name, query) {
+  const selection = state.selection;
+  try {
+    await invoke("save_query", { collection: selection.slug, path: selection.path, name, query });
+  } catch (error) {
+    $("query-note").textContent = String(error);
+    $("query-note").hidden = false;
+    return false;
+  }
+  // A computed key also stores names such as "__proto__" as plain keys.
+  const queries = query === null ? { ...(selection.node.queries || {}) }
+    : { ...(selection.node.queries || {}), [name]: query };
+  if (query === null) delete queries[name];
+  selection.node.queries = queries;
+  return true;
+}
+
+async function storeQuery() {
   if (state.selection?.kind !== "request" || !state.draft) return;
   const name = $("query-name").value.trim();
   const query = $("query").value;
   if (!name || !query.trim()) return;
-  const queries = state.draft.queries || {};
+  const queries = savedQueries();
   if (Object.hasOwn(queries, name) && queries[name] !== query &&
       !window.confirm(`Replace the saved query "${name}"?`)) return;
-  // Computed keys also safely support names such as "__proto__".
-  state.draft.queries = { ...queries, [name]: query };
+  if (!await writeQuery(name, query)) return;
   $("saved-query").value = name;
   queryEdited();
-  updateDirty();
-  $("query-note").textContent = "Query kept in draft. Save the request to persist query changes.";
-  $("query-note").hidden = false;
+  $("query-note").hidden = true;
 }
 
-function removeSavedQuery() {
+async function removeSavedQuery() {
   if (state.selection?.kind !== "request" || !state.draft) return;
   const name = $("saved-query").value;
-  if (!Object.hasOwn(state.draft.queries || {}, name)) return;
-  delete state.draft.queries[name];
+  if (!Object.hasOwn(savedQueries(), name)) return;
+  if (!await writeQuery(name, null)) return;
   renderSavedQueries();
-  updateDirty();
-  $("query-note").textContent = "Query removed from draft. Save the request to persist query changes.";
-  $("query-note").hidden = false;
+  $("query-note").hidden = true;
 }
 
 function renderProjection(projection, response) {
@@ -4295,6 +4421,8 @@ async function open(path) {
   try {
     const loaded = await invoke("open_workspace", { path });
     state.workspace = loaded;
+    // Clearing the old tabs below must not overwrite the ones to restore.
+    restoringTabs = true;
     state.env = localStorage.getItem(environmentStorageKey(loaded.path)) || "";
     state.selection = null;
     state.draft = null;
@@ -4308,11 +4436,15 @@ async function open(path) {
     renderRequestTabs();
     renderWorkspace();
     showEmpty();
+    restoringTabs = false;
 
-    // Land on something real instead of an empty pane.
-    const first = $("tree").querySelector(".request-row");
-    if (first) first.click();
+    // Reopen the last session's tabs, or land on something real instead of an empty pane.
+    if (!restoreTabs()) {
+      const first = $("tree").querySelector(".request-row");
+      if (first) first.click();
+    }
   } catch (error) {
+    restoringTabs = false;
     window.alert(String(error));
   }
 }
@@ -4533,6 +4665,7 @@ async function boot() {
 
   withVariables($("url"));
   withVariables($("body-text"));
+  withVariables($("body-variables"));
   for (const input of document.querySelectorAll(".script-editor")) withVariables(input);
 
   $("url").addEventListener("input", () => {
@@ -4612,13 +4745,18 @@ async function boot() {
   }
 
   $("body-text").addEventListener("input", readBody);
+  $("body-variables").addEventListener("input", readBody);
   $("body-language").addEventListener("change", () => {
+    showBodyVariables();
     paintVariables($("body-text"));
     readBody();
   });
+  $("body-beautify").addEventListener("click", beautifyBody);
   $("body-clear").addEventListener("click", () => {
     $("body-text").value = "";
+    $("body-variables").value = "";
     paintVariables($("body-text"));
+    paintVariables($("body-variables"));
     readBody();
   });
 
